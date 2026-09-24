@@ -1,0 +1,105 @@
+# ⚠️ 这是**模板**，不是你在用的配置。
+#
+# 首次运行会把它复制成 config.yaml，之后你在界面上的改动（设备选择、语言等）
+# 都写进 config.yaml，而 config.yaml 已被 gitignore、不会进版本库
+# （设备名这类配置因机器而异，跟着仓库走只会互相污染）。
+#
+# 想重新来一份：删掉 config.yaml 再启动即可。
+#
+# ---------------------------------------------------------------
+# VRChat 实时同传 —— 主配置
+# 模型与目标语言都在这里改，不需要动代码（适配层按 model 自动分派事件）。
+
+session:
+  # 默认 3.8；可换 qwen3.5-livetranslate-flash-realtime（字段/事件自动切换）
+  model: qwen3.8-livetranslate-flash-realtime
+  # 实测：旧域名可用，无需 WorkspaceId。要迁到 maas 域名时改成
+  #   wss://{workspace_id}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime 并填 workspace_id
+  base_url: wss://dashscope.aliyuncs.com/api-ws/v1/realtime
+  workspace_id: ""
+  # ⚠️ 必须显式指定：不填会抛 Voice 'Chelsie' is not supported（纯文本模式也校验）
+  voice: Tina
+  # 断句：留空 = 用服务端默认（3.8 为 speaker_detection）；也可填 server_vad
+  turn_detection: null
+  # RPM 10 预算：每次 WS 连接算一次请求
+  max_new_sessions_per_minute: 4
+  reconnect_backoff: [2, 5, 10, 30]
+
+# 音频设备选择（空字符串 = 自动检测，也可在界面下拉里选）
+capture:
+  mic_device: ""            # 麦克风设备名；空 = 自动检测（默认设备）
+  loopback_device: ""       # VRChat 音频端点名；空 = 自动回退链
+
+# 每个方向一条独立会话
+directions:
+  # ① 我说 → chatbox（对方看得见，我自己也看得见）
+  mine:
+    source_lang: zh
+    target_lang: en          # 可改 ja / ko / fr / de / es ...
+    output_audio: false      # true 则同时拿译音（走虚拟声卡那条腿）
+    hotwords: {}             # 例：{"VRChat": "VRChat", "逆袭": "Nixi"}
+  # ② 别人说 → 手腕屏
+  theirs:
+    source_lang: null        # null = 自动识别（多国玩家场景）
+    target_lang: zh
+    output_audio: false
+
+chatbox:
+  host: 127.0.0.1
+  port: 9000
+  max_chars: 144             # 官方上限（字符，不是字节）
+  max_lines: 9
+  interval_s: 2.0            # 增量刷新节奏（漏桶 5 条/5 秒 → 2 秒一条余量充足）
+  bucket_capacity: 5
+  bucket_window_s: 5.0
+  min_gap_s: 0.4
+  notification_sound: true
+
+merger:
+  interval_s: 2.0            # 首个 delta 立即发，之后每 2 秒一次快照，句末必刷最终版
+  carry_over: false          # true = 把上一段最终译文作为前缀保留（连续字幕观感）
+
+# 手腕屏幕（SteamVR overlay）
+overlay:
+  enabled: true
+  # 刷新策略：0 = 有更新立刻上屏（本地显示不受 chatbox 2 秒节流约束，默认如此）
+  #            >0 = 按秒数节流（怕刷太快看着晃时才调，例如 0.5）
+  interval_s: 0
+  anchor: right_hand         # left_hand | right_hand | tracker | hmd
+  tracker_index: 0           # anchor=tracker 时取第几个 tracker（前臂 tracker 最贴合“绑在手臂上”）
+  offset:
+    pos: [0.0, 0.06, 0.02]   # 相对锚点偏移（米）——改完存盘即生效，无需重启
+    rot: [0, 0, 0]           # 欧拉角（度）
+    width_m: 0.24            # 面板宽度（米）
+    curvature: 0.0           # >0 则弯曲贴合（0.1~0.3 可试）
+    alpha: 0.9
+  size_px: [1024, 320]
+  font: "C:/Windows/Fonts/msyh.ttc"   # 雅黑；日文可用 NotoSansJP-VF.ttf
+  font_size: 48              # 译文字号
+  source_font_size: 36       # 原文小字号
+  max_lines: 3               # 译文最多显示几行（超出保留最新）
+  show_source: true          # 双行显示：原文 + 译文（3.8 默认就返回源文识别结果，零额外成本）
+  fade_after_s: 0.0          # >0 则静默这么久后淡出
+  # 配色：统一白色系，层级只靠字号 + 透明度区分（不靠换色，避免像残留色）
+  color_translation: [255, 255, 255]
+  color_source: [255, 255, 255]
+  source_alpha: 205          # 原文透明度 0-255（150 会显灰，像另一个颜色）
+  color_border: [110, 170, 205]
+  border_alpha: 120
+  color_bg: [12, 14, 20]
+  bg_alpha: 205
+  separator: true            # 原文/译文之间的细分隔线
+
+# 第三条腿：译音输出（模型译音 → 虚拟声卡 → VRChat 麦克风 → 对方听到）
+output:
+  audio:
+    enabled: false           # 总开关（与 direction 的 output_audio 是「与」关系——两边都 true 才出声）
+    device:                  # 按名称回退链找虚拟声卡（设备 ID 会随插拔变化，绝不写死）
+      - "voicemeeter input"
+      - "voicemeeter aux input"
+      - "cable input"
+      - "vb-audio"
+    device_name: ""          # 用户手选的译音输出设备名；非空时优先于上面的回退链
+    sample_rate: 48000       # VRChat / VoiceMeeter 统一要 48k
+    buffer_ms: 300           # 起播前先攒这么多，避免断续
+    max_buffer_ms: 2000      # 超过就丢最旧的，避免延迟越积越大

@@ -13,6 +13,25 @@ from .session.base import SessionConfig
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = ROOT / "config.yaml"
+# 入库的是模板；config.yaml 是用户自己的配置（设备名/语言偏好），已被 gitignore。
+EXAMPLE_CONFIG = ROOT / "config.example.yaml"
+
+
+def ensure_config(path: Path | None = None) -> Path:
+    """确保配置文件存在：不存在就从 config.example.yaml 复制一份。
+
+    这样新克隆的仓库（以及给朋友用的时候）开箱即用，而用户的实际配置
+    不会进版本库——设备名这类东西因机器而异，跟着仓库走只会互相污染。
+    """
+    p = Path(path) if path else DEFAULT_CONFIG
+    if p.exists() or not EXAMPLE_CONFIG.exists():
+        return p
+    try:
+        p.write_text(EXAMPLE_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"[config] 已从 {EXAMPLE_CONFIG.name} 生成 {p.name}")
+    except OSError as exc:
+        print(f"[config] 生成 {p.name} 失败（将使用内置默认值）：{exc}")
+    return p
 
 
 def load_api_key(explicit: str | None = None) -> str:
@@ -73,7 +92,7 @@ class AppConfig:
 
 
 def load_config(path: str | Path | None = None, api_key: str | None = None) -> AppConfig:
-    p = Path(path) if path else DEFAULT_CONFIG
+    p = ensure_config(Path(path) if path else None)   # 缺文件时从 config.example.yaml 生成
     raw: dict[str, Any] = {}
     if p.exists():
         raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}

@@ -9,7 +9,9 @@ __pycache__/
 logs/
 out/
 
-# 本地个人配置（如果复制成 config.local.yaml 就不会被提交）
+# 用户自己的配置（设备名、语言偏好等因机器而异，不入库）
+# 入库的是 config.example.yaml 模板；首次运行会自动复制生成 config.yaml
+config.yaml
 config.local.yaml
 
 # 编辑器

@@ -75,3 +75,16 @@ overlay:
   color_bg: [12, 14, 20]
   bg_alpha: 205
   separator: true            # 原文/译文之间的细分隔线
+
+# 第三条腿：译音输出（模型译音 → 虚拟声卡 → VRChat 麦克风 → 对方听到）
+output:
+  audio:
+    enabled: false           # 总开关（与 direction 的 output_audio 是「与」关系——两边都 true 才出声）
+    device:                  # 按名称回退链找虚拟声卡（设备 ID 会随插拔变化，绝不写死）
+      - "voicemeeter input"
+      - "voicemeeter aux input"
+      - "cable input"
+      - "vb-audio"
+    sample_rate: 48000       # VRChat / VoiceMeeter 统一要 48k
+    buffer_ms: 300           # 起播前先攒这么多，避免断续
+    max_buffer_ms: 2000      # 超过就丢最旧的，避免延迟越积越大

@@ -99,6 +99,8 @@ async def run(args: argparse.Namespace) -> int:
         overlay_dry_run=args.overlay_dry_run,
         no_realtime=args.no_realtime,
         config_path=args.config,
+        audio_out=args.audio_out,
+        audio_device=args.audio_device or None,
     )
 
     if args.log_events and engine is not None:
@@ -155,6 +157,10 @@ def main() -> int:
                     help="输出去向：chatbox（我说→气泡）/ overlay（别人说→手腕屏）/ both")
     ap.add_argument("--overlay-dry-run", action="store_true",
                     help="overlay 不接管 SteamVR，把每帧渲染成 PNG 存 out/overlay_frames/")
+    ap.add_argument("--audio-out", action="store_true", default=None,
+                    help="开启译音输出（模型译音 → 虚拟声卡）。覆盖 config.yaml 的 output.audio.enabled")
+    ap.add_argument("--audio-device", default=None, nargs="*",
+                    help="虚拟声卡设备名称回退链；不填用 config.yaml 里的默认值")
     ap.add_argument("--log-events", action="store_true", help="把每个服务端事件类型写进埋点（调试用）")
     ap.add_argument("--config", default=None)
     args = ap.parse_args()

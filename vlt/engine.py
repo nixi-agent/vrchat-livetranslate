@@ -18,6 +18,7 @@ from .config import AppConfig, Direction, load_config
 from .output.chatbox import Chatbox, TokenBucket
 from .output.merger import Merger
 from .output.overlay import OverlayConfig, WristOverlay
+from .output.virtualmic import VirtualMic, pick_output_device, resample_24k_mono_to_48k_stereo
 from .session.base import SessionConfig, TextDelta, create_session
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -53,6 +54,8 @@ class Engine:
         overlay_dry_run: bool = False,
         no_realtime: bool = False,
         config_path: str | Path | None = None,
+        audio_out: bool | None = None,
+        audio_device: list[str] | None = None,
     ) -> None:
         self._cfg = cfg
         self._direction = direction
@@ -64,6 +67,8 @@ class Engine:
         self._overlay_dry_run = overlay_dry_run
         self._no_realtime = no_realtime
         self._config_path = config_path
+        self._audio_out_override = audio_out
+        self._audio_device_override = audio_device
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -74,6 +79,7 @@ class Engine:
         self._chatbox: Chatbox | None = None
         self._merger: Merger | None = None
         self._overlay: WristOverlay | None = None
+        self._virtualmic: VirtualMic | None = None
         self._pump_task: asyncio.Task | None = None
 
         self._connect_ts: list[float] = []
@@ -114,6 +120,10 @@ class Engine:
     @property
     def merger(self) -> Merger | None:
         return self._merger
+
+    @property
+    def virtualmic(self) -> VirtualMic | None:
+        return self._virtualmic
 
     @property
     def session(self):
@@ -200,6 +210,12 @@ class Engine:
         except Exception:
             pass
         try:
+            if self._virtualmic is not None:
+                self._virtualmic.close()
+                self._virtualmic = None
+        except Exception:
+            pass
+        try:
             if self._session is not None:
                 await self._session.close()
         except Exception:
@@ -237,6 +253,12 @@ class Engine:
             )
             self._overlay.start()
 
+        audio_cfg = (self._cfg.output or {}).get("audio") or {}
+        audio_enabled = self._audio_out_override if self._audio_out_override is not None else audio_cfg.get("enabled", False)
+        d = self._cfg.directions.get(self._direction)
+        if audio_enabled and d is not None and d.output_audio:
+            self._setup_virtualmic(audio_cfg)
+
         merger_cfg = self._cfg.merger or {}
         cb_cfg = self._cfg.chatbox or {}
         self._merger = Merger(
@@ -253,6 +275,30 @@ class Engine:
 
         self._events.on_status("info", f"等待收尾（{self._settle_s}s）…")
         await asyncio.sleep(self._settle_s)
+
+    def _setup_virtualmic(self, audio_cfg: dict) -> None:
+        patterns = self._audio_device_override or audio_cfg.get("device")
+        try:
+            picked = pick_output_device(patterns)
+        except Exception as exc:
+            self._events.on_status("error", f"枚举输出设备失败：{exc}（其余功能不受影响）")
+            return
+        if picked is None:
+            chain = ", ".join(patterns) if patterns else "(默认回退链)"
+            self._events.on_status("error",
+                f"没找到匹配的输出设备（回退链：{chain}）。虚拟声卡装好了吗？其余功能不受影响。")
+            return
+        idx, name, rate = picked
+        self._virtualmic = VirtualMic(
+            device_index=idx,
+            device_name=name,
+            sample_rate=int(audio_cfg.get("sample_rate", 48000)),
+            buffer_ms=int(audio_cfg.get("buffer_ms", 300)),
+            max_buffer_ms=int(audio_cfg.get("max_buffer_ms", 2000)),
+            on_status=self._events.on_status,
+        )
+        if not self._virtualmic.open():
+            self._virtualmic = None
 
     async def _create_session(self, scfg: SessionConfig) -> None:
         now = time.monotonic()
@@ -334,7 +380,9 @@ class Engine:
             self._merger.push(d)
 
     def _on_audio(self, pcm: bytes) -> None:
-        pass
+        if self._virtualmic is not None:
+            stereo = resample_24k_mono_to_48k_stereo(pcm)
+            self._virtualmic.push(stereo)
 
     def _on_usage(self, u: dict) -> None:
         self._events.on_stats({k: v for k, v in u.items() if isinstance(v, int)})

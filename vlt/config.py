@@ -64,6 +64,7 @@ class AppConfig:
     chatbox: dict[str, Any]
     merger: dict[str, Any]
     overlay: dict[str, Any] = field(default_factory=dict)
+    output: dict[str, Any] = field(default_factory=dict)
 
     def direction(self, name: str) -> Direction:
         if name not in self.directions:
@@ -99,10 +100,22 @@ def load_config(path: str | Path | None = None, api_key: str | None = None) -> A
         )
     if not directions:
         directions = {"mine": Direction(source_lang="zh", target_lang="en")}
+    raw_output = raw.get("output") or {}
+    raw_audio = raw_output.get("audio") or {}
+    output = {
+        "audio": {
+            "enabled": bool(raw_audio.get("enabled", False)),
+            "device": raw_audio.get("device") or ["voicemeeter input", "voicemeeter aux input", "cable input", "vb-audio"],
+            "sample_rate": int(raw_audio.get("sample_rate", 48000)),
+            "buffer_ms": int(raw_audio.get("buffer_ms", 300)),
+            "max_buffer_ms": int(raw_audio.get("max_buffer_ms", 2000)),
+        },
+    }
     return AppConfig(
         session_base=session_base,
         directions=directions,
         chatbox=raw.get("chatbox") or {},
         merger=raw.get("merger") or {},
         overlay=raw.get("overlay") or {},
+        output=output,
     )

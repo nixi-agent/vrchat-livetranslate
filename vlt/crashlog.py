@@ -37,12 +37,46 @@ _ORIG_STDERR = None
 
 
 class _Tee:
-    """把写入同时送到原流和日志文件；日志文件出问题也绝不影响原流程。"""
+    """把写入同时送到原流和日志文件；日志文件出问题也绝不影响原流程。
+
+    每条日志**行首**自动加 `HH:MM:SS.mmm` 时间戳（本机本地时间 = UTC+8）。
+    没有时间戳时，"跑多久断的""两次事件间隔多少"全靠猜 —— 排查真实故障时这是硬伤。
+    只在行首加：半行写入（没有换行结尾）不会被打断，下一行才补戳。
+    """
 
     def __init__(self, *streams) -> None:
         self._streams = [s for s in streams if s is not None]
+        self._at_line_start = True
+        self._lock = threading.Lock()
+
+    _stamp_warned = False        # 加戳失败只报一次（避免刷屏）
+
+    def _stamp(self, data: str) -> str:
+        out: list[str] = []
+        for i, part in enumerate(data.split("\n")):
+            if i:                     # split 出来的后续片段 = 新的一行
+                out.append("\n")
+                self._at_line_start = True
+            if part and self._at_line_start:
+                out.append(_dt.datetime.now().strftime("%H:%M:%S.%f")[:-3] + " ")
+                self._at_line_start = False
+            out.append(part)
+        return "".join(out)
 
     def write(self, data):  # noqa: ANN001
+        try:
+            if isinstance(data, str) and data:
+                with self._lock:
+                    data = self._stamp(data)
+        except Exception as exc:  # noqa: BLE001
+            # 加戳失败不能影响主流程，但**必须留痕**（直接写原 stderr，避免递归）
+            if not _Tee._stamp_warned:
+                _Tee._stamp_warned = True
+                try:
+                    sys.__stderr__.write(f"[crashlog] ⚠️ 日志时间戳失败（后续不加戳）："
+                                         f"{type(exc).__name__}: {exc}\n")
+                except Exception:
+                    pass
         for s in self._streams:
             try:
                 s.write(data)
@@ -154,6 +188,7 @@ def log_startup_info(tag: str = "") -> None:
     print(f"[startup] {tag}  {_dt.datetime.now().isoformat(timespec='seconds')}")
     print(f"[startup] python {sys.version.split()[0]} | {platform.platform()}")
     print(f"[startup] cwd {Path.cwd()}")
+    print("[startup] 日志时间戳为行首 HH:MM:SS.mmm（本机本地时间 = UTC+8）")
     try:
         root = Path(__file__).resolve().parent.parent
         head = subprocess.run(["git", "-C", str(root), "rev-parse", "--short", "HEAD"],

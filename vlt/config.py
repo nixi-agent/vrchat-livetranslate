@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -96,7 +98,26 @@ def load_config(path: str | Path | None = None, api_key: str | None = None) -> A
     p = ensure_config(Path(path) if path else None)   # 缺文件时从 config.example.yaml 生成
     raw: dict[str, Any] = {}
     if p.exists():
-        raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as exc:
+            # 配置文件被写坏了（实测：残留的孤立序列项会让整个文件非法，
+            # 比如 `pos: [...]` 下面还留着旧版的 `- 0.0`）→ 备份 + 从模板重建，
+            # 否则程序下次连启动都起不来。**绝不静默**：打印清楚，并保留坏文件供排查。
+            broken = p.with_name(p.name + ".broken")
+            try:
+                shutil.copyfile(p, broken)
+            except OSError as exc2:  # noqa: BLE001
+                broken = None
+                print(f"[config] 备份损坏的配置也失败了：{exc2}", file=sys.stderr)
+            print(f"[config] ❌ 配置文件解析失败：{exc}\n"
+                  f"[config]    （这是「配置被写坏」的表现，不是你的错）\n"
+                  f"[config]    已备份到 {broken}，并从 {EXAMPLE_CONFIG.name} 重新生成默认配置 ——"
+                  f"设备/语言等选择需要重设一次",
+                  file=sys.stderr)
+            if EXAMPLE_CONFIG.exists():
+                shutil.copyfile(EXAMPLE_CONFIG, p)
+                raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     s = raw.get("session", {}) or {}
     session_base = {
         "model": s.get("model", "qwen3.8-livetranslate-flash-realtime"),

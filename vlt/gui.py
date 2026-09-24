@@ -153,10 +153,41 @@ def _yaml_set_in_text(text: str, path: list[str], value: str) -> str:
         m = pat.match(lines[i])
         if m and len(m.group(1)) == indent:
             comment = (m.group(4) or "").strip()
-            lines[i] = f"{m.group(1)}{leaf}: {value}" + (f"   {comment}" if comment else "")
+            new_line = f"{m.group(1)}{leaf}: {value}" + (f"   {comment}" if comment else "")
+            # ⚠️ 关键：如果这一项的旧值是**多行块**（块序列 / 嵌套映射），必须把子行一并删掉，
+            # 否则会留下孤立的 `- 0.0` 之类 → 整个文件变成非法 YAML。
+            # 用户实测踩过：旧版整文件 yaml.dump 会把 `pos: [0.0, 0.06, 0.02]` 写成
+            #    pos:
+            #    - 0.0
+            #  而本函数当时只换了 `pos:` 那一行，热重载就报
+            #  `expected <block end>, but found '-'`，界面上拖滑块完全没效果。
+            j = i + 1
+            while j < hi and lines[j].strip():
+                stripped = lines[j].lstrip()
+                ind_j = len(lines[j]) - len(stripped)
+                # 更深的缩进 = 属于本键的块；同级但以 "- " 开头 = 块序列（PyYAML 默认就不缩进）
+                if ind_j > indent or (ind_j == indent and stripped.startswith("- ")):
+                    j += 1
+                    continue
+                break
+            del lines[i + 1:j]
+            lines[i] = new_line
             return "\n".join(lines)
     lines.insert(hi, f"{' ' * indent}{leaf}: {value}")
     return "\n".join(lines)
+
+
+def _write_config_text(path: Path, text: str) -> None:
+    """写回配置前先验证仍是合法 YAML。
+
+    宁可这次改动不生效（调用方会 catch 并打印），也**绝不能把用户的配置写坏** ——
+    配置坏了影响的是启动，比一个滑块没生效严重得多。
+    """
+    try:
+        yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise RuntimeError(f"生成的新配置不是合法 YAML，已放弃写入：{exc}") from exc
+    path.write_text(text, encoding="utf-8")
 
 
 def _fmt_scalar(x) -> str:  # noqa: ANN001
@@ -542,7 +573,7 @@ class TranslationGUI:
             ]
             for key_path, val in updates:
                 text = _yaml_set_in_text(text, key_path, val)
-            p.write_text(text, encoding="utf-8")
+            _write_config_text(p, text)
             print(f"[gui] 手腕屏参数已写入 config.yaml：anchor={updates[0][1]} "
                   f"pos={updates[2][1]} rot={updates[3][1]} width={updates[4][1]}m "
                   f"curvature={updates[5][1]} alpha={updates[6][1]}（overlay 会热重载，无需重启）",
@@ -702,7 +733,7 @@ class TranslationGUI:
             for name, langs in pairs.items():
                 for key, val in langs.items():
                     text = _yaml_set_in_text(text, ["directions", name, key], _fmt_scalar(val))
-            p.write_text(text, encoding="utf-8")
+            _write_config_text(p, text)
         except Exception as exc:  # noqa: BLE001
             print(f"[gui] 保存配置失败：{exc}", flush=True)
 
@@ -726,7 +757,7 @@ class TranslationGUI:
             ]
             for key_path, val in updates:
                 text = _yaml_set_in_text(text, key_path, val)
-            p.write_text(text, encoding="utf-8")
+            _write_config_text(p, text)
             print(f"[gui] 界面选择已保存：direction={updates[0][1]} chatbox={updates[1][1]} "
                   f"overlay={updates[2][1]}", flush=True)
         except Exception as exc:  # noqa: BLE001
@@ -744,7 +775,7 @@ class TranslationGUI:
         try:
             text = p.read_text(encoding="utf-8")
             text = _yaml_set_in_text(text, ["output", "audio", "enabled"], _fmt_scalar(want))
-            p.write_text(text, encoding="utf-8")
+            _write_config_text(p, text)
             print(f"[gui] 译音输出总开关 → {'开' if want else '关'}（已写入 config.yaml）", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[gui] 保存译音开关失败：{exc}", flush=True)

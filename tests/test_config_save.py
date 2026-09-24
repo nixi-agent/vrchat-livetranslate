@@ -9,6 +9,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(r"D:/workspace/vrchat-livetranslate")
 sys.path.insert(0, str(ROOT))
 CONFIG = ROOT / "config.yaml"
@@ -75,6 +77,14 @@ def main() -> int:
     CONFIG.write_text(before, encoding="utf-8")
     print(f"已还原 config.yaml（注释 {n_comments(CONFIG.read_text(encoding='utf-8'))} 行）")
 
+    # 三个新用例：块序列替换 / 写入校验 / 坏配置恢复
+    try:
+        test_block_sequence_value_is_replaced_intact()
+        test_write_guard_refuses_invalid_yaml()
+        test_broken_config_backed_up_and_regenerated()
+    except AssertionError as exc:
+        fails.append(f"新增用例失败：{exc}")
+
     if fails:
         print("\n❌ 失败：")
         for f in fails:
@@ -82,6 +92,70 @@ def main() -> int:
         return 1
     print("\n✅ 全部通过：注释、顺序、写入值都正确")
     return 0
+
+
+def test_block_sequence_value_is_replaced_intact() -> None:
+    """★ 复现真实事故：旧版 yaml.dump 把 `pos: [..]` 写成**块序列**（多行 `- 0.0`）。
+
+    用户实测：替换时只换 `pos:` 那一行、留下孤立的 `- 0.0` → 整个文件非法 →
+    overlay 热重载报 `expected <block end>, but found '-'`，拖滑块完全没效果。
+    """
+    from vlt.gui import _yaml_set_in_text
+
+    text = ("overlay:\n"
+            "  offset:\n"
+            "    alpha: 0.9\n"
+            "    pos:\n"
+            "    - 0.0\n"
+            "    - 0.06\n"
+            "    - 0.02\n"
+            "    width_m: 0.24\n"
+            "capture:\n"
+            "  mic_device: ''\n")
+    out = _yaml_set_in_text(text, ["overlay", "offset", "pos"], "[-0.005, 0.06, 0.02]")
+    print("  替换后：\n" + "\n".join("    " + ln for ln in out.splitlines()))
+    data = yaml.safe_load(out)                     # ← 必须仍能被解析（原事故就是这里炸）
+    assert data["overlay"]["offset"]["pos"] == [-0.005, 0.06, 0.02]
+    assert data["overlay"]["offset"]["width_m"] == 0.24, "后面的兄弟键被误删"
+    assert data["overlay"]["offset"]["alpha"] == 0.9, "前面的兄弟键被误删"
+    assert data["capture"]["mic_device"] == "", "其他段被破坏"
+    assert "- 0.06" not in out, f"孤立的序列项没被吃掉：{out!r}"
+    print("  块序列值被整体替换、文件仍是合法 YAML OK")
+
+
+def test_write_guard_refuses_invalid_yaml() -> None:
+    """写入前必须校验：宁可这次不生效，也不能把用户配置写坏。"""
+    from vlt.gui import _write_config_text
+
+    guard = ROOT / "out" / "guard_test.yaml"
+    guard.parent.mkdir(parents=True, exist_ok=True)
+    guard.write_text("keep: me\n", encoding="utf-8")
+    try:
+        _write_config_text(guard, "a:\n  b: 1\n  - oops\n")
+    except RuntimeError as exc:
+        print(f"  非法 YAML 被拦下 OK：{str(exc)[:70]}")
+    else:
+        raise AssertionError("非法 YAML 竟然被写进去了")
+    assert guard.read_text(encoding="utf-8") == "keep: me\n", "原有内容被破坏"
+    guard.unlink(missing_ok=True)
+
+
+def test_broken_config_backed_up_and_regenerated() -> None:
+    """配置被写坏时：启动必须仍能起来（备份坏文件 + 从模板重建），且不静默。"""
+    from vlt.config import load_config
+
+    tmp = ROOT / "out" / "broken_cfg"
+    tmp.mkdir(parents=True, exist_ok=True)
+    f = tmp / "config.yaml"
+    f.write_text("overlay:\n  offset:\n    pos: [-0.005, 0.06, 0.02]\n    - 0.0\n",
+                 encoding="utf-8")
+
+    cfg = load_config(f)                            # 不该抛异常
+    assert (tmp / "config.yaml.broken").exists(), "没有备份坏文件"
+    data = yaml.safe_load(f.read_text(encoding="utf-8"))
+    assert isinstance(data, dict) and "session" in data, "没有从模板重建"
+    assert cfg.session_base.get("model"), "重建后仍然读不到基础配置"
+    print("  坏配置 → 已备份 + 已重建 + 程序仍可启动 OK")
 
 
 if __name__ == "__main__":

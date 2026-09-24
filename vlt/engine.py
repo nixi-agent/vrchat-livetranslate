@@ -27,6 +27,8 @@ from .session.base import SessionConfig, TextDelta, create_session
 
 ROOT = Path(__file__).resolve().parent.parent
 CHUNK_BYTES = 3200          # 100ms @16kHz s16le mono
+# 音频流静默超过这个时长 = 上一句说完了（给虚拟麦打句尾标记的兜底触发）
+SENTENCE_GAP_S = 0.6
 
 LOOPBACK_FALLBACK = ["steam streaming speakers", "vive virtual", "cable input", "voicemeeter"]
 
@@ -86,6 +88,8 @@ class Engine:
         self._merger: Merger | None = None
         self._overlay: WristOverlay | None = None
         self._virtualmic: VirtualMic | None = None
+        self._last_audio_ts = 0.0      # 上一段 TTS 音频到达时刻（判句边界）
+        self._pending_seal = False     # 上一句终版文本已到 → 下一段音频前封句尾
         self._pump_task: asyncio.Task | None = None
 
         self._connect_ts: list[float] = []
@@ -431,15 +435,30 @@ class Engine:
         text = d.display
         if text:
             self._events.on_text(d.source or "", text, d.is_final)
+        if d.is_final:
+            # 一句译音出完了 → 下一段音频起始处给它封句尾（虚拟麦整句丢弃的依据）
+            self._pending_seal = True
         if self._overlay is not None:
             self._overlay.update(text, d.source or "")
         if self._merger is not None and "chatbox" in self._sinks:
             self._merger.push(d)
 
     def _on_audio(self, pcm: bytes) -> None:
-        if self._virtualmic is not None:
-            stereo = resample_24k_mono_to_48k_stereo(pcm)
-            self._virtualmic.push(stereo)
+        if self._virtualmic is None:
+            return
+        stereo = resample_24k_mono_to_48k_stereo(pcm)
+        # 句子边界（两条触发，缺一不可）：
+        # ① 上一句的终版文本已到 → 现在这段音频属于新的一句；
+        # ② 音频流静默 ≥ SENTENCE_GAP_S（终版文本没来时兜底）。
+        # 虚拟麦靠句尾标记**整句**丢弃；没有它就只能从句中切断，
+        # 用户实测就是「上一句 TTS 没说完就切到下一句」。
+        now = time.monotonic()
+        if self._pending_seal or (self._last_audio_ts
+                                  and now - self._last_audio_ts >= SENTENCE_GAP_S):
+            self._virtualmic.end_sentence()
+        self._pending_seal = False
+        self._last_audio_ts = now
+        self._virtualmic.push(stereo)
 
     def _on_usage(self, u: dict) -> None:
         self._events.on_stats({k: v for k, v in u.items() if isinstance(v, int)})

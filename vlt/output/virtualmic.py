@@ -88,8 +88,9 @@ class VirtualMic:
         self._max_buffer_ms = max_buffer_ms
         self._on_status = on_status
 
-        self._buf: collections.deque[bytes] = collections.deque()
+        self._buf: collections.deque[tuple[bytes, bool]] = collections.deque()   # (chunk, 是否句尾)
         self._buf_bytes = 0
+        self._head_started = False          # 队首那句是否已经开始播放（开始播的句子不丢）
         self._lock = threading.Lock()
         self._stream = None
         self._primed = False
@@ -135,20 +136,71 @@ class VirtualMic:
         self._primed = False
 
     def push(self, pcm_48k_stereo: bytes) -> None:
-        """推入已重采样的 48kHz 立体声 PCM。超 max_buffer_ms 时丢最旧的。"""
+        """推入已重采样的 48kHz 立体声 PCM。
+
+        ⚠️ 超限时**只丢整句**，绝不在句子中间切断 —— 用户实测：原来从队首
+        一个个 chunk 丢，表现为「上一句 TTS 还没说完就切到了下一句」。
+        宁可让缓冲长一点（TTS 落后），也不要让人听到半句话。
+        """
         if not pcm_48k_stereo:
             return
         with self._lock:
-            self._buf.append(pcm_48k_stereo)
+            self._buf.append((pcm_48k_stereo, False))
             self._buf_bytes += len(pcm_48k_stereo)
             self._last_push_ts = time.monotonic()
             max_bytes = int(self._max_buffer_ms * self._bytes_per_ms)
-            while self._buf_bytes > max_bytes and len(self._buf) > 1:
-                dropped = self._buf.popleft()
-                self._buf_bytes -= len(dropped)
-                log.warning("[virtualmic] 缓冲超限，丢弃最旧 %.1fms（保留最新）",
-                            len(dropped) / self._bytes_per_ms)
+            hard_bytes = max_bytes * 4          # 兜底硬上限（见下）
+            while self._buf_bytes > max_bytes:
+                if self._drop_oldest_whole_sentence():
+                    continue
+                # 一句完整的都没有（异常情况：句尾标记一直没来）→ 退化丢最旧 chunk，
+                # 但**必须大声报出来**：这种情况说明句边界判定失效了。
+                # 只在超过硬上限（4×）时才这么做，避免正常情况被误切。
+                if self._buf_bytes > hard_bytes and len(self._buf) > 1:
+                    chunk, _e = self._buf.popleft()
+                    self._buf_bytes -= len(chunk)
+                    log.warning("[virtualmic] 没有任何完整句子可丢、缓冲已超硬上限 %.0fms："
+                                "退化丢弃最旧 %.0fms 的 chunk（句尾标记一直没来？）",
+                                hard_bytes / self._bytes_per_ms,
+                                len(chunk) / self._bytes_per_ms)
+                    continue
+                break
             self._maybe_prime()
+
+    def end_sentence(self) -> None:
+        """把刚推完的音频封成**一句**（打句尾标记）。
+
+        引擎在两个响应之间的静默间隔处调用。有了句尾标记，缓冲超限时才能整句丢弃；
+        另外短句封口后可以立刻起播，不必干等 buffer_ms。
+        """
+        with self._lock:
+            if self._buf and not self._buf[-1][1]:
+                chunk, _ = self._buf[-1]
+                self._buf[-1] = (chunk, True)
+            self._maybe_prime()
+
+    def _drop_oldest_whole_sentence(self) -> int:
+        """丢掉**最旧的一整句**（正在播的那句除外），返回丢弃的字节数。
+
+        调用者必须已持有 self._lock。
+        """
+        items = list(self._buf)
+        ends = [i for i, (_c, e) in enumerate(items) if e]
+        if not ends:
+            return 0                                    # 还没有任何完整句子
+        # 正在播放的那句 = 第一个句尾之前（若已开始播，就不能动它）
+        start = ends[0] + 1 if self._head_started else 0
+        nxt = next((i for i in ends if i >= start), None)
+        if nxt is None:
+            return 0                                    # 后面没有更完整的句子
+        dropped = sum(len(c) for c, _e in items[start:nxt + 1])
+        self._buf = collections.deque(items[:start] + items[nxt + 1:])
+        self._buf_bytes -= dropped
+        if start == 0:
+            self._head_started = False
+        log.warning("[virtualmic] 缓冲超限：丢弃最旧的一整句 %.0fms（正在播的那句不丢、绝不切句）",
+                    dropped / self._bytes_per_ms)
+        return dropped
 
     def _maybe_prime(self) -> None:
         """决定是不是可以起播了。调用者必须已持有 self._lock。
@@ -176,13 +228,16 @@ class VirtualMic:
                 return
             out = bytearray()
             while len(out) < need_bytes and self._buf:
-                chunk = self._buf[0]
+                chunk, ends = self._buf[0]
+                self._head_started = True
                 take = min(need_bytes - len(out), len(chunk))
                 out.extend(chunk[:take])
                 if take < len(chunk):
-                    self._buf[0] = chunk[take:]
+                    self._buf[0] = (chunk[take:], ends)
                 else:
                     self._buf.popleft()
+                    if ends:
+                        self._head_started = False     # 这句播完了，下一句可以整句丢
                 self._buf_bytes -= take
             if len(out) < need_bytes:
                 out.extend(b"\x00" * (need_bytes - len(out)))

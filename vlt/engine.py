@@ -345,9 +345,11 @@ class Engine:
         if not self._virtualmic.open():
             self._virtualmic = None
             print(f"[virtualmic] 打开失败 → 译音输出已禁用（其余功能不受影响）：{name}", flush=True)
-        else:
-            print(f"[virtualmic] 已打开译音输出设备：{name} @ {self._virtualmic.sample_rate}Hz"
-                  f"（译音会写进这里，VRChat 选它当麦克风就能听见）", flush=True)
+        # 打开成功不用再打印：VirtualMic.open() 自己会报
+        # 「虚拟声卡已打开：#N 名字」（经 on_status → 日志 + 状态栏）。
+        # 这里之前多打了一行，还误用了不存在的属性 `sample_rate`（真实叫 `_sample_rate`），
+        # 结果设备打开成功后那行日志直接抛 AttributeError，把整条翻译腿打死了 ——
+        # 用户机器上有 VoiceMeeter 才会走到这条分支，我本机没虚拟声卡，本地测试全绿。
 
     async def _create_session(self, scfg: SessionConfig) -> None:
         now = time.monotonic()

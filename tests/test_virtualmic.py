@@ -180,6 +180,92 @@ def test_resample_edge_cases():
     print("  resample edge cases OK（单样本/奇数长度）")
 
 
+def test_setup_virtualmic_success_path():
+    """★ 回归：译音输出设备**打开成功**那条分支必须跑通。
+
+    真实事故（用户机器上有 VoiceMeeter 才会走到这条分支）：
+    `_setup_virtualmic` 成功分支里多打了一行日志，用了不存在的属性
+    `self._virtualmic.sample_rate`（真实属性叫 `_sample_rate`）→ AttributeError
+    → 引擎报「运行错误」，**整条翻译腿直接死掉**（用户日志里连报三次）。
+
+    我本机没装虚拟声卡，永远走不到这条分支，所以本地测试全绿、一到用户那儿就炸 ——
+    因此必须用**假设备**把成功分支覆盖掉。
+    """
+    from vlt.config import AppConfig, Direction
+    from vlt.engine import Engine, EngineEvents
+    import vlt.engine as E
+
+    statuses: list[tuple[str, str]] = []
+    cfg = AppConfig(
+        session_base={"model": "x", "base_url": "x", "voice": "x", "api_key": "x",
+                      "workspace_id": "", "reconnect_backoff": [1],
+                      "max_new_sessions_per_minute": 10, "final_silence_s": 1.0},
+        directions={"mine": Direction(source_lang="zh", target_lang="en", output_audio=True)},
+        chatbox={}, merger={}, overlay={},
+        output={"audio": {"enabled": True, "device": ["voicemeeter input"],
+                          "device_name": "", "sample_rate": 48000,
+                          "buffer_ms": 300, "max_buffer_ms": 2000}},
+    )
+
+    # ★ 用**真实的 VirtualMic 子类**，只把 open() 换掉不真的开音频流：
+    # 这样引擎里对它的每一处属性访问都会走真对象，属性名写错立刻暴露。
+    from vlt.output.virtualmic import VirtualMic as RealVirtualMic
+
+    class PatchedVirtualMic(RealVirtualMic):
+        def open(self) -> bool:
+            self.opened = True
+            return True
+
+    orig_pick, orig_vm = E.pick_output_device, E.VirtualMic
+    E.pick_output_device = lambda patterns=None: (  # noqa: ARG005
+        11, "VoiceMeeter Input (VB-Audio VoiceMeeter VAIO)", 48000)
+    E.VirtualMic = PatchedVirtualMic
+    try:
+        engine = Engine(cfg=cfg, direction="mine", source="mic", sinks=set(),
+                        events=EngineEvents(on_status=lambda lvl, msg: statuses.append((lvl, msg))))
+        engine._setup_virtualmic(cfg.output["audio"])       # ← 不许抛异常
+    finally:
+        E.pick_output_device, E.VirtualMic = orig_pick, orig_vm
+
+    assert engine.virtualmic is not None, "设备可用时应该留下 VirtualMic 实例"
+    assert getattr(engine.virtualmic, "opened", False), "没有调用 open()"
+    assert isinstance(engine.virtualmic, RealVirtualMic)
+    print(f"  虚拟声卡打开成功分支不抛异常 OK（状态：{[m[:40] for _, m in statuses]}）")
+
+
+def test_setup_virtualmic_open_failure():
+    """打开失败要优雅降级：留 None + 打印原因，不许抛异常拖垮引擎。"""
+    from vlt.config import AppConfig, Direction
+    from vlt.engine import Engine, EngineEvents
+    import vlt.engine as E
+    from vlt.output.virtualmic import VirtualMic as RealVirtualMic
+
+    cfg = AppConfig(
+        session_base={"model": "x", "base_url": "x", "voice": "x", "api_key": "x",
+                      "workspace_id": "", "reconnect_backoff": [1],
+                      "max_new_sessions_per_minute": 10, "final_silence_s": 1.0},
+        directions={"mine": Direction(source_lang="zh", target_lang="en", output_audio=True)},
+        chatbox={}, merger={}, overlay={},
+        output={"audio": {"enabled": True, "device": ["voicemeeter input"], "sample_rate": 48000}},
+    )
+
+    class FailVirtualMic(RealVirtualMic):
+        def open(self) -> bool:
+            return False
+
+    orig_pick, orig_vm = E.pick_output_device, E.VirtualMic
+    E.pick_output_device = lambda patterns=None: (11, "Fake Virtual Card", 48000)  # noqa: ARG005
+    E.VirtualMic = FailVirtualMic
+    try:
+        engine = Engine(cfg=cfg, direction="mine", source="mic", sinks=set(),
+                        events=EngineEvents(on_status=lambda lvl, msg: None))
+        engine._setup_virtualmic(cfg.output["audio"])
+    finally:
+        E.pick_output_device, E.VirtualMic = orig_pick, orig_vm
+    assert engine.virtualmic is None, "打开失败应清成 None"
+    print("  虚拟声卡打开失败 → 优雅降级 OK")
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.WARNING)
     print("test_virtualmic:")
@@ -192,4 +278,6 @@ if __name__ == "__main__":
     test_no_device_no_crash()
     test_prime_timeout_short_audio()
     test_resample_edge_cases()
+    test_setup_virtualmic_success_path()
+    test_setup_virtualmic_open_failure()
     print("ALL PASSED")

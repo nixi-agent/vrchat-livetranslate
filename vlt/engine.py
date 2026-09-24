@@ -75,6 +75,8 @@ class Engine:
         self._thread: threading.Thread | None = None
         self._stopping = False
         self._stopped = threading.Event()
+        # 采集（mic/loopback）是无限循环，靠这个事件唤醒退出——stop() 与 _async_stop() 都会置位
+        self._stop_event = threading.Event()
 
         self._session = None
         self._chatbox: Chatbox | None = None
@@ -92,6 +94,7 @@ class Engine:
             return
         self._stopping = False
         self._stopped.clear()
+        self._stop_event.clear()
         t = threading.Thread(target=self._thread_run, daemon=True, name="vlt-engine")
         self._thread = t
         t.start()
@@ -100,6 +103,7 @@ class Engine:
         if self._thread is None:
             return
         self._stopping = True
+        self._stop_event.set()          # 直接置位（线程安全）：采集循环下个周期就退出
         if self._loop is not None and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._schedule_stop)
         self._stopped.wait(timeout)
@@ -153,6 +157,16 @@ class Engine:
     def _schedule_stop(self) -> None:
         if self._loop is not None:
             asyncio.run_coroutine_threadsafe(self._async_stop(), self._loop)
+
+    async def _async_stop(self) -> None:
+        """打断采集循环，让 _async_run 自然收尾。
+
+        采集（mic / loopback）是**无限循环**，靠 stop_event 唤醒；
+        PCM 源则在每个 chunk 之间检查 _stopping。不能用 cancel() 硬砍主协程，
+        那样 _cleanup() 里的 await 会被打断，音频流/会话关不干净。
+        """
+        self._stopping = True
+        self._stop_event.set()
 
     def _thread_run(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -274,6 +288,10 @@ class Engine:
         self._pump_task = asyncio.create_task(self._pump_loop())
         await self._feed_audio()
 
+        # 被 stop() 打断时不要再等收尾（否则点"停止翻译"后要卡 8 秒才响应）；
+        # 未发完的最终版由 _cleanup() 里的 flush_pending 补发。
+        if self._stopping:
+            return
         self._events.on_status("info", f"等待收尾（{self._settle_s}s）…")
         await asyncio.sleep(self._settle_s)
 
@@ -365,11 +383,13 @@ class Engine:
         elif self._source == "mic":
             capture_cfg = (self._cfg.output or {}).get("capture") or {}
             mic_name = capture_cfg.get("mic_device") or None
-            await run_mic(self._session, None, device_pattern=mic_name, device_name=mic_name)
+            await run_mic(self._session, None, device_pattern=mic_name, device_name=mic_name,
+                          stop_event=self._stop_event)
         elif self._source == "loopback":
             capture_cfg = (self._cfg.output or {}).get("capture") or {}
             loopback_name = capture_cfg.get("loopback_device") or None
-            await run_loopback(self._session, None, device_name=loopback_name)
+            await run_loopback(self._session, None, device_name=loopback_name,
+                               stop_event=self._stop_event)
 
     async def _feed_pcm(self, path: str) -> None:
         pcm = Path(path).read_bytes()
@@ -409,9 +429,15 @@ class Engine:
 # ================================================================ 音频采集函数
 
 
+def _stop_requested(stop_event: threading.Event | None) -> bool:
+    """采集循环的退出判据：stop() 会置位这个事件（线程安全）。"""
+    return stop_event is not None and stop_event.is_set()
+
+
 async def run_mic(session, tele, seconds: float = 0.0, device_pattern: str | None = None,
-                  device_name: str | None = None) -> None:
-    """麦克风采集（16kHz 单声道）。seconds=0 → 一直跑到 Ctrl+C。"""
+                  device_name: str | None = None,
+                  stop_event: threading.Event | None = None) -> None:
+    """麦克风采集（16kHz 单声道）。seconds=0 → 一直跑到 Ctrl+C 或 stop_event 置位。"""
     import sounddevice as sd
 
     dev_index = None
@@ -441,7 +467,7 @@ async def run_mic(session, tele, seconds: float = 0.0, device_pattern: str | Non
     with sd.RawInputStream(samplerate=16000, channels=1, dtype="int16",
                            blocksize=CHUNK_BYTES // 2, callback=callback, device=dev_index):
         end = None if seconds <= 0 else time.perf_counter() + seconds
-        while end is None or time.perf_counter() < end:
+        while (end is None or time.perf_counter() < end) and not _stop_requested(stop_event):
             try:
                 chunk = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
@@ -518,7 +544,8 @@ def to_16k_mono(pcm: bytes, rate: int, channels: int) -> bytes:
 
 
 async def run_loopback(session, tele, patterns: list[str] | None = None,
-                       seconds: float = 0.0, device_name: str | None = None) -> None:
+                       seconds: float = 0.0, device_name: str | None = None,
+                       stop_event: threading.Event | None = None) -> None:
     """采集 VRChat 的播放输出（= 别人说话）→ 推给会话。"""
     import pyaudiowpatch as pyaudio
 
@@ -571,7 +598,7 @@ async def run_loopback(session, tele, patterns: list[str] | None = None,
     end = None if seconds <= 0 else time.perf_counter() + seconds
     sent_bytes = 0
     try:
-        while end is None or time.perf_counter() < end:
+        while (end is None or time.perf_counter() < end) and not _stop_requested(stop_event):
             try:
                 raw = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:

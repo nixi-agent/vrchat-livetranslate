@@ -44,6 +44,11 @@ bl auth login --api-key "sk-你的key"
 app 读取顺序：`DASHSCOPE_API_KEY` 环境变量 → `%USERPROFILE%\.bailian\config.json`。
 **key 只从这两处读，不写进项目文件。**
 
+> 🔒 **防误提交**：仓库带凭据扫描。跑一次 `install_secret_guard.bat` 装上 pre-commit 钩子后，
+> 任何含 `sk-...` / `gho_...` / 硬编码密钥的提交会被直接拦下（脚本：`scripts/check_no_secrets.py`）。
+> 手动全量检查：`python scripts/check_no_secrets.py --once`
+> 为什么需要：key 一旦进了 git 历史，删掉文件也清不掉，必须 rewrite 历史 —— 宁可在提交前拦。
+
 ## 四、自检（推荐先跑这个）
 
 双击 **`run_selfcheck.bat`**。它会依次检查：模块齐全 → key 能读到 → 能渲染手腕屏贴图 →

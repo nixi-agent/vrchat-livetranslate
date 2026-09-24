@@ -292,6 +292,7 @@ class WristOverlay:
         self._device = None
         self._last_render: tuple[str, str] | None = None
         self._last_entries: tuple | None = None
+        self._upload_fails = 0             # 贴图连续上传失败次数（用于降噪 + 触发重建）
         self._last_cfg_mtime = 0.0
         self._last_text_at = 0.0
         self.available = False
@@ -447,10 +448,58 @@ class WristOverlay:
         buf = ctypes.create_string_buffer(data, len(data))
         try:
             self._overlay.setOverlayRaw(self._handle, buf, w, h, 4)
-            self.frames_updated += 1
-            print(f"[overlay] ← 贴图已更新（{w}x{h}, 第 {self.frames_updated} 帧）")
         except Exception as exc:  # noqa: BLE001
-            print(f"[overlay] ❌ setOverlayRaw 失败：{type(exc).__name__}: {exc}")
+            self._upload_fails += 1
+            # 降噪：连失败 86 次时每帧打一行会把日志彻底淹没（用户实测就是这样），
+            # 只报第一次 + 每隔 50 次汇总一条。
+            if self._upload_fails == 1:
+                print(f"[overlay] ❌ setOverlayRaw 失败：{type(exc).__name__}: {exc}")
+            elif self._upload_fails == 3:
+                print("[overlay] ⚠️ 贴图连续 3 次上传失败 → 尝试重建 overlay 恢复")
+                self._recreate_overlay()
+            elif self._upload_fails % 50 == 0:
+                print(f"[overlay] ❌ 贴图上传已连续失败 {self._upload_fails} 次"
+                      f"（面板会停在最后一帧）")
+            return
+        self.frames_updated += 1
+        if self._upload_fails:
+            print(f"[overlay] ✅ 贴图恢复上传（其间连续失败 {self._upload_fails} 次）")
+            self._upload_fails = 0
+        # 也别每帧都打：第 1 帧 + 每 50 帧一条（保留"还在刷"的证据，但不淹日志）
+        if self.frames_updated == 1 or self.frames_updated % 50 == 0:
+            print(f"[overlay] ← 贴图已更新（{w}x{h}, 第 {self.frames_updated} 帧）")
+
+    def _recreate_overlay(self) -> bool:
+        """销毁重建 overlay —— 贴图上传连续失败时用来恢复。
+
+        SteamVR 的 `setOverlayRaw` 每次调用都会新建一张贴图，长时间高频更新后
+        可能开始返回 `OverlayError_RequestFailed`（用户实测：连续失败 86 次，
+        手腕屏停在最后一帧不动，之后又自己恢复）。重建能拿到一张干净的贴图；
+        重建失败也不致命，下一次失败还会再试。
+        """
+        if self.dry_run or self._overlay is None:
+            return False
+        entries = list(self._last_entries or [])
+        try:
+            try:
+                if self._handle is not None:
+                    self._overlay.destroyOverlay(self._handle)
+            except Exception:  # noqa: BLE001
+                pass
+            self._handle = self._overlay.createOverlay(self.cfg.overlay_key, "VLT 手腕屏")
+            self._device = self._resolve_anchor()
+            self.available = True
+            self._apply_transform()
+            self._overlay.showOverlay(self._handle)
+            print(f"[overlay] ♻️ 已重建 overlay 并重新贴到 {self.cfg.anchor}"
+                  f"（device={self._device}）")
+            if entries:                        # 新 overlay 是空的，立刻把内容贴回去
+                self._last_entries = None
+                self.update_entries(entries, force=True)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[overlay] ⚠️ 重建 overlay 失败：{type(exc).__name__}: {exc}")
+            return False
 
     # ---------- 周期任务：热重载 + 淡出 ----------
     def tick(self) -> None:

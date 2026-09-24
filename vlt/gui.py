@@ -1275,10 +1275,14 @@ class TranslationGUI:
         if delta:
             # 气泡长高时把下面的气泡整体下移，避免重叠（双向同时时会用到）
             idx = self._bubbles.index(b)
+            # ⚠️ Canvas.move(tagOrId, x, y) 只接受**一个** tagOrId。
+            # 写成 `move(*other.items, 0, delta)` 会在 items 有 ≥2 个图元时抛
+            # `TclError: wrong # args`（双行气泡必然有 ≥2 个图元）→ 下面的气泡不移位 → 重叠。
+            # 用户实测日志里就抓到了这个 TclError。
             for other in self._bubbles[idx + 1:]:
                 other.y += delta
-                if other.items:
-                    self._canvas.move(*other.items, 0, delta)
+                for iid in other.items:
+                    self._canvas.move(iid, 0, delta)
             self._update_scrollregion()
 
     def _trim(self) -> None:

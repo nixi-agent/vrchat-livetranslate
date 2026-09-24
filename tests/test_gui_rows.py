@@ -45,6 +45,46 @@ def check(events: list[tuple], expect_finals: int) -> bool:
             pass
 
 
+def test_growing_bubble_shifts_later_bubbles() -> bool:
+    """★ 回归：流式气泡长高时，下面的气泡必须真的下移（否则重叠）。
+
+    真实事故（用户日志里抓到的 TclError）：
+
+        File "vlt/gui.py", line 1281, in _redraw_current
+            self._canvas.move(*other.items, 0, delta)
+        _tkinter.TclError: wrong # args: should be
+            ".!frame6.!canvas move tagOrId xAmount yAmount"
+
+    `Canvas.move` 只接受**一个** tagOrId；双行气泡有 ≥2 个图元 → 必然抛错 →
+    下面的气泡不移位 → 视觉上叠在一起。
+    """
+    from vlt.gui import TranslationGUI
+
+    gui = TranslationGUI()
+    try:
+        gui._root.geometry("920x620")
+        gui._root.update()
+        gui._add_text("", "第一句", False, who="mine")          # 未终版 → 之后还会增长
+        gui._add_text("", "第二句", True, who="theirs")
+        gui._root.update()
+
+        later = gui._bubbles[1]
+        assert later.items, "第二条气泡没有图元"
+        assert len(later.items) >= 2, f"预期双行气泡有 ≥2 个图元，实际 {len(later.items)}"
+        before = gui._canvas.coords(later.items[0])[1]
+
+        # 把第一条撑长 → 触发 _redraw_current 里的 delta 位移路径
+        gui._add_text("", "第一句变得很长很长" * 20, False, who="mine")
+        gui._root.update()
+        after = gui._canvas.coords(later.items[0])[1]
+
+        assert after > before, f"下面的气泡没有下移：{before} → {after}（会重叠）"
+        print(f"  ✓ 气泡长高时下面的气泡下移（y {before} → {after}，图元 {len(later.items)} 个）")
+        return True
+    finally:
+        gui._root.destroy()
+
+
 def main() -> int:
     cases = [
         # 一句话：增量 → 增量 → 终版，应只占 1 条气泡
@@ -73,6 +113,11 @@ def main() -> int:
 
     print("界面气泡回归测试：")
     all_ok = True
+    try:
+        all_ok &= test_growing_bubble_shifts_later_bubbles()
+    except AssertionError as exc:
+        print(f"  ❌ 气泡长高时下移失败：{exc}")
+        all_ok = False
     for i, (events, expect) in enumerate(cases, 1):
         print(f"用例 {i}:")
         all_ok &= check(events, expect)

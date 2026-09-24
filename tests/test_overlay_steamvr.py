@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 CALLS: list[tuple] = []
+RAW_FAIL_PLAN = {"remaining": 0}     # >0 时 setOverlayRaw 抛错（模拟 OverlayError_RequestFailed）
 
 
 class _FakeHmdMatrix34_t:
@@ -58,6 +59,9 @@ class _FakeIVROverlay:
         CALLS.append(("setOverlayTransformTrackedDeviceRelative", device, mat.m[0][3]))
 
     def setOverlayRaw(self, handle, buf, w, h, depth):  # noqa: ANN001
+        if RAW_FAIL_PLAN["remaining"] > 0:
+            RAW_FAIL_PLAN["remaining"] -= 1
+            raise RuntimeError("OverlayError_RequestFailed: 模拟 SteamVR 贴图上传失败")
         CALLS.append(("setOverlayRaw", w, h, depth))
 
     def showOverlay(self, handle):  # noqa: ANN001
@@ -247,6 +251,45 @@ def test_hot_reload_font_rerenders() -> None:
     print("  字号/面板高改动 → 重新渲染 OK")
 
 
+def test_upload_failure_recovers_and_logs_quietly() -> None:
+    """★ 回归：贴图上传连续失败时要「降噪 + 自动重建恢复」。
+
+    用户实测：一晚上连续失败 86 次，**每帧打一行**把日志淹没了（371 行贴图日志里
+    混着 86 行错误），而且手腕屏就停在最后一帧不动。
+    """
+    import contextlib
+    import io
+
+    CALLS.clear()
+    RAW_FAIL_PLAN["remaining"] = 0
+    _install_fake_openvr()
+    from vlt.output.overlay import WristOverlay
+
+    ov = WristOverlay(_cfg(Path(".")))
+    ov.start()
+    ov.update_entries([("theirs", "hi", "你好")], force=True)
+    CALLS.clear()
+
+    # 恰好失败 3 次：第 3 次触发重建，重建时会立刻把内容贴回去 → 应报「恢复上传」
+    RAW_FAIL_PLAN["remaining"] = 3
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        for i in range(4):
+            ov.update_entries([("theirs", f"hi{i}", f"你好{i}")], force=True)
+    out = buf.getvalue()
+
+    fail_lines = [ln for ln in out.splitlines() if "setOverlayRaw 失败" in ln]
+    assert len(fail_lines) == 1, f"失败日志只应报一次（降噪），实际 {len(fail_lines)} 条：\n{out}"
+    assert "重建 overlay" in out, f"连续失败 3 次时应尝试重建 overlay：\n{out}"
+    recreated = sum(1 for c in CALLS if c[0] == "createOverlay")
+    assert recreated >= 1, f"没有真的重建（createOverlay 调用 {recreated} 次）"
+    assert "恢复上传" in out, f"恢复时应有明确日志：\n{out}"
+    assert ov._upload_fails == 0, f"恢复后失败计数应清零，实际 {ov._upload_fails}"
+    assert sum(1 for c in CALLS if c[0] == "setOverlayRaw") >= 1, "重建后没有把内容贴回去"
+    ov.close()
+    print("  上传失败降噪 + 自动重建 + 恢复日志 OK")
+
+
 if __name__ == "__main__":
     print("test_overlay_steamvr:")
     test_start_takes_over_steamvr()
@@ -255,4 +298,5 @@ if __name__ == "__main__":
     test_update_uploads_texture()
     test_hot_reload_reapplies_geometry()
     test_hot_reload_font_rerenders()
+    test_upload_failure_recovers_and_logs_quietly()
     print("ALL PASSED")

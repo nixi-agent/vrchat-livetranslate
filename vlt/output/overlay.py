@@ -243,20 +243,25 @@ class WristOverlay:
         except Exception as exc:  # noqa: BLE001
             print(f"[overlay] ⚠️ SteamVR 未运行或不可用，overlay 已禁用（其他输出不受影响）：{exc}")
             return False
-        self._overlay = self._vr.overlay
         try:
+            # ⚠️ overlay 接口是**模块级工厂函数** `openvr.IVROverlay()`，
+            # 不是 IVRSystem 的属性 —— 写 `self._vr.overlay` 会抛
+            # AttributeError: 'IVRSystem' object has no attribute 'overlay'，
+            # 而且必须放在 try 里：否则异常会冒到引擎，把整条翻译腿一起打死。
+            self._overlay = openvr.IVROverlay()
             self._handle = self._overlay.createOverlay(self.cfg.overlay_key, "VLT 手腕屏")
-            self._overlay.setOverlayWidthInMeters(self._handle, self.cfg.width_m)
-            if self.cfg.curvature:
-                self._overlay.setOverlayCurvature(self._handle, self.cfg.curvature)
-            self._overlay.setOverlayAlpha(self._handle, self.cfg.alpha)
             self._device = self._resolve_anchor()
+            # ⚠️ available 必须在 _apply_transform 之前置位：它开头有
+            # `if not self.available: return`，否则「创建时应用变换」这一步等于没做
+            # （面板会出现但停在默认位置）。
+            self.available = True
             self._apply_transform()
             self._overlay.showOverlay(self._handle)
         except Exception as exc:  # noqa: BLE001
-            print(f"[overlay] ⚠️ 创建 overlay 失败：{exc}")
+            print(f"[overlay] ⚠️ 创建 overlay 失败，已禁用（其他输出不受影响）："
+                  f"{type(exc).__name__}: {exc}")
+            self.available = False
             return False
-        self.available = True
         print(f"[overlay] ✅ 已挂到 {self.cfg.anchor}（device={self._device}），"
               f"宽 {self.cfg.width_m}m，位置 {self.cfg.pos}")
         return True

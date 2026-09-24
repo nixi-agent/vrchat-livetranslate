@@ -264,12 +264,22 @@ class Engine:
             )
 
         if "overlay" in self._sinks:
-            self._overlay = WristOverlay(
-                OverlayConfig.from_dict(self._cfg.overlay),
-                config_path=Path(self._config_path) if self._config_path else None,
-                dry_run=self._overlay_dry_run,
-            )
-            self._overlay.start()
+            try:
+                self._overlay = WristOverlay(
+                    OverlayConfig.from_dict(self._cfg.overlay),
+                    config_path=Path(self._config_path) if self._config_path else None,
+                    dry_run=self._overlay_dry_run,
+                )
+                if not self._overlay.start() and not self._overlay_dry_run:
+                    # start() 内部已打印原因（SteamVR 没跑 / overlay 创建失败）
+                    self._overlay = None
+            except Exception as exc:  # noqa: BLE001
+                # 手腕屏挂不上**绝不能拖垮翻译**：chatbox / 译音照常工作。
+                # 但必须留痕——用户实测过 overlay 报错把两条腿一起打死的场景
+                # （`'IVRSystem' object has no attribute 'overlay'`）。
+                self._overlay = None
+                print(f"[overlay] ⚠️ 初始化异常，手腕屏已禁用（其余输出不受影响）："
+                      f"{type(exc).__name__}: {exc}", flush=True)
 
         audio_cfg = (self._cfg.output or {}).get("audio") or {}
         audio_enabled = self._audio_out_override if self._audio_out_override is not None else audio_cfg.get("enabled", False)

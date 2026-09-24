@@ -15,6 +15,7 @@ from typing import Callable
 import numpy as np
 
 from .config import AppConfig, Direction, load_config
+from .devices import resolve_device_name
 from .output.chatbox import Chatbox, TokenBucket
 from .output.merger import Merger
 from .output.overlay import OverlayConfig, WristOverlay
@@ -277,12 +278,25 @@ class Engine:
         await asyncio.sleep(self._settle_s)
 
     def _setup_virtualmic(self, audio_cfg: dict) -> None:
-        patterns = self._audio_device_override or audio_cfg.get("device")
-        try:
-            picked = pick_output_device(patterns)
-        except Exception as exc:
-            self._events.on_status("error", f"枚举输出设备失败：{exc}（其余功能不受影响）")
-            return
+        device_name = audio_cfg.get("device_name") or ""
+        picked = None
+        if device_name:
+            idx = resolve_device_name(device_name, "output")
+            if idx is not None:
+                import sounddevice as sd
+                info = sd.query_devices(idx)
+                picked = (idx, str(info["name"]), int(info.get("default_samplerate", 48000)))
+                self._events.on_status("info", f"按名称选中输出设备：{device_name!r} → #{idx}")
+            else:
+                self._events.on_status("warn",
+                    f"未找到输出设备 '{device_name}'，回退到回退链")
+        if picked is None:
+            patterns = self._audio_device_override or audio_cfg.get("device")
+            try:
+                picked = pick_output_device(patterns)
+            except Exception as exc:
+                self._events.on_status("error", f"枚举输出设备失败：{exc}（其余功能不受影响）")
+                return
         if picked is None:
             chain = ", ".join(patterns) if patterns else "(默认回退链)"
             self._events.on_status("error",
@@ -349,9 +363,13 @@ class Engine:
         if self._source.startswith("pcm:"):
             await self._feed_pcm(self._source[4:])
         elif self._source == "mic":
-            await run_mic(self._session, None, device_pattern=None)
+            capture_cfg = (self._cfg.output or {}).get("capture") or {}
+            mic_name = capture_cfg.get("mic_device") or None
+            await run_mic(self._session, None, device_pattern=mic_name, device_name=mic_name)
         elif self._source == "loopback":
-            await run_loopback(self._session, None)
+            capture_cfg = (self._cfg.output or {}).get("capture") or {}
+            loopback_name = capture_cfg.get("loopback_device") or None
+            await run_loopback(self._session, None, device_name=loopback_name)
 
     async def _feed_pcm(self, path: str) -> None:
         pcm = Path(path).read_bytes()
@@ -391,13 +409,22 @@ class Engine:
 # ================================================================ 音频采集函数
 
 
-async def run_mic(session, tele, seconds: float = 0.0, device_pattern: str | None = None) -> None:
+async def run_mic(session, tele, seconds: float = 0.0, device_pattern: str | None = None,
+                  device_name: str | None = None) -> None:
     """麦克风采集（16kHz 单声道）。seconds=0 → 一直跑到 Ctrl+C。"""
     import sounddevice as sd
 
-    dev_index = pick_input_device(device_pattern)
-    if device_pattern and dev_index is None:
-        print(f"[mic] ⚠️ 没找到匹配 '{device_pattern}' 的输入设备，改用系统默认设备")
+    dev_index = None
+    if device_name:
+        dev_index = resolve_device_name(device_name, "input")
+        if dev_index is not None:
+            print(f"[mic] 按名称选中设备：{device_name!r} → #{dev_index}")
+        else:
+            print(f"[mic] ⚠️ 未找到设备 '{device_name}'，回退自动检测")
+    if dev_index is None:
+        dev_index = pick_input_device(device_pattern)
+        if device_pattern and dev_index is None:
+            print(f"[mic] ⚠️ 没找到匹配 '{device_pattern}' 的输入设备，改用系统默认设备")
     info = sd.query_devices(dev_index) if dev_index is not None else sd.query_devices(kind="input")
     print(f"[mic] 使用设备 #{dev_index if dev_index is not None else '(默认)'} : {info['name']}  "
           f"{int(info['default_samplerate'])}Hz")
@@ -490,17 +517,40 @@ def to_16k_mono(pcm: bytes, rate: int, channels: int) -> bytes:
     return y.astype(np.int16).tobytes()
 
 
-async def run_loopback(session, tele, patterns: list[str] | None = None, seconds: float = 0.0) -> None:
+async def run_loopback(session, tele, patterns: list[str] | None = None,
+                       seconds: float = 0.0, device_name: str | None = None) -> None:
     """采集 VRChat 的播放输出（= 别人说话）→ 推给会话。"""
     import pyaudiowpatch as pyaudio
 
     loop = asyncio.get_running_loop()
-    picked, p = pick_loopback_device(patterns)
-    if picked is None:
-        print("[loopback] ❌ 没找到任何 loopback 设备（VRChat 在跑吗？在物理控制台会话里吗？）")
-        p.terminate()
-        return
-    idx, name, rate, channels = picked
+
+    # 优先按设备名解析
+    if device_name:
+        resolved_idx = resolve_device_name(device_name, "loopback")
+        if resolved_idx is not None:
+            p = pyaudio.PyAudio()
+            try:
+                dev_info = p.get_device_info_by_index(resolved_idx)
+                idx = resolved_idx
+                name = str(dev_info.get("name", device_name))
+                rate = int(dev_info.get("defaultSampleRate", 48000))
+                channels = int(dev_info.get("maxInputChannels", 2))
+                print(f"[loopback] 按名称选中设备：{device_name!r} → #{idx}")
+            except Exception:
+                p.terminate()
+                resolved_idx = None
+
+    if device_name and resolved_idx is not None:
+        pass  # idx/name/rate/channels already set above
+    else:
+        if device_name:
+            print(f"[loopback] ⚠️ 未找到设备 '{device_name}'，回退自动检测")
+        picked, p = pick_loopback_device(patterns)
+        if picked is None:
+            print("[loopback] ❌ 没找到任何 loopback 设备（VRChat 在跑吗？在物理控制台会话里吗？）")
+            p.terminate()
+            return
+        idx, name, rate, channels = picked
     print(f"[loopback] 采集端点 #{idx}「{name}」{rate}Hz ×{channels}ch → 16kHz 单声道")
 
     stream = p.open(format=pyaudio.paInt16, channels=min(2, channels or 2), rate=rate,

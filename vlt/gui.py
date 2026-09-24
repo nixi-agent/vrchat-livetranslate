@@ -21,6 +21,13 @@ from tkinter import ttk
 import yaml
 
 from .config import Direction, DEFAULT_CONFIG, load_config
+from .devices import (
+    DeviceInfo,
+    enumerate_audio_out_devices,
+    enumerate_loopback_devices,
+    enumerate_mic_devices,
+    format_device_display,
+)
 from .engine import Engine, EngineEvents
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -125,6 +132,12 @@ class TranslationGUI:
         self._relayout_job: str | None = None
         self._last_status_level = ""
 
+        # 设备选择
+        self._mic_names: list[str] = []
+        self._loopback_names: list[str] = []
+        self._audio_out_names: list[str] = []
+        self._device_scan_pending = False
+
         self._cfg = load_config()
         mine = self._cfg.directions.get("mine")
         # 语言对：我的语言 A ↔ 对方语言 B。别人说方向自动镜像（B → A）。
@@ -142,11 +155,12 @@ class TranslationGUI:
         self._root = tk.Tk()
         self._root.title("VRChat 实时同传")
         self._root.geometry("920x620")
-        self._root.minsize(700, 400)
+        self._root.minsize(860, 460)      # 下限要保证设备行三个下拉 + 刷新按钮都放得下
         self._root.configure(bg=PANEL)
 
         self._apply_theme()          # 必须先于任何控件创建
         self._build_controls()
+        self._build_device_row()
         self._divider()
         self._build_chat()
         self._divider()
@@ -157,6 +171,7 @@ class TranslationGUI:
         self._update_direction_langs()
         self._check_api_key()
         self._poll()
+        self._start_device_scan()
 
     # ================================================================ 主题
 
@@ -300,6 +315,46 @@ class TranslationGUI:
         return dict(bg=PANEL, fg=TEXT, activebackground=PANEL,
                     activeforeground="#ffffff", selectcolor=SURFACE,
                     highlightthickness=0, bd=0, font=FONT_UI)
+
+    def _build_device_row(self) -> None:
+        row = ttk.Frame(self._root, padding=(14, 6))
+        row.pack(fill=tk.X)
+
+        auto = "自动检测"
+
+        # ⚠️ 「刷新」按钮必须先打包（side=RIGHT）：Tk 的 pack 空间不足时**先挤压
+        # 最后打包的控件**，按钮若最后打包会被挤成 1px（实测窗口 860 宽时按钮消失）。
+        # 先占住右侧，让下拉框去吸收压缩。
+        self._refresh_btn = ttk.Button(row, text="刷新", width=5,
+                                       command=self._on_refresh_devices)
+        self._refresh_btn.pack(side=tk.RIGHT, padx=(8, 0))
+
+        ttk.Label(row, text="麦克风:", style="Dim.TLabel").pack(side=tk.LEFT)
+        self._mic_combo = ttk.Combobox(row, values=[auto], state="readonly", width=24)
+        # fill+expand：随窗口伸缩。设备名普遍 30~50 字符，固定宽度要么截断要么把
+        # "刷新"按钮挤出窗口（实测固定 30 时设备行需要 1046px，窗口只有 920px）
+        self._mic_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 12))
+        self._mic_combo.set(auto)
+        self._mic_combo.bind("<<ComboboxSelected>>", self._on_device_change)
+
+        ttk.Label(row, text="VRChat 音频:", style="Dim.TLabel").pack(side=tk.LEFT)
+        self._loopback_combo = ttk.Combobox(row, values=[auto], state="readonly", width=24)
+        self._loopback_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 12))
+        self._loopback_combo.set(auto)
+        self._loopback_combo.bind("<<ComboboxSelected>>", self._on_device_change)
+
+        ttk.Label(row, text="译音输出:", style="Dim.TLabel").pack(side=tk.LEFT)
+        self._audio_out_combo = ttk.Combobox(row, values=[auto], state="readonly", width=24)
+        self._audio_out_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 12))
+        self._audio_out_combo.set(auto)
+        self._audio_out_combo.bind("<<ComboboxSelected>>", self._on_device_change)
+
+        # 从配置恢复选择
+        capture_cfg = (self._cfg.output or {}).get("capture") or {}
+        audio_cfg = (self._cfg.output or {}).get("audio") or {}
+        self._mic_combo.set(capture_cfg.get("mic_device") or auto)
+        self._loopback_combo.set(capture_cfg.get("loopback_device") or auto)
+        self._audio_out_combo.set(audio_cfg.get("device_name") or auto)
 
     def _build_chat(self) -> None:
         chat_frame = ttk.Frame(self._root)
@@ -517,6 +572,151 @@ class TranslationGUI:
         self._stop()
         self._root.destroy()
 
+    # ================================================================ 设备选择
+
+    def _start_device_scan(self) -> None:
+        """扫描设备（**主线程同步执行**）。
+
+        为什么不用后台线程：PortAudio 的初始化/销毁是**线程绑定**的（WASAPI 用 COM
+        单元）。sounddevice 在首次调用的那个线程里 Pa_Initialize，而它的 atexit 钩子
+        在主线程 Pa_Terminate —— 跨线程销毁会抛
+        `Tcl_AsyncDelete: async handler deleted by the wrong thread`（实测退出码 3，
+        更早的版本还直接段错误）。实测枚举冷启动 348ms、预热后只要 23ms，
+        同步做完全可接受，换来的是确定性。
+        """
+        if self._headless:
+            return                        # 无界面的自检模式不需要设备列表
+        self._device_scan_pending = True
+        try:
+            self._root.update_idletasks()     # 先把"正在扫描…"画出来再阻塞
+            mics = enumerate_mic_devices()
+            loops = enumerate_loopback_devices()
+            outs = enumerate_audio_out_devices()
+            self._on_device_scan_result(mics, loops, outs)
+        except Exception as exc:
+            self._device_scan_pending = False
+            self._set_status("warn", f"设备扫描失败：{exc}")
+
+    def _on_refresh_devices(self) -> None:
+        if any(e.running for e in self._engines):
+            self._set_status("warn", "建议停止翻译后再刷新设备列表")
+        self._start_device_scan()
+        self._set_status("info", "正在扫描设备…")
+
+    def _on_device_scan_result(self, mics, loops, outs) -> None:
+        auto = "自动检测"
+        self._mic_names = []
+        mic_display = [auto]
+        for info in mics:
+            self._mic_names.append(info.name)
+            mic_display.append(format_device_display(info))
+
+        self._loopback_names = []
+        loop_display = [auto]
+        for info in loops:
+            self._loopback_names.append(info.name)
+            loop_display.append(format_device_display(info))
+
+        self._audio_out_names = []
+        out_display = [auto]
+        for info in outs:
+            self._audio_out_names.append(info.name)
+            out_display.append(format_device_display(info))
+
+        self._mic_combo.configure(values=mic_display)
+        self._loopback_combo.configure(values=loop_display)
+        self._audio_out_combo.configure(values=out_display)
+
+        # 恢复配置里的选择（如果设备在列表里）
+        capture_cfg = (self._cfg.output or {}).get("capture") or {}
+        audio_cfg = (self._cfg.output or {}).get("audio") or {}
+        mic_name = capture_cfg.get("mic_device") or ""
+        loop_name = capture_cfg.get("loopback_device") or ""
+        out_name = audio_cfg.get("device_name") or ""
+
+        if mic_name and mic_name in self._mic_names:
+            self._mic_combo.set(mic_display[self._mic_names.index(mic_name) + 1])
+        else:
+            self._mic_combo.set(auto)
+
+        if loop_name and loop_name in self._loopback_names:
+            self._loopback_combo.set(loop_display[self._loopback_names.index(loop_name) + 1])
+        else:
+            self._loopback_combo.set(auto)
+
+        if out_name and out_name in self._audio_out_names:
+            self._audio_out_combo.set(out_display[self._audio_out_names.index(out_name) + 1])
+        else:
+            self._audio_out_combo.set(auto)
+
+        if not mics and not loops and not outs:
+            self._set_status("warn", "未扫描到设备（远程会话下枚举为空是正常的）")
+        else:
+            self._set_status("info",
+                f"已扫描到 {len(mics)} 个麦克风 / {len(loops)} 个 loopback / {len(outs)} 个输出")
+        self._device_scan_pending = False
+
+    def _on_device_change(self, _event=None) -> None:
+        auto = "自动检测"
+        mic_text = self._mic_combo.get()
+        loop_text = self._loopback_combo.get()
+        out_text = self._audio_out_combo.get()
+
+        mic_name = ""
+        if mic_text != auto and mic_text:
+            display_list = list(self._mic_combo.cget("values"))
+            idx = display_list.index(mic_text) if mic_text in display_list else -1
+            if idx > 0 and idx - 1 < len(self._mic_names):
+                mic_name = self._mic_names[idx - 1]
+
+        loop_name = ""
+        if loop_text != auto and loop_text:
+            display_list = list(self._loopback_combo.cget("values"))
+            idx = display_list.index(loop_text) if loop_text in display_list else -1
+            if idx > 0 and idx - 1 < len(self._loopback_names):
+                loop_name = self._loopback_names[idx - 1]
+
+        out_name = ""
+        if out_text != auto and out_text:
+            display_list = list(self._audio_out_combo.cget("values"))
+            idx = display_list.index(out_text) if out_text in display_list else -1
+            if idx > 0 and idx - 1 < len(self._audio_out_names):
+                out_name = self._audio_out_names[idx - 1]
+
+        self._save_device_config(mic_name, loop_name, out_name)
+        # 回显完整设备名：下拉框宽度有限（长设备名会被截断），
+        # 状态栏给一次完整确认，免得用户不知道自己到底选了哪个。
+        picked = [t for t in (mic_name, loop_name, out_name) if t]
+        if picked:
+            self._set_status("info", "已选设备：" + " | ".join(picked))
+        else:
+            self._set_status("info", "设备：全部自动检测")
+
+    def _save_device_config(self, mic_name: str, loop_name: str, out_name: str) -> None:
+        p = DEFAULT_CONFIG
+        if not p.exists():
+            return
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+            capture = dict(raw.get("capture") or {})
+            capture["mic_device"] = mic_name
+            capture["loopback_device"] = loop_name
+            raw["capture"] = capture
+            output = dict(raw.get("output") or {})
+            audio = dict(output.get("audio") or {})
+            audio["device_name"] = out_name
+            output["audio"] = audio
+            raw["output"] = output
+            with p.open("w", encoding="utf-8") as f:
+                yaml.dump(raw, f, allow_unicode=True, default_flow_style=False)
+        except Exception as exc:
+            print(f"[gui] 保存设备配置失败：{exc}")
+            return
+        # 同步内存里的配置，引擎启动时会读
+        self._cfg.output.setdefault("capture", {})["mic_device"] = mic_name
+        self._cfg.output["capture"]["loopback_device"] = loop_name
+        self._cfg.output.setdefault("audio", {})["device_name"] = out_name
+
     # ================================================================ 队列轮询
 
     def _poll(self) -> None:
@@ -531,6 +731,11 @@ class TranslationGUI:
                 elif kind == "stats":
                     self._stats.update(item[1])
                     self._refresh_status()
+                elif kind == "devices":
+                    self._on_device_scan_result(item[1], item[2], item[3])
+                elif kind == "devices_error":
+                    self._set_status("warn", f"设备扫描失败：{item[1]}")
+                    self._device_scan_pending = False
         except queue.Empty:
             pass
         if (self._pending_starts == 0 and self._engines

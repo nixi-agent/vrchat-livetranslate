@@ -102,13 +102,19 @@ def load_config(path: str | Path | None = None, api_key: str | None = None) -> A
         directions = {"mine": Direction(source_lang="zh", target_lang="en")}
     raw_output = raw.get("output") or {}
     raw_audio = raw_output.get("audio") or {}
+    raw_capture = raw.get("capture") or {}
     output = {
         "audio": {
             "enabled": bool(raw_audio.get("enabled", False)),
             "device": raw_audio.get("device") or ["voicemeeter input", "voicemeeter aux input", "cable input", "vb-audio"],
+            "device_name": str(raw_audio.get("device_name") or ""),
             "sample_rate": int(raw_audio.get("sample_rate", 48000)),
             "buffer_ms": int(raw_audio.get("buffer_ms", 300)),
             "max_buffer_ms": int(raw_audio.get("max_buffer_ms", 2000)),
+        },
+        "capture": {
+            "mic_device": str(raw_capture.get("mic_device") or ""),
+            "loopback_device": str(raw_capture.get("loopback_device") or ""),
         },
     }
     return AppConfig(

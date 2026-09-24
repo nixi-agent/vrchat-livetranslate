@@ -16,6 +16,11 @@ session:
   max_new_sessions_per_minute: 4
   reconnect_backoff: [2, 5, 10, 30]
 
+# 音频设备选择（空字符串 = 自动检测，也可在界面下拉里选）
+capture:
+  mic_device: ""            # 麦克风设备名；空 = 自动检测（默认设备）
+  loopback_device: ""       # VRChat 音频端点名；空 = 自动回退链
+
 # 每个方向一条独立会话
 directions:
   # ① 我说 → chatbox（对方看得见，我自己也看得见）
@@ -85,6 +90,7 @@ output:
       - "voicemeeter aux input"
       - "cable input"
       - "vb-audio"
+    device_name: ""          # 用户手选的译音输出设备名；非空时优先于上面的回退链
     sample_rate: 48000       # VRChat / VoiceMeeter 统一要 48k
     buffer_ms: 300           # 起播前先攒这么多，避免断续
     max_buffer_ms: 2000      # 超过就丢最旧的，避免延迟越积越大

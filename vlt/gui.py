@@ -22,6 +22,7 @@ from tkinter import ttk
 import yaml
 
 from .config import Direction, DEFAULT_CONFIG, load_config
+from .output.overlay import OverlayConfig, WristOverlay
 from . import crashlog
 from .devices import (
     DeviceInfo,
@@ -177,6 +178,9 @@ class TranslationGUI:
         self._q: queue.Queue = queue.Queue()
         self._engines: list[Engine] = []
         self._engine_dirs: list[str] = []      # 与 _engines 一一对应
+        # 手腕屏由**界面**持有（不是某个引擎）：手腕上只该有一块屏，内容镜像聊天区，
+        # 而聊天区本来就在界面这一层（两个方向的文字都汇到这里）。
+        self._overlay_out: WristOverlay | None = None
         self._specs: list[tuple] = []
         self._sinks: set[str] = set()
         self._pending_starts = 0
@@ -332,7 +336,9 @@ class TranslationGUI:
         ttk.Label(ctrl, text="方向:").pack(side=tk.LEFT)
         dir_frame = ttk.Frame(ctrl)
         dir_frame.pack(side=tk.LEFT, padx=(0, 20))
-        self._direction_var = tk.StringVar(value="mine")
+        self._direction_var = tk.StringVar(value=str((self._cfg.ui or {}).get("direction", "mine")))
+        if self._direction_var.get() not in ("mine", "theirs", "dual"):
+            self._direction_var.set("mine")
         # 单选/复选框用经典 tk 控件：ttk 的指示器在 clam 下也吃不准颜色，
         # 经典控件的 bg/fg/selectcolor 一定可控，扁平且与面板融为一体。
         radio_kw = dict(variable=self._direction_var, command=self._on_direction_change,
@@ -362,15 +368,17 @@ class TranslationGUI:
         out_frame = ttk.Frame(self._root, padding=(14, 0))
         out_frame.pack(fill=tk.X)
         ttk.Label(out_frame, text="输出:").pack(side=tk.LEFT)
-        self._chatbox_var = tk.BooleanVar(value=True)
-        self._overlay_var = tk.BooleanVar(value=False)
+        self._chatbox_var = tk.BooleanVar(value=bool((self._cfg.ui or {}).get("chatbox", True)))
+        self._overlay_var = tk.BooleanVar(value=bool((self._cfg.ui or {}).get("overlay", False)))
         # 译音输出：把「我说的话」的译音回灌进虚拟声卡，VRChat 里的对方就能听见外语 TTS。
         # 这是**总开关**；config 里 directions.<X>.output_audio 是方向级开关，两者是「与」关系。
         _audio_cfg = (self._cfg.output.get("audio") or {}) if isinstance(self._cfg.output, dict) else {}
         self._vmic_var = tk.BooleanVar(value=bool(_audio_cfg.get("enabled", False)))
         tk.Checkbutton(out_frame, text="chatbox", variable=self._chatbox_var,
+                       command=self._save_ui_state,
                        **self._indicator_kw()).pack(side=tk.LEFT, padx=(6, 0))
         tk.Checkbutton(out_frame, text="手腕屏", variable=self._overlay_var,
+                       command=self._save_ui_state,
                        **self._indicator_kw()).pack(side=tk.LEFT, padx=(10, 0))
         tk.Checkbutton(out_frame, text="译音输出", variable=self._vmic_var,
                        command=self._save_audio_flag,
@@ -642,6 +650,7 @@ class TranslationGUI:
 
     def _on_direction_change(self) -> None:
         self._update_direction_langs()
+        self._save_ui_state()      # 方向要记下来，下次启动恢复（用户明确要求）
 
     def _update_direction_langs(self) -> None:
         d = self._direction_var.get()
@@ -696,6 +705,32 @@ class TranslationGUI:
             p.write_text(text, encoding="utf-8")
         except Exception as exc:  # noqa: BLE001
             print(f"[gui] 保存配置失败：{exc}", flush=True)
+
+    def _save_ui_state(self) -> None:
+        """把界面上的选择（方向 / 输出勾选）写回 config.yaml 的 `ui:` 段，下次启动恢复。
+
+        用户明确要求「方向这个东西是需要保存的」——之前每次启动都会重置成「我说的话」。
+        段不存在时补建：老 config.yaml（从旧模板生成）里没有 ui 段。
+        """
+        p = DEFAULT_CONFIG
+        if not p.exists():
+            return
+        try:
+            text = p.read_text(encoding="utf-8")
+            if not re.search(r"^ui:", text, re.M):
+                text = text.rstrip("\n") + "\n\n# 界面上次的选择（启动时自动恢复，不用手改）\nui:\n"
+            updates = [
+                (["ui", "direction"], self._direction_var.get()),
+                (["ui", "chatbox"], _fmt_scalar(bool(self._chatbox_var.get()))),
+                (["ui", "overlay"], _fmt_scalar(bool(self._overlay_var.get()))),
+            ]
+            for key_path, val in updates:
+                text = _yaml_set_in_text(text, key_path, val)
+            p.write_text(text, encoding="utf-8")
+            print(f"[gui] 界面选择已保存：direction={updates[0][1]} chatbox={updates[1][1]} "
+                  f"overlay={updates[2][1]}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[gui] 保存界面选择失败：{exc}", flush=True)
 
     def _save_audio_flag(self) -> None:
         """把译音输出总开关写回 config.yaml（output.audio.enabled），勾了就一直记住。
@@ -788,6 +823,8 @@ class TranslationGUI:
         self._specs = specs
         self._sinks = sinks
         self._pending_starts = len(specs)
+        # 手腕屏由界面持有，内容镜像聊天区（两个方向都进同一块屏）
+        self._start_overlay()
         self._start_engine(0)
         self._start_btn.configure(state=tk.DISABLED)
         self._stop_btn.configure(state=tk.NORMAL)
@@ -805,6 +842,9 @@ class TranslationGUI:
         if index >= len(specs):
             return
         who, direction, source, src_lang, tgt_lang = specs[index]
+        # 引擎不碰手腕屏：它由界面持有（一块屏显示两个方向的对话）。
+        # 若交给两个引擎各自创建，会撞 `OverlayError_KeyInUse`（用户实测）。
+        own_sinks = {s for s in self._sinks if s != "overlay"}
         events = EngineEvents(
             on_text=lambda src, txt, final, who=who: self._q.put(("text", who, src, txt, final)),
             on_status=lambda lvl, msg, who=who: self._on_engine_status(lvl, msg, who),
@@ -814,7 +854,7 @@ class TranslationGUI:
             cfg=self._cfg,
             direction=direction,
             source=source,
-            sinks=self._sinks,
+            sinks=own_sinks,
             events=events,
             config_path=DEFAULT_CONFIG,
         )
@@ -835,6 +875,46 @@ class TranslationGUI:
         print(f"[{who}][{lvl}] {msg}", flush=True)
         self._q.put(("status", lvl, msg))
 
+    # ---------------------------------------------------------------- 手腕屏（界面持有）
+    def _start_overlay(self) -> None:
+        """按勾选状态接管 SteamVR 的手腕屏。失败只禁用这一项，绝不影响翻译。
+
+        手腕屏由**界面**持有而不是某个引擎：手腕上只该有一块屏，内容是最近几句对话
+        （镜像聊天区）。交给两个引擎各自创建会撞 `OverlayError_KeyInUse`（用户实测）。
+        """
+        if "overlay" not in self._sinks:
+            return
+        try:
+            self._overlay_out = WristOverlay(
+                OverlayConfig.from_dict(self._cfg.overlay), config_path=DEFAULT_CONFIG)
+            if not self._overlay_out.start():
+                self._overlay_out = None      # start() 内部已打印原因
+                return
+            self._push_overlay(force=True)
+        except Exception as exc:  # noqa: BLE001
+            self._overlay_out = None
+            print(f"[gui] ⚠️ 手腕屏初始化异常，已禁用（翻译不受影响）："
+                  f"{type(exc).__name__}: {exc}", flush=True)
+
+    def _stop_overlay(self) -> None:
+        if self._overlay_out is None:
+            return
+        try:
+            self._overlay_out.close()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[gui] 关闭手腕屏时出错（忽略）：{exc}", flush=True)
+        self._overlay_out = None
+
+    def _push_overlay(self, force: bool = False) -> None:
+        """把聊天区最近几条推给手腕屏（同一块屏显示两个方向的对话）。"""
+        if self._overlay_out is None:
+            return
+        try:
+            entries = [(b.who, b.source, b.text) for b in self._bubbles[-8:]]
+            self._overlay_out.update_entries(entries, force=force)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[gui] 手腕屏刷新失败：{type(exc).__name__}: {exc}", flush=True)
+
     def _stop(self) -> None:
         self._pending_starts = 0
         self._specs = []
@@ -846,6 +926,7 @@ class TranslationGUI:
             self._start_job = None
         for eng in self._engines:
             eng.stop()
+        self._stop_overlay()
         self._engines = []
         self._engine_dirs = []
         self._start_btn.configure(state=tk.NORMAL)
@@ -1022,6 +1103,7 @@ class TranslationGUI:
                 kind = item[0]
                 if kind == "text":
                     self._add_text(item[2], item[3], item[4], who=item[1])
+                    self._push_overlay()   # 手腕屏镜像聊天区（同一块屏，两个方向都上）
                 elif kind == "status":
                     self._set_status(item[1], item[2])
                 elif kind == "stats":
@@ -1043,6 +1125,8 @@ class TranslationGUI:
                 self._set_status("info", "已停止")
             self._engines = []
             self._engine_dirs = []
+        if self._overlay_out is not None:
+            self._overlay_out.tick()      # 手腕屏的热重载 / 淡出
         self._root.after(50, self._poll)
 
     # ================================================================ 聊天气泡

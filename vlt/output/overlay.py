@@ -43,6 +43,9 @@ class OverlayConfig:
     border_alpha: int = 120
     color_bg: tuple[int, int, int] = (12, 14, 20)
     bg_alpha: int = 205
+    # 对话视图：我说的 / 别人说的 外缘竖条（与 GUI 气泡同色系）
+    color_mine: tuple[int, int, int] = (47, 111, 208)
+    color_theirs: tuple[int, int, int] = (110, 116, 128)
     separator: bool = True                   # 原文与译文之间的细分隔线（同色系，低透明度）
     max_lines: int = 3
     show_source: bool = True
@@ -182,6 +185,76 @@ def render_panel(text: str, source: str = "", cfg: OverlayConfig | None = None) 
     return img
 
 
+def render_conversation(entries, cfg: OverlayConfig | None = None) -> Image.Image:
+    """把「最近的对话」渲染成**一块**面板 —— 镜像 GUI 的聊天区（别人在左、我在右）。
+
+    entries: [(who, source, translation), ...]，who ∈ {"mine","theirs"}，**最后一条最新**。
+
+    尺寸固定为 cfg.size_px（不改物理宽高比，避免手腕上的面板忽大忽小）；
+    从最新往回塞，塞不下的更早条目直接不画 —— 永远优先显示最新内容。
+    """
+    cfg = cfg or OverlayConfig()
+    w, h = cfg.size_px
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    pad = 12
+    d.rounded_rectangle([pad, pad, w - pad, h - pad], radius=28,
+                        fill=(*cfg.color_bg, cfg.bg_alpha),
+                        outline=(*cfg.color_border, cfg.border_alpha), width=3)
+
+    def _f(size: int) -> ImageFont.FreeTypeFont:
+        try:
+            return ImageFont.truetype(cfg.font, size)
+        except Exception:
+            return ImageFont.load_default()
+
+    tf, sf = _f(cfg.font_size), _f(cfg.source_font_size)
+    inner_w = w - 4 * pad
+    asc_t = cfg.font_size + 10
+    asc_s = cfg.source_font_size + 6
+    budget = h - 3 * pad
+
+    shown: list[tuple[str, list[str], list[str], int]] = []
+    used = 0
+    for who, source, text in reversed(list(entries or [])):
+        t = (text or "").strip()
+        if not t:
+            continue
+        tl = wrap_text(d, t, tf, inner_w - 24)
+        src = (source or "").strip()
+        sl = wrap_text(d, src, sf, inner_w - 24) if (cfg.show_source and src) else []
+        blk_h = len(sl) * asc_s + (4 if sl else 0) + len(tl) * asc_t + 14
+        if shown and used + blk_h > budget:      # 塞不下更早的就停（保留最新）
+            break
+        shown.append((who, sl, tl, blk_h))
+        used += blk_h
+    shown.reverse()                              # 最新的在最下面，和聊天区一致
+
+    y = h - pad * 2 - used
+    for who, sl, tl, blk_h in shown:
+        mine = who == "mine"
+        if mine:                                 # 外缘竖条 + 右对齐
+            d.rounded_rectangle([w - pad * 2 - 5, y + 2, w - pad * 2, y + blk_h - 8],
+                                radius=2, fill=(*cfg.color_mine, 230))
+            tx, anchor = w - pad * 2 - 16, "ra"
+        else:
+            d.rounded_rectangle([pad * 2, y + 2, pad * 2 + 5, y + blk_h - 8],
+                                radius=2, fill=(*cfg.color_theirs, 230))
+            tx, anchor = pad * 2 + 16, "la"
+        yy = y
+        for ln in sl:                            # 原文小字在上
+            d.text((tx, yy), ln, font=sf, fill=(*cfg.color_source, cfg.source_alpha), anchor=anchor)
+            yy += asc_s
+        if sl:
+            yy += 4
+        for ln in tl:                            # 译文大字在下
+            d.text((tx, yy), ln, font=tf, fill=(*cfg.color_translation, 255), anchor=anchor)
+            yy += asc_t
+        y += blk_h
+    return img
+
+
 def build_matrix(pos: tuple[float, float, float], rot_deg: tuple[float, float, float]):
     """构造 OpenVR 的 3x4 位姿矩阵（行主序）。需要 openvr 才能返回其 ctypes 类型。"""
     import openvr
@@ -218,6 +291,7 @@ class WristOverlay:
         self._handle = None
         self._device = None
         self._last_render: tuple[str, str] | None = None
+        self._last_entries: tuple | None = None
         self._last_cfg_mtime = 0.0
         self._last_text_at = 0.0
         self.available = False
@@ -249,7 +323,26 @@ class WristOverlay:
             # AttributeError: 'IVRSystem' object has no attribute 'overlay'，
             # 而且必须放在 try 里：否则异常会冒到引擎，把整条翻译腿一起打死。
             self._overlay = openvr.IVROverlay()
-            self._handle = self._overlay.createOverlay(self.cfg.overlay_key, "VLT 手腕屏")
+            try:
+                self._handle = self._overlay.createOverlay(self.cfg.overlay_key, "VLT 手腕屏")
+            except Exception as exc:  # noqa: BLE001
+                name = type(exc).__name__
+                if "KeyInUse" not in name and "KeyInUse" not in str(exc):
+                    raise
+                # 同 key 的**残留 overlay**（上次进程异常退出没清干净）→ 清掉再建一次。
+                # 用户实测过这个报错：双引擎同时挂同一个 key 会撞
+                # `OverlayError_KeyInUse`（GUI 侧已改成只给 owner 那条腿挂）；
+                # 这里兜的是「上一次没清干净」的情况，否则手腕屏会一直被卡住。
+                print(f"[overlay] ⚠️ key '{self.cfg.overlay_key}' 已被占用（{name}），"
+                      f"尝试清理残留 overlay 后重建", flush=True)
+                try:
+                    stale = self._overlay.findOverlay(self.cfg.overlay_key)
+                    self._overlay.destroyOverlay(stale)
+                    print("[overlay]   已清理残留 overlay", flush=True)
+                except Exception as exc2:  # noqa: BLE001
+                    print(f"[overlay]   清理残留 overlay 未成功（继续尝试重建）："
+                          f"{type(exc2).__name__}: {exc2}", flush=True)
+                self._handle = self._overlay.createOverlay(self.cfg.overlay_key, "VLT 手腕屏")
             self._device = self._resolve_anchor()
             # ⚠️ available 必须在 _apply_transform 之前置位：它开头有
             # `if not self.available: return`，否则「创建时应用变换」这一步等于没做
@@ -319,6 +412,30 @@ class WristOverlay:
             path = self._frames_dir / f"{self.frames_updated:03d}.png"
             img.save(path)
             print(f"[overlay][dry-run] 第 {self.frames_updated} 帧 → {path.name} | {text[:50]}")
+            return
+        if not self.available:
+            return
+        self._upload(img)
+
+    def update_entries(self, entries, force: bool = False) -> None:
+        """刷新成**对话视图**（GUI 用这个）：entries = [(who, source, translation), ...]。
+
+        与 `update()` 的区别：`update()` 是"当前这一句"（CLI 单腿场景够用），
+        `update_entries()` 是"最近几句对话"——手腕上只有一块屏，内容应该像 GUI 的聊天区。
+        """
+        key = tuple((w, (s or "").strip(), (t or "").strip()) for w, s, t in (entries or []))
+        if key == self._last_entries and not force:
+            return
+        self._last_entries = key
+        self._last_text_at = time.monotonic()
+        img = render_conversation(entries, self.cfg)
+        if self.dry_run:
+            self.frames_updated += 1
+            self._frames_dir.mkdir(parents=True, exist_ok=True)
+            path = self._frames_dir / f"{self.frames_updated:03d}.png"
+            img.save(path)
+            print(f"[overlay][dry-run] 第 {self.frames_updated} 帧（对话视图，{len(entries or [])} 条）"
+                  f" → {path.name}")
             return
         if not self.available:
             return

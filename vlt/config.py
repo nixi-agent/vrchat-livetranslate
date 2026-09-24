@@ -84,6 +84,7 @@ class AppConfig:
     merger: dict[str, Any]
     overlay: dict[str, Any] = field(default_factory=dict)
     output: dict[str, Any] = field(default_factory=dict)
+    ui: dict[str, Any] = field(default_factory=dict)      # 界面上次的选择（方向/输出勾选），启动时恢复
 
     def direction(self, name: str) -> Direction:
         if name not in self.directions:
@@ -143,4 +144,5 @@ def load_config(path: str | Path | None = None, api_key: str | None = None) -> A
         merger=raw.get("merger") or {},
         overlay=raw.get("overlay") or {},
         output=output,
+        ui=raw.get("ui") or {},
     )

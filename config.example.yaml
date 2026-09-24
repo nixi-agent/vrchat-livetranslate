@@ -103,3 +103,9 @@ output:
     sample_rate: 48000       # VRChat / VoiceMeeter 统一要 48k
     buffer_ms: 300           # 起播前先攒这么多，避免断续
     max_buffer_ms: 2000      # 超过就丢最旧的，避免延迟越积越大
+
+# 界面（图形界面上次的选择，**启动时自动恢复**；手改也有效）
+ui:
+  direction: mine          # mine=我说的话 | theirs=别人说 | dual=双向同时
+  chatbox: true            # 输出勾选：chatbox 气泡
+  overlay: false           # 输出勾选：手腕屏（需要 SteamVR 在跑）

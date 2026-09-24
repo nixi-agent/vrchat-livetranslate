@@ -5,6 +5,7 @@ GUI 与 CLI 共用同一个 Engine 类；区别只在事件回调和音频源。
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Callable
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 from .config import AppConfig, Direction, load_config
 from .devices import resolve_device_name
@@ -583,16 +586,38 @@ async def run_loopback(session, tele, patterns: list[str] | None = None,
     stream = p.open(format=pyaudio.paInt16, channels=min(2, channels or 2), rate=rate,
                     frames_per_buffer=int(rate * 0.1), input=True, input_device_index=idx)
     queue: asyncio.Queue[bytes] = asyncio.Queue()
+    # ⚠️ 读线程必须有退出条件，且关闭流之前**必须先把它 join 掉**。
+    # 否则：一个线程卡在阻塞的 stream.read() 里，另一个线程把流 stop/close、
+    # 把 PortAudio terminate 掉 → 访问违规（原来是 while True 死循环，
+    # 用户实测点「停止翻译」时崩在这里，faulthandler 抓到 pyaudiowpatch read 里访问违规）。
+    reader_stop = threading.Event()
+    chunk_max = int(rate * 0.1)
 
     def reader():
-        while True:
+        # ⚠️ 必须用 get_read_available() **非阻塞轮询**，不能用阻塞的 stream.read()：
+        # WASAPI loopback 在端点没有音频在播时，read() 会一直不返回（实测 3 秒 0 帧、
+        # 读线程永久卡在里面），于是收尾时「关流/terminate」与「卡住的读」撞车
+        # → 访问违规（用户实测闪退，退出码 139）。轮询则任何情况下都能秒退。
+        while not reader_stop.is_set():
             try:
-                data = stream.read(int(rate * 0.1), exception_on_overflow=False)
+                avail = stream.get_read_available()
             except Exception:
                 break
-            loop.call_soon_threadsafe(queue.put_nowait, data)
+            if avail <= 0:
+                time.sleep(0.01)
+                continue
+            try:
+                data = stream.read(min(avail, chunk_max), exception_on_overflow=False)
+            except Exception:
+                break
+            if not data:
+                continue
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, data)
+            except RuntimeError:
+                break   # 事件循环已关闭（收尾中），正常退出
 
-    th = threading.Thread(target=reader, daemon=True)
+    th = threading.Thread(target=reader, daemon=True, name="vlt-loopback-reader")
     th.start()
     print("[loopback] 开始采集" + ("（Ctrl+C 结束）" if seconds <= 0 else f"（{seconds:.0f}s）"))
     end = None if seconds <= 0 else time.perf_counter() + seconds
@@ -610,6 +635,11 @@ async def run_loopback(session, tele, patterns: list[str] | None = None,
                 if tele is not None:
                     tele.add("loopback_chunk", bytes=len(pcm16))
     finally:
+        # 顺序不能改：① 通知读线程退出 → ② 等它真的退出 → ③ 才关闭流
+        reader_stop.set()
+        th.join(timeout=2.0)
+        if th.is_alive():
+            log.warning("[loopback] 读线程未在 2s 内退出，仍继续关闭流（可能竞争）")
         try:
             stream.stop_stream()
             stream.close()

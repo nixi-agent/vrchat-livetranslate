@@ -334,6 +334,10 @@ class Engine:
         )
         if not self._virtualmic.open():
             self._virtualmic = None
+            print(f"[virtualmic] 打开失败 → 译音输出已禁用（其余功能不受影响）：{name}", flush=True)
+        else:
+            print(f"[virtualmic] 已打开译音输出设备：{name} @ {self._virtualmic.sample_rate}Hz"
+                  f"（译音会写进这里，VRChat 选它当麦克风就能听见）", flush=True)
 
     async def _create_session(self, scfg: SessionConfig) -> None:
         now = time.monotonic()

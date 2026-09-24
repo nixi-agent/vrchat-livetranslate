@@ -300,14 +300,24 @@ class TranslationGUI:
         self._target_combo.pack(side=tk.LEFT, padx=(4, 20))
         self._target_combo.bind("<<ComboboxSelected>>", self._on_lang_change)
 
-        out_frame = ttk.Frame(ctrl)
-        out_frame.pack(side=tk.LEFT)
+        # 输出勾选框**单独一行**：和方向/语言挤在同一行时整行需要 1062px，
+        # 而窗口默认只有 920px —— 超出部分会被 Tk 直接裁掉，
+        # 表现就是「某个选项莫名消失」（用户实测看不到「手腕屏」勾选框）。
+        out_frame = ttk.Frame(self._root, padding=(14, 0))
+        out_frame.pack(fill=tk.X)
         ttk.Label(out_frame, text="输出:").pack(side=tk.LEFT)
         self._chatbox_var = tk.BooleanVar(value=True)
         self._overlay_var = tk.BooleanVar(value=False)
+        # 译音输出：把「我说的话」的译音回灌进虚拟声卡，VRChat 里的对方就能听见外语 TTS。
+        # 这是**总开关**；config 里 directions.<X>.output_audio 是方向级开关，两者是「与」关系。
+        _audio_cfg = (self._cfg.output.get("audio") or {}) if isinstance(self._cfg.output, dict) else {}
+        self._vmic_var = tk.BooleanVar(value=bool(_audio_cfg.get("enabled", False)))
         tk.Checkbutton(out_frame, text="chatbox", variable=self._chatbox_var,
                        **self._indicator_kw()).pack(side=tk.LEFT, padx=(6, 0))
         tk.Checkbutton(out_frame, text="手腕屏", variable=self._overlay_var,
+                       **self._indicator_kw()).pack(side=tk.LEFT, padx=(10, 0))
+        tk.Checkbutton(out_frame, text="译音输出", variable=self._vmic_var,
+                       command=self._save_audio_flag,
                        **self._indicator_kw()).pack(side=tk.LEFT, padx=(10, 0))
 
     @staticmethod
@@ -474,6 +484,25 @@ class TranslationGUI:
         except Exception as exc:
             print(f"[gui] 保存配置失败：{exc}")
 
+    def _save_audio_flag(self) -> None:
+        """把译音输出总开关写回 config.yaml（output.audio.enabled），勾了就一直记住。"""
+        want = bool(self._vmic_var.get())
+        p = DEFAULT_CONFIG
+        if not p.exists():
+            return
+        try:
+            raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+            out = dict(raw.get("output") or {})
+            audio = dict(out.get("audio") or {})
+            audio["enabled"] = want
+            out["audio"] = audio
+            raw["output"] = out
+            with p.open("w", encoding="utf-8") as f:
+                yaml.dump(raw, f, allow_unicode=True, default_flow_style=False)
+            print(f"[gui] 译音输出总开关 → {'开' if want else '关'}（已写入 config.yaml）", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[gui] 保存译音开关失败：{exc}", flush=True)
+
     def _push_lang_to_engines(self) -> None:
         a, b = self._lang_pair["source"], self._lang_pair["target"] or "en"
         for name, (src, tgt) in (("mine", (a, b)), ("theirs", (b, a or "zh"))):
@@ -519,10 +548,27 @@ class TranslationGUI:
             print(f"[gui]   腿 {_dir}：来源={'麦克风' if _src == 'mic' else '游戏音频(loopback)'}"
                   f" | {_sl}→{_tl}", flush=True)
 
+        # 译音输出：勾选框（总开关）+ 方向级开关，两者是「与」关系，都开才出声。
+        # 译音回灌只对「我说的话」有意义（对方要听的是我说的话的译文）；
+        # 「别人说」的译文是我自己的母语，回灌进虚拟麦毫无意义 → 明确告知，不静默忽略。
+        want_audio = bool(self._vmic_var.get())
+        audio_warn = ""
+        if want_audio and not any(s[1] == "mine" for s in specs):
+            audio_warn = "译音输出只对「我说的话」方向有效（当前方向不含它）→ 本次已忽略"
+            print(f"[gui] ⚠️ {audio_warn}", flush=True)
+            want_audio = False
+        if isinstance(self._cfg.output, dict):
+            self._cfg.output.setdefault("audio", {})["enabled"] = want_audio
+            _dev = (self._cfg.output.get("audio") or {}).get("device_name") or "自动回退链"
+        else:
+            _dev = "自动回退链"
+        print(f"[gui]   译音输出={'开' if want_audio else '关'}（虚拟声卡：{_dev}）", flush=True)
+
         for _who, direction, _src, src_lang, tgt_lang in specs:
             dd = self._cfg.directions.setdefault(direction, Direction())
             dd.source_lang = src_lang
             dd.target_lang = tgt_lang
+            dd.output_audio = want_audio and direction == "mine"
 
         self._current = {}
         self._auto_scroll = True
@@ -534,7 +580,9 @@ class TranslationGUI:
         self._start_engine(0)
         self._start_btn.configure(state=tk.DISABLED)
         self._stop_btn.configure(state=tk.NORMAL)
-        if d == "mine":
+        if audio_warn:
+            self._set_status("warn", audio_warn)
+        elif d == "mine":
             # 只翻自己的话时明确提示一句：用户放英文视频却没选对方向，
             # 表现就是「翻译坏了」，而实际是根本没采集对方/视频的声音。
             self._set_status("info", "正在启动…（只翻译你说的话；要翻译对方/视频请选「双向同时」）")
@@ -548,7 +596,7 @@ class TranslationGUI:
         who, direction, source, src_lang, tgt_lang = specs[index]
         events = EngineEvents(
             on_text=lambda src, txt, final, who=who: self._q.put(("text", who, src, txt, final)),
-            on_status=lambda lvl, msg: self._q.put(("status", lvl, msg)),
+            on_status=lambda lvl, msg, who=who: self._on_engine_status(lvl, msg, who),
             on_stats=lambda s: self._q.put(("stats", s)),
         )
         eng = Engine(
@@ -566,6 +614,15 @@ class TranslationGUI:
         if self._pending_starts > 0:
             # 两个引擎错开 300ms 启动，避免同时抢占音频设备
             self._start_job = self._root.after(300, self._start_engine, index + 1)
+
+    def _on_engine_status(self, lvl: str, msg: str, who: str) -> None:
+        """引擎状态既要进状态栏，也要进日志（stdout）。
+
+        状态栏文字不落盘 —— 少了这一行，「译音输出为什么没出声」「设备为什么没匹配上」
+        这类提示在用户发来的日志里完全看不到，只能靠猜。
+        """
+        print(f"[{who}][{lvl}] {msg}", flush=True)
+        self._q.put(("status", lvl, msg))
 
     def _stop(self) -> None:
         self._pending_starts = 0

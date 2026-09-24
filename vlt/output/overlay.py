@@ -294,8 +294,8 @@ class WristOverlay:
         self._overlay.setOverlayTransformTrackedDeviceRelative(self._handle, self._device, m)
         self._overlay.setOverlayWidthInMeters(self._handle, self.cfg.width_m)
         self._overlay.setOverlayAlpha(self._handle, self.cfg.alpha)
-        if self.cfg.curvature:
-            self._overlay.setOverlayCurvature(self._handle, self.cfg.curvature)
+        # 弯曲每次都应用：只在 >0 时设置的话，把它调回 0 就永远回不去了
+        self._overlay.setOverlayCurvature(self._handle, max(0.0, min(1.0, self.cfg.curvature)))
 
     # ---------- 文本 ----------
     def update(self, text: str, source: str = "", force: bool = False) -> None:
@@ -344,12 +344,23 @@ class WristOverlay:
 
                     raw = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
                     new_cfg = OverlayConfig.from_dict(raw.get("overlay") or {})
-                    if (new_cfg.pos, new_cfg.rot, new_cfg.width_m, new_cfg.alpha) != \
-                       (self.cfg.pos, self.cfg.rot, self.cfg.width_m, self.cfg.alpha):
+                    # 弯曲与锚点也要参与比对：少了它们，界面上拖动弯曲滑块、
+                    # 或切换锚点（左手/右手/tracker）时热重载会「静默不生效」。
+                    geo_changed = (new_cfg.pos, new_cfg.rot, new_cfg.width_m, new_cfg.alpha,
+                                   new_cfg.curvature) != (self.cfg.pos, self.cfg.rot,
+                                                          self.cfg.width_m, self.cfg.alpha,
+                                                          self.cfg.curvature)
+                    anchor_changed = (new_cfg.anchor != self.cfg.anchor
+                                      or new_cfg.tracker_index != self.cfg.tracker_index)
+                    if geo_changed or anchor_changed:
                         self.cfg = new_cfg
                         if self.available:
+                            if anchor_changed:
+                                self._device = self._resolve_anchor()
                             self._apply_transform()
-                        print(f"[overlay] ♻️ 配置热重载：pos={new_cfg.pos} width={new_cfg.width_m}m alpha={new_cfg.alpha}")
+                        print(f"[overlay] ♻️ 配置热重载：anchor={new_cfg.anchor} pos={new_cfg.pos} "
+                              f"rot={new_cfg.rot} width={new_cfg.width_m}m "
+                              f"curvature={new_cfg.curvature} alpha={new_cfg.alpha}")
                 except Exception as exc:  # noqa: BLE001
                     print(f"[overlay] ⚠️ 热重载失败（保留旧配置）：{exc}")
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import queue
+import re
 import sys
 import threading
 import time
@@ -111,6 +112,61 @@ class _Bubble:
     y: int = 0
     h: int = 0
     items: list = field(default_factory=list)
+
+
+def _yaml_set_in_text(text: str, path: list[str], value: str) -> str:
+    """在 YAML 文本里**就地**改一个叶子值，保留注释、空行与键的顺序。
+
+    为什么不用 `yaml.safe_load` + `yaml.dump` 整文件重写：那会抹平所有注释和顺序
+    （实测把一份带完整中文说明的 config.yaml 变成一坨没有注释的键值对，键还被按字母重排）。
+    配置文件是给人读的，程序存个设置不该毁掉它的可读性。
+    找不到路径就返回原文——宁可这次没生效，也不退化成整文件重写。
+    """
+    lines = text.split("\n")
+
+    def _span(key: str, indent: int, lo: int, hi: int):
+        head = re.compile(rf"^(\s*){re.escape(key)}:\s*$")
+        for i in range(lo, hi):
+            m = head.match(lines[i])
+            if m is None or len(m.group(1)) != indent:
+                continue
+            sub_hi = hi
+            for j in range(i + 1, hi):
+                if lines[j].strip() and not lines[j].startswith(" " * (indent + 1)):
+                    sub_hi = j
+                    break
+            return i, sub_hi
+        return None
+
+    lo, hi, indent = 0, len(lines), 0
+    for key in path[:-1]:
+        got = _span(key, indent, lo, hi)
+        if got is None:
+            return text
+        lo, hi = got[0] + 1, got[1]
+        indent += 2
+
+    leaf = path[-1]
+    pat = re.compile(rf"^(\s*){re.escape(leaf)}:(\s*)([^#\n]*)(\s*#.*)?$")
+    for i in range(lo, hi):
+        m = pat.match(lines[i])
+        if m and len(m.group(1)) == indent:
+            comment = (m.group(4) or "").strip()
+            lines[i] = f"{m.group(1)}{leaf}: {value}" + (f"   {comment}" if comment else "")
+            return "\n".join(lines)
+    lines.insert(hi, f"{' ' * indent}{leaf}: {value}")
+    return "\n".join(lines)
+
+
+def _fmt_scalar(x) -> str:  # noqa: ANN001
+    """None → null；float → 紧凑写法（0.24 而不是 0.24000000000000002）。"""
+    if x is None:
+        return "null"
+    if isinstance(x, bool):
+        return "true" if x else "false"
+    if isinstance(x, float):
+        return f"{x:g}"
+    return str(x)
 
 
 class TranslationGUI:
@@ -319,6 +375,16 @@ class TranslationGUI:
         tk.Checkbutton(out_frame, text="译音输出", variable=self._vmic_var,
                        command=self._save_audio_flag,
                        **self._indicator_kw()).pack(side=tk.LEFT, padx=(10, 0))
+        self._tune_btn = ttk.Button(out_frame, text="手腕屏微调 ▸", width=13,
+                                    command=self._toggle_tune_panel)
+        self._tune_btn.pack(side=tk.LEFT, padx=(16, 0))
+
+        # 微调面板：外层常驻（保证位置固定），只切换内层 body 的显隐——
+        # 若整块 pack_forget 再 pack，会被排到窗口最底部去。
+        self._tune_frame = ttk.Frame(self._root, padding=(14, 0))
+        self._tune_frame.pack(fill=tk.X)
+        self._tune_body = ttk.Frame(self._tune_frame)
+        self._build_tune_body()
 
     @staticmethod
     def _indicator_kw() -> dict:
@@ -326,6 +392,155 @@ class TranslationGUI:
         return dict(bg=PANEL, fg=TEXT, activebackground=PANEL,
                     activeforeground="#ffffff", selectcolor=SURFACE,
                     highlightthickness=0, bd=0, font=FONT_UI)
+
+    # ---------------------------------------------------------------- 手腕屏微调
+    def _toggle_tune_panel(self) -> None:
+        """展开/收起微调面板（只切内层 body，外层常驻以固定位置）。
+
+        展开时同步把窗口加高：否则聊天区被面板挤扁（实测 434px → 329px），
+        而调参时正需要一边看译文一边拖。
+        """
+        win_h = self._root.winfo_height()
+        win_w = self._root.winfo_width()
+        if self._tune_body.winfo_ismapped():
+            self._tune_body.pack_forget()
+            # ⚠️ 只 pack_forget 不够：Tk 不会重算空 frame 的高度（实测 reqheight 仍停在 106），
+            # 那 106px 会一直占着把聊天区压扁。必须显式关掉传播并把高度压到 0。
+            self._tune_frame.pack_propagate(False)
+            self._tune_frame.configure(height=1)
+            self._tune_btn.configure(text="手腕屏微调 ▸")
+            new_h = max(self._root.minsize()[1], win_h - getattr(self, "_tune_added_h", 0))
+        else:
+            self._tune_frame.pack_propagate(True)
+            self._tune_body.pack(fill=tk.X)
+            self._tune_btn.configure(text="手腕屏微调 ▾")
+            self._root.update_idletasks()
+            self._tune_added_h = self._tune_body.winfo_reqheight() + 8
+            new_h = win_h + self._tune_added_h
+        self._root.geometry(f"{win_w}x{new_h}")
+
+    def _build_tune_body(self) -> None:
+        """手腕屏微调：滑块改动 → 写回 config.yaml → overlay 配置热重载（无需重启）。
+
+        面板做成**可收起**的（默认收起）：它是调试期工具，平时不该占屏幕，
+        但参数全都要能拖——位置/旋转/大小/弯曲/透明度 + 锚点。
+        """
+        ov = self._cfg.overlay if isinstance(self._cfg.overlay, dict) else {}
+        off = ov.get("offset") or {}
+        pos = list(off.get("pos") or [0.0, 0.06, 0.02])
+        rot = list(off.get("rot") or [0, 0, 0])
+        self._tune_values: dict[str, float] = {
+            "pos_x": float(pos[0]), "pos_y": float(pos[1]), "pos_z": float(pos[2]),
+            "rot_x": float(rot[0]), "rot_y": float(rot[1]), "rot_z": float(rot[2]),
+            "width_m": float(off.get("width_m", 0.24)),
+            "curvature": float(off.get("curvature", 0.0)),
+            "alpha": float(off.get("alpha", 0.9)),
+        }
+        self._ov_save_job: str | None = None
+        self._anchor_label_to_key = {"右手": "right_hand", "左手": "left_hand",
+                                     "前臂 tracker": "tracker", "头显前固定": "hmd"}
+        _key_to_label = {v: k for k, v in self._anchor_label_to_key.items()}
+
+        row = ttk.Frame(self._tune_body)
+        row.pack(fill=tk.X, pady=(2, 2))
+        ttk.Label(row, text="锚点:", font=FONT_UI).pack(side=tk.LEFT)
+        self._anchor_combo = ttk.Combobox(row, values=list(self._anchor_label_to_key),
+                                          state="readonly", width=12, font=FONT_UI)
+        self._anchor_combo.set(_key_to_label.get(str(ov.get("anchor", "right_hand")), "右手"))
+        self._anchor_combo.pack(side=tk.LEFT, padx=(4, 14))
+        self._anchor_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_anchor_change())
+        ttk.Label(row, text="tracker 序号:", font=FONT_UI).pack(side=tk.LEFT)
+        self._tracker_var = tk.StringVar(value=str(ov.get("tracker_index", 0)))
+        ttk.Spinbox(row, from_=0, to=3, width=3, font=FONT_UI, textvariable=self._tracker_var,
+                    command=self._save_overlay_cfg).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(row, text="（仅锚点=前臂 tracker 时有效）", font=FONT_STATUS,
+                  foreground=TEXT_MUTED).pack(side=tk.LEFT, padx=(10, 0))
+
+        grid = ttk.Frame(self._tune_body)
+        grid.pack(fill=tk.X, pady=(2, 2))
+        specs = [
+            ("pos_x", "位置X", -0.30, 0.30, 0.005, "m"),
+            ("pos_y", "位置Y", -0.30, 0.30, 0.005, "m"),
+            ("pos_z", "位置Z", -0.30, 0.30, 0.005, "m"),
+            ("rot_x", "俯仰X", -90.0, 90.0, 1.0, "°"),
+            ("rot_y", "偏航Y", -90.0, 90.0, 1.0, "°"),
+            ("rot_z", "翻滚Z", -90.0, 90.0, 1.0, "°"),
+            ("width_m", "大小", 0.05, 0.80, 0.01, "m"),
+            ("curvature", "弯曲", 0.0, 0.50, 0.01, ""),
+            ("alpha", "透明度", 0.10, 1.00, 0.05, ""),
+        ]
+        for i, (key, label, lo, hi, res, unit) in enumerate(specs):
+            row_i, col_i = divmod(i, 3)
+            cell = ttk.Frame(grid)
+            cell.grid(row=row_i, column=col_i, sticky="w", padx=(0, 18), pady=1)
+            ttk.Label(cell, text=label, font=FONT_UI, width=6).pack(side=tk.LEFT)
+            var = tk.DoubleVar(value=self._tune_values[key])
+            val_lbl = ttk.Label(cell, text=f"{self._tune_values[key]:g}{unit}",
+                                font=FONT_STATUS, foreground=TEXT_DIM, width=7)
+            tk.Scale(cell, from_=lo, to=hi, resolution=res, orient=tk.HORIZONTAL,
+                     variable=var, showvalue=False, length=104, width=10,
+                     bg=PANEL, fg=TEXT, troughcolor=SURFACE, activebackground=ACCENT,
+                     highlightthickness=0, bd=0, sliderrelief=tk.FLAT,
+                     command=self._make_tune_handler(key, var, val_lbl, unit)).pack(side=tk.LEFT, padx=(4, 6))
+            val_lbl.pack(side=tk.LEFT)
+
+    def _make_tune_handler(self, key: str, var, lbl, unit: str):  # noqa: ANN001
+        def _on_move(_v: str) -> None:
+            self._tune_values[key] = round(float(var.get()), 4)
+            lbl.configure(text=f"{self._tune_values[key]:g}{unit}")
+            self._schedule_overlay_save()
+        return _on_move
+
+    def _on_anchor_change(self) -> None:
+        self._save_overlay_cfg()
+
+    def _schedule_overlay_save(self) -> None:
+        """拖动时不要每像素写盘：延后 200ms，停手才落盘。"""
+        if self._ov_save_job is not None:
+            try:
+                self._root.after_cancel(self._ov_save_job)
+            except Exception:
+                pass
+        self._ov_save_job = self._root.after(200, self._save_overlay_cfg)
+
+    def _save_overlay_cfg(self) -> None:
+        """把微调面板的值写回 config.yaml；overlay 侧有热重载，改完立刻生效。
+
+        用就地改文本的方式（`_yaml_set_in_text`），**不整文件重写**，
+        否则拖动一次滑块就会把配置里的注释和键顺序全抹掉。
+        """
+        self._ov_save_job = None
+        p = DEFAULT_CONFIG
+        if not p.exists():
+            return
+        try:
+            text = p.read_text(encoding="utf-8")
+            v = self._tune_values
+            try:
+                tracker = int(self._tracker_var.get())
+            except (TypeError, ValueError):
+                tracker = 0
+            updates: list[tuple[list[str], str]] = [
+                (["overlay", "anchor"],
+                 self._anchor_label_to_key.get(self._anchor_combo.get(), "right_hand")),
+                (["overlay", "tracker_index"], str(tracker)),
+                (["overlay", "offset", "pos"],
+                 f"[{_fmt_scalar(v['pos_x'])}, {_fmt_scalar(v['pos_y'])}, {_fmt_scalar(v['pos_z'])}]"),
+                (["overlay", "offset", "rot"],
+                 f"[{_fmt_scalar(v['rot_x'])}, {_fmt_scalar(v['rot_y'])}, {_fmt_scalar(v['rot_z'])}]"),
+                (["overlay", "offset", "width_m"], _fmt_scalar(v["width_m"])),
+                (["overlay", "offset", "curvature"], _fmt_scalar(v["curvature"])),
+                (["overlay", "offset", "alpha"], _fmt_scalar(v["alpha"])),
+            ]
+            for key_path, val in updates:
+                text = _yaml_set_in_text(text, key_path, val)
+            p.write_text(text, encoding="utf-8")
+            print(f"[gui] 手腕屏参数已写入 config.yaml：anchor={updates[0][1]} "
+                  f"pos={updates[2][1]} rot={updates[3][1]} width={updates[4][1]}m "
+                  f"curvature={updates[5][1]} alpha={updates[6][1]}（overlay 会热重载，无需重启）",
+                  flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[gui] 保存手腕屏参数失败：{exc}", flush=True)
 
     def _build_device_row(self) -> None:
         row = ttk.Frame(self._root, padding=(14, 6))
@@ -461,7 +676,10 @@ class TranslationGUI:
         self._update_direction_langs()
 
     def _save_lang_config(self) -> None:
-        """把互为镜像的两组方向写回 config.yaml（mine: A→B / theirs: B→A）。"""
+        """把互为镜像的两组方向写回 config.yaml（mine: A→B / theirs: B→A）。
+
+        就地改文本，不整文件重写（原因见 `_yaml_set_in_text`）。
+        """
         a, b = self._lang_pair["source"], self._lang_pair["target"] or "en"
         pairs = {
             "mine": {"source_lang": a, "target_lang": b},
@@ -471,34 +689,27 @@ class TranslationGUI:
         if not p.exists():
             return
         try:
-            raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-            dirs = dict(raw.get("directions") or {})
+            text = p.read_text(encoding="utf-8")
             for name, langs in pairs.items():
-                d = dict(dirs.get(name) or {})
-                d["source_lang"] = langs["source_lang"]
-                d["target_lang"] = langs["target_lang"]
-                dirs[name] = d
-            raw["directions"] = dirs
-            with p.open("w", encoding="utf-8") as f:
-                yaml.dump(raw, f, allow_unicode=True, default_flow_style=False)
-        except Exception as exc:
-            print(f"[gui] 保存配置失败：{exc}")
+                for key, val in langs.items():
+                    text = _yaml_set_in_text(text, ["directions", name, key], _fmt_scalar(val))
+            p.write_text(text, encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[gui] 保存配置失败：{exc}", flush=True)
 
     def _save_audio_flag(self) -> None:
-        """把译音输出总开关写回 config.yaml（output.audio.enabled），勾了就一直记住。"""
+        """把译音输出总开关写回 config.yaml（output.audio.enabled），勾了就一直记住。
+
+        就地改一行（`_yaml_set_in_text`），不整文件重写 —— 保住注释与键顺序。
+        """
         want = bool(self._vmic_var.get())
         p = DEFAULT_CONFIG
         if not p.exists():
             return
         try:
-            raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-            out = dict(raw.get("output") or {})
-            audio = dict(out.get("audio") or {})
-            audio["enabled"] = want
-            out["audio"] = audio
-            raw["output"] = out
-            with p.open("w", encoding="utf-8") as f:
-                yaml.dump(raw, f, allow_unicode=True, default_flow_style=False)
+            text = p.read_text(encoding="utf-8")
+            text = _yaml_set_in_text(text, ["output", "audio", "enabled"], _fmt_scalar(want))
+            p.write_text(text, encoding="utf-8")
             print(f"[gui] 译音输出总开关 → {'开' if want else '关'}（已写入 config.yaml）", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[gui] 保存译音开关失败：{exc}", flush=True)

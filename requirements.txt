@@ -1,0 +1,13 @@
+# VRChat 实时同传 —— 依赖（Python 3.11，Windows）
+# 本机验证过的版本写在注释里；用 >= 是为了在别的机器上能解析到可用 wheel。
+
+PyAudioWPatch>=0.2.12.8   # WASAPI loopback 采集（听别人说话）—— 必须是这个分支，不是 pyaudio
+pycaw>=20240210           # 音频端点信息（设备枚举/默认设备）
+openvr>=1.26.701          # SteamVR overlay（手腕屏）
+python-osc>=1.9.0         # 发 chatbox 消息（UDP 127.0.0.1:9000）
+Pillow>=10.0.0            # 把中日文渲染成贴图
+websockets>=12.0          # 与阿里实时翻译建立双工会话
+numpy>=1.26               # 重采样 / 音频处理
+sounddevice>=0.4.6        # 麦克风采集 + 设备枚举
+miniaudio>=1.60           # （留给语音路）音频格式转换
+PyYAML>=6.0               # 配置读取

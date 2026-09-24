@@ -1,0 +1,155 @@
+# VRChat 实时同传
+
+在 VRChat 里做实时同声传译。当前实现两条腿：
+
+| 腿 | 状态 | 说明 |
+|---|---|---|
+| ① 我说 → **chatbox 气泡** | ✅ 可用 | 麦克风 → 端到端语音翻译 → 每 2 秒刷新译文，句末刷最终版 |
+| ② 别人说 → **VR 手腕屏** | ✅ 可用（待真机目视） | 采集 VRChat 播放输出 → 中文渲染到 SteamVR overlay，**有更新就立刻上屏** |
+| ③ 我说 → **译音进对方耳朵** | ⬜ 未实现 | 需装 VoiceMeeter（方案已定：模型直出译音 → 虚拟声卡） |
+
+---
+
+## 一、前置条件
+
+1. **Windows 10/11**（用到 WASAPI 与 SteamVR）
+2. **Python 3.11**（3.12 未测；务必勾选 Add to PATH）
+   https://www.python.org/downloads/release/python-3119/
+3. **VRChat**：设置里打开 OSC（`OSC enabled: True`），chat bubble visibility 设为 Everyone
+4. **SteamVR**（只有第②条腿需要）
+5. **阿里云百炼 API key**（必须，个人实名认证即可）
+
+## 二、安装
+
+双击 **`setup.bat`**（会自动建 venv + 装依赖，约 1–2 分钟）。
+
+手动等价命令：
+
+```bat
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+## 三、配置 API key（二选一）
+
+```bat
+:: 方式A：环境变量（推荐，重开一个命令行窗口生效）
+setx DASHSCOPE_API_KEY "sk-你的key"
+
+:: 方式B：用百炼 CLI 存起来（需要 npm install -g bailian-cli）
+bl auth login --api-key "sk-你的key"
+```
+
+app 读取顺序：`DASHSCOPE_API_KEY` 环境变量 → `%USERPROFILE%\.bailian\config.json`。
+**key 只从这两处读，不写进项目文件。**
+
+## 四、自检（推荐先跑这个）
+
+双击 **`run_selfcheck.bat`**。它会依次检查：模块齐全 → key 能读到 → 能渲染手腕屏贴图 →
+用自带测试音频跑一遍完整链路（中文→英文，打进 chatbox）。
+
+VRChat 开着的话，气泡里应该出现：
+`Hello, I'm Nixi. Today, we're going to test out the real-time simultaneous interpretation feature in VRChat.`
+
+## 五、正式使用
+
+### ① 我说 → chatbox
+双击 **`run_chatbox.bat`**（会先列音频设备，确认麦克风没问题再开始）。
+或手动：
+
+```bat
+.venv\Scripts\python.exe -m vlt.app --direction mine --mic --sink chatbox
+```
+
+### ② 别人说 → 手腕屏（需要 SteamVR 在跑）
+双击 **`run_overlay.bat`**。或手动：
+
+```bat
+.venv\Scripts\python.exe -m vlt.app --direction theirs --loopback --sink overlay
+```
+
+### 两条腿同时用
+**开两个命令行窗口**，一个跑 chatbox、一个跑 overlay（各自一条 WS 会话，互不干扰）。
+> 单进程双会话模式还没做；两条腿一起跑时各占一次 WS 连接（限流 RPM 10，够用）。
+
+### 常用参数
+
+| 参数 | 作用 |
+|---|---|
+| `--direction mine/theirs` | 用 config.yaml 里哪个方向 |
+| `--mic` / `--loopback` / `--pcm <file>` | 音源：麦克风 / VRChat 播放输出 / 离线 PCM |
+| `--sink chatbox/overlay/both` | 输出去向 |
+| `--list-devices` | 列出音频设备（选麦克风时用） |
+| `--mic-device realtek` | 按名称子串选麦克风 |
+| `--dry-run` | 不真发 OSC，只打印 |
+| `--overlay-dry-run` | 不接管 SteamVR，每帧渲染成 PNG 存 `out/overlay_frames/` |
+| `--log-events` | 把服务端事件序列写进埋点（排查用） |
+| `--seconds 30` | 只跑 30 秒（默认 0 = 一直跑到 Ctrl+C） |
+
+## 六、改配置（`config.yaml`，改完**不用重启**）
+
+```yaml
+session:
+  model: qwen3.8-livetranslate-flash-realtime   # 可换 qwen3.5-*（字段/事件会自动切换）
+  voice: Tina                                   # ⚠️ 必须显式指定，不填会报错
+  final_silence_s: 3.0                          # 服务端不发 done 时的兜底终结阈值
+
+directions:
+  mine:   { source_lang: zh, target_lang: en, output_audio: false }   # 我说→气泡
+  theirs: { source_lang: null, target_lang: zh, output_audio: false } # 别人说→手腕屏
+
+chatbox:
+  interval_s: 2.0        # 气泡刷新节奏（漏桶 5 条/5 秒，2 秒余量充足）
+
+overlay:
+  interval_s: 0          # 0 = 有更新立刻上屏（手腕屏不受 chatbox 限流约束）
+  anchor: right_hand     # left_hand | right_hand | tracker | hmd
+  offset:
+    pos: [0.0, 0.06, 0.02]   # 位置（米）；改完存盘即生效
+    width_m: 0.24            # 面板宽
+  source_alpha: 205      # 原文亮度（150 会显灰像另一个颜色）
+```
+
+## 七、排障
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 气泡里没东西 | VRChat 没开 / OSC 没开 / chat bubble visibility 是 Off。`--dry-run` 能看到发送日志说明程序没问题 |
+| `[loopback] 没找到任何 loopback 设备` | VRChat 没在放声音；或在**远程桌面会话**里跑（WASAPI 端点按会话隔离，必须在物理机当前会话） |
+| 麦克风采不到声音 | 同上；`--list-devices` 确认设备；`--mic-device` 指定 |
+| `Voice 'Chelsie' is not supported` | `session.voice` 没填。保持 `Tina` |
+| `Invalid translation parameter` | `session.update` 缺 `translation` 字段（代码里已保证，改代码时注意） |
+| `1007 Requests rate limit exceeded` | 撞了 RPM 10。等 1 分钟；别频繁重启（**每次 WS 连接都算一次请求**） |
+| `[overlay] SteamVR 未运行或不可用` | 正常降级：只有手腕屏不显示，chatbox 不受影响 |
+| 手腕屏看不见 | 先确认 SteamVR 在跑；再调 `offset.pos` / `width_m`；`--overlay-dry-run` 能出 PNG 说明渲染没问题 |
+
+## 八、项目结构
+
+```
+vlt/
+├── app.py                主程序：音源 → 会话 → 输出（含麦克风/环回采集）
+├── config.py             配置加载；API key 只从环境变量或 bl CLI 配置读
+├── session/
+│   ├── base.py           TextDelta / SessionConfig / LiveTranslateSession / create_session
+│   └── qwen38.py         3.8/3.5 事件按代次分派 + 连接预算 + 静默兜底
+└── output/
+    ├── merger.py         首 delta 立即发 → 2s 快照 → 句末 flush（只管 chatbox）
+    ├── chatbox.py        OSC ,sTT + 令牌桶 + 最终版补发队列
+    └── overlay.py        手腕屏渲染 + SteamVR overlay + 配置热重载
+scripts/                  探针与调试工具（probe_*、osc_listen）
+tests/                    渲染回归测试（拉丁整词保护 / 中文避头尾）
+docs/                     P0.5 / P1 / P2 实测结果
+testdata/                 自带测试音频（中文 8.56s、英文 7.92s，16kHz PCM）
+```
+
+## 九、设计要点（踩过的坑，别踩第二遍）
+
+1. **事件名按模型代次分派**：3.8 纯文本用 `response.text.delta`，文本+音频用 `response.audio_transcript.delta`；
+   3.5 用 `response.text.text`（含 `stash` 预测文本）。接错代 → 文本路静默为空。
+2. **`session.update` 必须整体下发且必带 `translation`**，服务端不做字段合并。
+3. **服务端在持续音频下不发 `done`** → 靠静默兜底（阈值必须大于增量间隔，实测最大 2.15s，取 3.0s）。
+4. **RPM 10：每次 WS 连接算一次请求**，重连要退避。
+5. **chatbox 是漏桶 5 条/5 秒**，且**最终版不可丢**（被拒要入队补发）；手腕屏不受此限制。
+6. **WASAPI 端点按 Windows 会话隔离**，采集必须在物理控制台会话。
+7. **Steam Link 场景下游戏音频走 `Steam Streaming Speakers`**，不是扬声器；设备选择用名称回退链，别写死 ID。

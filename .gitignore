@@ -1,0 +1,18 @@
+# 运行产物与本地环境（不进版本库）
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 运行日志与输出
+logs/
+out/
+
+# 本地个人配置（如果复制成 config.local.yaml 就不会被提交）
+config.local.yaml
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

@@ -28,15 +28,32 @@ ROOT = Path(__file__).resolve().parent.parent
 FONT = ("Microsoft YaHei UI", 11)          # 译文（主）
 FONT_SMALL = ("Microsoft YaHei UI", 9)     # 原文（辅，小一号）
 FONT_META = ("Microsoft YaHei UI", 8)
+FONT_UI = ("Microsoft YaHei UI", 9)        # 控件文字
+FONT_STATUS = ("Microsoft YaHei UI", 8)    # 状态栏
 MAX_BUBBLES = 500
-BG = "#14161c"
-COLOR_MINE = "#2f6fd0"
-COLOR_THEIRS = "#33363f"
-COLOR_TEXT = "#ffffff"
-COLOR_META = "#6f7480"
+
+# ---- 统一配色：深灰 + 蓝（明度阶梯：聊天区最暗 → 面板次之 → 控件最亮） ----
+BG            = "#14161c"   # 聊天区背景（最暗）
+PANEL         = "#1b1e26"   # 顶栏 / 状态栏 / 窗口底色
+SURFACE       = "#262a33"   # 按钮 / 下拉框 / 指示器底色（最亮一档）
+SURFACE_HOVER = "#303541"   # 悬停
+BORDER        = "#2e333d"   # 边框 / 分割线
+ACCENT        = "#2f6fd0"   # 主色蓝（与"我说的"气泡同色）
+ACCENT_HOVER  = "#3a7de0"
+ACCENT_ACTIVE = "#2559a8"   # 按下
+TEXT          = "#e8eaee"   # 主文字
+TEXT_DIM      = "#9aa1ad"   # 次要文字
+TEXT_MUTED    = "#6f7480"   # 时间戳 / 占位
+COLOR_MINE    = ACCENT      # 气泡：我说的
+COLOR_THEIRS  = "#33363f"   # 气泡：别人说的
+COLOR_TEXT    = "#ffffff"
+COLOR_META    = TEXT_MUTED
+COLOR_OK      = "#4a90d9"   # 状态栏 info
+COLOR_WARN    = "#d9904a"
+COLOR_ERROR   = "#e05a5a"
 # 原文小字的颜色：比译文暗一档但仍清晰可读（按气泡底色分别取，保证对比度）
 COLOR_SRC_MINE = "#c3d4ee"
-COLOR_SRC_THEIRS = "#9aa1ad"
+COLOR_SRC_THEIRS = TEXT_DIM
 
 SOURCE_LANGS = {
     "自动检测": None,
@@ -126,46 +143,145 @@ class TranslationGUI:
         self._root.title("VRChat 实时同传")
         self._root.geometry("920x620")
         self._root.minsize(700, 400)
+        self._root.configure(bg=PANEL)
 
+        self._apply_theme()          # 必须先于任何控件创建
         self._build_controls()
+        self._divider()
         self._build_chat()
+        self._divider()
         self._build_status()
+        self._apply_dark_titlebar()
 
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._update_direction_langs()
         self._check_api_key()
         self._poll()
 
+    # ================================================================ 主题
+
+    def _apply_theme(self) -> None:
+        """统一深色主题：深灰 + 蓝。
+
+        ⚠️ Windows 上 ttk 默认主题（vista/xpnative）由系统绘制，
+        style.configure(background=...) 会被**静默忽略**——必须切到 clam。
+        """
+        root = self._root
+        style = ttk.Style(root)
+        style.theme_use("clam")
+
+        style.configure(".", font=FONT_UI, background=PANEL, foreground=TEXT,
+                        bordercolor=BORDER, focuscolor=PANEL)
+        style.configure("TFrame", background=PANEL)
+        style.configure("TLabel", background=PANEL, foreground=TEXT)
+        style.configure("Dim.TLabel", foreground=TEXT_DIM)
+        style.configure("Muted.TLabel", foreground=TEXT_DIM, font=FONT_STATUS)
+        style.configure("Status.TLabel", font=FONT_STATUS)
+
+        # 按钮：扁平、无边框（clam 的按钮边框会带亮色 bevel，直接不要边框），
+        # 悬停/按下有反馈；focuscolor 设成与背景同色，去掉点状焦点框
+        style.configure("TButton", background=SURFACE, foreground=TEXT,
+                        borderwidth=0, focusthickness=0, focuscolor=PANEL,
+                        padding=(12, 7))
+        style.map("TButton",
+                  background=[("pressed", SURFACE_HOVER), ("active", SURFACE_HOVER),
+                              ("disabled", "#20242d")],
+                  foreground=[("disabled", TEXT_MUTED)])
+        # 主按钮（开始翻译）：蓝色强调
+        style.configure("Accent.TButton", background=ACCENT, foreground="#ffffff",
+                        borderwidth=0, focusthickness=0, focuscolor=ACCENT,
+                        padding=(14, 6))
+        style.map("Accent.TButton",
+                  background=[("pressed", ACCENT_ACTIVE), ("active", ACCENT_HOVER),
+                              ("disabled", "#22374f")],
+                  foreground=[("disabled", "#6b87ab")])
+
+        # 下拉框：字段、箭头、边框都变深；readonly 下保持深色
+        style.configure("TCombobox", fieldbackground=SURFACE, background=SURFACE,
+                        foreground=TEXT, arrowcolor=TEXT_DIM, bordercolor=BORDER,
+                        lightcolor=SURFACE, darkcolor=SURFACE, insertcolor=TEXT,
+                        padding=(8, 4))
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", SURFACE)],
+                  foreground=[("readonly", TEXT)],
+                  selectbackground=[("readonly", SURFACE)],   # 去掉选中文字的高亮白块
+                  selectforeground=[("readonly", TEXT)],
+                  bordercolor=[("focus", ACCENT), ("active", SURFACE_HOVER)],
+                  arrowcolor=[("active", TEXT)])
+        # 下拉弹出的列表是独立 Listbox，必须单独配色（否则弹出来是白的）
+        root.option_add("*TCombobox*Listbox.background", SURFACE)
+        root.option_add("*TCombobox*Listbox.foreground", TEXT)
+        root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+        root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        root.option_add("*TCombobox*Listbox.font", FONT_UI)
+
+        # 滚动条：细、暗、无箭头，跟聊天区融合
+        style.layout("Vertical.TScrollbar",
+                     [("Vertical.Scrollbar.trough",
+                       {"children": [("Vertical.Scrollbar.thumb",
+                                      {"expand": "1", "sticky": "nswe"})],
+                        "sticky": "ns"})])
+        style.configure("Vertical.TScrollbar", background=SURFACE, troughcolor=BG,
+                        bordercolor=BG, darkcolor=BG, lightcolor=BG,
+                        arrowcolor=TEXT_DIM, gripcount=0)
+        style.map("Vertical.TScrollbar",
+                  background=[("pressed", ACCENT_ACTIVE), ("active", SURFACE_HOVER)])
+
+    def _apply_dark_titlebar(self) -> None:
+        """Windows 标题栏变深色；老系统不支持就静默跳过（不能因此崩掉）。"""
+        try:
+            import ctypes
+            self._root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self._root.winfo_id())
+            value = ctypes.c_int(1)
+            for attr in (20, 19):          # 20 = Win10 20H1+，19 = 更早版本
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                        hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)) == 0:
+                    break
+        except Exception:
+            pass
+
+    def _divider(self) -> None:
+        """1px 深色分割线：用明度差 + 分隔线表达层次，不用 3D 边框。"""
+        tk.Frame(self._root, bg=BORDER, height=1, bd=0,
+                 highlightthickness=0).pack(fill=tk.X)
+
     def _build_controls(self) -> None:
-        ctrl = ttk.Frame(self._root, padding=6)
+        ctrl = ttk.Frame(self._root, padding=(14, 10))
         ctrl.pack(fill=tk.X)
 
-        self._start_btn = ttk.Button(ctrl, text="开始翻译", command=self._start)
-        self._start_btn.pack(side=tk.LEFT, padx=(0, 4))
-        self._stop_btn = ttk.Button(ctrl, text="停止翻译", command=self._stop, state=tk.DISABLED)
-        self._stop_btn.pack(side=tk.LEFT, padx=(0, 12))
+        self._start_btn = ttk.Button(ctrl, text="开始翻译", style="Accent.TButton",
+                                     command=self._start)
+        self._start_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self._stop_btn = ttk.Button(ctrl, text="停止翻译", command=self._stop,
+                                    state=tk.DISABLED)
+        self._stop_btn.pack(side=tk.LEFT, padx=(0, 20))
 
         ttk.Label(ctrl, text="方向:").pack(side=tk.LEFT)
         dir_frame = ttk.Frame(ctrl)
-        dir_frame.pack(side=tk.LEFT, padx=(0, 12))
+        dir_frame.pack(side=tk.LEFT, padx=(0, 20))
         self._direction_var = tk.StringVar(value="mine")
-        ttk.Radiobutton(dir_frame, text="我说", variable=self._direction_var,
-                         value="mine", command=self._on_direction_change).pack(side=tk.LEFT)
-        ttk.Radiobutton(dir_frame, text="别人说", variable=self._direction_var,
-                         value="theirs", command=self._on_direction_change).pack(side=tk.LEFT)
-        ttk.Radiobutton(dir_frame, text="双向同时", variable=self._direction_var,
-                         value="dual", command=self._on_direction_change).pack(side=tk.LEFT)
+        # 单选/复选框用经典 tk 控件：ttk 的指示器在 clam 下也吃不准颜色，
+        # 经典控件的 bg/fg/selectcolor 一定可控，扁平且与面板融为一体。
+        radio_kw = dict(variable=self._direction_var, command=self._on_direction_change,
+                        **self._indicator_kw())
+        tk.Radiobutton(dir_frame, text="我说", value="mine",
+                       **radio_kw).pack(side=tk.LEFT, padx=(4, 0))
+        tk.Radiobutton(dir_frame, text="别人说", value="theirs",
+                       **radio_kw).pack(side=tk.LEFT, padx=(10, 0))
+        tk.Radiobutton(dir_frame, text="双向同时", value="dual",
+                       **radio_kw).pack(side=tk.LEFT, padx=(10, 0))
 
         ttk.Label(ctrl, text="源:").pack(side=tk.LEFT)
         self._source_combo = ttk.Combobox(ctrl, values=list(SOURCE_LANGS.keys()),
                                            state="readonly", width=10)
-        self._source_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self._source_combo.pack(side=tk.LEFT, padx=(4, 12))
         self._source_combo.bind("<<ComboboxSelected>>", self._on_lang_change)
 
         ttk.Label(ctrl, text="目标:").pack(side=tk.LEFT)
         self._target_combo = ttk.Combobox(ctrl, values=list(TARGET_LANGS.keys()),
                                            state="readonly", width=10)
-        self._target_combo.pack(side=tk.LEFT, padx=(0, 12))
+        self._target_combo.pack(side=tk.LEFT, padx=(4, 20))
         self._target_combo.bind("<<ComboboxSelected>>", self._on_lang_change)
 
         out_frame = ttk.Frame(ctrl)
@@ -173,31 +289,44 @@ class TranslationGUI:
         ttk.Label(out_frame, text="输出:").pack(side=tk.LEFT)
         self._chatbox_var = tk.BooleanVar(value=True)
         self._overlay_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(out_frame, text="chatbox", variable=self._chatbox_var).pack(side=tk.LEFT, padx=4)
-        ttk.Checkbutton(out_frame, text="手腕屏", variable=self._overlay_var).pack(side=tk.LEFT, padx=4)
+        tk.Checkbutton(out_frame, text="chatbox", variable=self._chatbox_var,
+                       **self._indicator_kw()).pack(side=tk.LEFT, padx=(6, 0))
+        tk.Checkbutton(out_frame, text="手腕屏", variable=self._overlay_var,
+                       **self._indicator_kw()).pack(side=tk.LEFT, padx=(10, 0))
+
+    @staticmethod
+    def _indicator_kw() -> dict:
+        """经典 tk 单选/复选框的统一配色：选中时指示器变蓝，其余深灰。"""
+        return dict(bg=PANEL, fg=TEXT, activebackground=PANEL,
+                    activeforeground="#ffffff", selectcolor=SURFACE,
+                    highlightthickness=0, bd=0, font=FONT_UI)
 
     def _build_chat(self) -> None:
         chat_frame = ttk.Frame(self._root)
-        chat_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 4))
+        chat_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
 
         # Treeview 不支持多行/换行，聊天气泡用 Canvas 手绘圆角矩形
-        self._canvas = tk.Canvas(chat_frame, bg=BG, highlightthickness=0)
+        self._canvas = tk.Canvas(chat_frame, bg=BG, highlightthickness=1,
+                                 highlightbackground=BORDER, highlightcolor=BORDER)
         self._vsb = ttk.Scrollbar(chat_frame, orient=tk.VERTICAL, command=self._canvas.yview)
         self._canvas.configure(yscrollcommand=self._on_canvas_scroll)
         self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self._vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._vsb.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
 
         self._canvas.bind("<Configure>", self._on_canvas_configure)
         self._canvas.bind("<MouseWheel>", self._on_mousewheel)
 
     def _build_status(self) -> None:
-        bar = ttk.Frame(self._root, padding=(6, 3))
+        bar = ttk.Frame(self._root, padding=(14, 7))
         bar.pack(fill=tk.X)
-        # 左侧放"最新一条状态消息"，右侧放统计汇总——两者分开，
+        # 左侧：彩色圆点（连接状态）+ 最新一条状态消息；右侧放统计汇总——两者分开，
         # 否则"等待收尾"这类瞬时消息会把"已翻译 N 条 / 首增量 Xms"覆盖掉。
-        self._status_label = ttk.Label(bar, text="就绪", foreground="gray")
+        self._status_dot = tk.Label(bar, text="●", bg=PANEL, fg=TEXT_MUTED,
+                                    font=FONT_STATUS, bd=0)
+        self._status_dot.pack(side=tk.LEFT, padx=(0, 6))
+        self._status_label = ttk.Label(bar, text="就绪", style="Status.TLabel")
         self._status_label.pack(side=tk.LEFT)
-        self._stats_label = ttk.Label(bar, text="", foreground="#666")
+        self._stats_label = ttk.Label(bar, text="", style="Muted.TLabel")
         self._stats_label.pack(side=tk.RIGHT)
 
     # ================================================================ 事件处理
@@ -565,8 +694,10 @@ class TranslationGUI:
         self._last_status_level = level
         if not hasattr(self, "_status_label"):
             return
-        colors = {"info": "#4a90d9", "warn": "#d9904a", "error": "#d94a4a"}
-        self._status_label.configure(text=f"状态：{msg}", foreground=colors.get(level, "gray"))
+        # 状态色走圆点，文字保持中性色——更现代，也不会整行刺眼
+        colors = {"info": COLOR_OK, "warn": COLOR_WARN, "error": COLOR_ERROR}
+        self._status_dot.configure(fg=colors.get(level, TEXT_MUTED))
+        self._status_label.configure(text=f"状态：{msg}")
 
     def _refresh_status(self) -> None:
         if not hasattr(self, "_stats_label"):

@@ -118,6 +118,26 @@ class QwenLiveTranslateSession(LiveTranslateSession):
             "audio": base64.b64encode(pcm16_16k).decode(),
         }))
 
+    @property
+    def is_alive(self) -> bool:
+        """会话是否还活着（接收循环没结束、且不是正常关闭）。"""
+        if self._closing or self._ws is None or self._recv_task is None:
+            return False
+        return not self._recv_task.done()
+
+    @property
+    def fail_reason(self) -> str:
+        """接收循环异常退出时的原因（用于日志与重连提示）。"""
+        if self._recv_task is None or not self._recv_task.done():
+            return ""
+        try:
+            exc = self._recv_task.exception()
+        except Exception:  # noqa: BLE001  （cancelled 时取 exception 会抛）
+            return "接收循环被取消"
+        if exc is None:
+            return "接收循环已结束"
+        return f"{type(exc).__name__}: {exc}"[:200]
+
     async def close(self) -> None:
         self._closing = True
         if self._ws is not None:

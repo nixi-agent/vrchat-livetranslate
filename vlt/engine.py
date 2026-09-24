@@ -40,6 +40,25 @@ class EngineEvents:
     on_stats: Callable[[dict], None] = lambda *_a: None              # 计数、延迟等
 
 
+class _SessionProxy:
+    """把采集循环的 `send_audio` 转发到**当前**会话。
+
+    采集循环（麦克风/loopback）是长跑任务，启动时拿到的 session 引用会在
+    自动重连后失效 —— 走代理每次动态取，重连后音频自然发到新连接上。
+    """
+
+    def __init__(self, engine: "Engine") -> None:
+        self._engine = engine
+        self.sent_bytes = 0
+
+    async def send_audio(self, pcm: bytes) -> None:
+        session = self._engine._session          # noqa: SLF001
+        if session is None:
+            return
+        await session.send_audio(pcm)
+        self.sent_bytes += len(pcm)
+
+
 class Engine:
     """可编程启停的同传引擎。
 
@@ -88,6 +107,10 @@ class Engine:
         self._merger: Merger | None = None
         self._overlay: WristOverlay | None = None
         self._virtualmic: VirtualMic | None = None
+        # 采集循环是长跑任务，不能直接持有 session 对象：重连会换新对象，
+        # 旧引用会把音频继续发到死连接上。统一走这个代理。
+        self._proxy = _SessionProxy(self)
+        self._reconnect_task: asyncio.Task | None = None
         self._last_audio_ts = 0.0      # 上一段 TTS 音频到达时刻（判句边界）
         self._pending_seal = False     # 上一句终版文本已到 → 下一段音频前封句尾
         self._pump_task: asyncio.Task | None = None
@@ -399,6 +422,7 @@ class Engine:
                 self._overlay.tick()
             if self._session is not None:
                 self._session.tick()
+                await self._watchdog()      # 会话挂了就自动重连（不再让这条腿永久死掉）
 
     async def _feed_audio(self) -> None:
         if self._source.startswith("pcm:"):
@@ -406,12 +430,12 @@ class Engine:
         elif self._source == "mic":
             capture_cfg = (self._cfg.output or {}).get("capture") or {}
             mic_name = capture_cfg.get("mic_device") or None
-            await run_mic(self._session, None, device_pattern=mic_name, device_name=mic_name,
+            await run_mic(self._proxy, None, device_pattern=mic_name, device_name=mic_name,
                           stop_event=self._stop_event)
         elif self._source == "loopback":
             capture_cfg = (self._cfg.output or {}).get("capture") or {}
             loopback_name = capture_cfg.get("loopback_device") or None
-            await run_loopback(self._session, None, device_name=loopback_name,
+            await run_loopback(self._proxy, None, device_name=loopback_name,
                                stop_event=self._stop_event)
 
     async def _feed_pcm(self, path: str) -> None:
@@ -462,6 +486,56 @@ class Engine:
 
     def _on_usage(self, u: dict) -> None:
         self._events.on_stats({k: v for k, v in u.items() if isinstance(v, int)})
+
+    # ---------------------------------------------------------------- 断线自愈
+
+    async def _watchdog(self) -> None:
+        """会话挂了就自动重连。
+
+        用户实测：服务端返回 1011 `model repeat output happened` 掐断连接后，
+        那条腿直接「运行错误」结束，只能重开界面。现在改为自动重连（带退避，
+        并复用 `_create_session` 里的 RPM 预算等待）。
+        """
+        if self._stopping or self._session is None:
+            return
+        if getattr(self._session, "is_alive", True):
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return                                  # 已有重连在跑
+        reason = getattr(self._session, "fail_reason", "") or "连接已断开"
+        self._reconnect_task = asyncio.create_task(self._reconnect_loop(reason))
+
+    async def _reconnect_session(self) -> None:
+        """关掉旧会话再建一个（失败会抛，交给重试循环）。"""
+        try:
+            if self._session is not None:
+                await self._session.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self._session = None
+        scfg = self._cfg.directions[self._direction].to_session_config(self._cfg.session_base)
+        await self._create_session(scfg)
+
+    async def _reconnect_loop(self, reason: str) -> None:
+        backoff = [float(x) for x in self._cfg.session_base.get("reconnect_backoff", [2, 5, 10, 30])]
+        attempt = 0
+        while not self._stopping:
+            wait = backoff[min(attempt, len(backoff) - 1)]
+            attempt += 1
+            msg = f"连接断开（{reason}）→ {wait:.0f}s 后重连（第 {attempt} 次）"
+            self._events.on_status("warn", msg)
+            print(f"[session] ⚠️ {msg}", flush=True)
+            await asyncio.sleep(wait)
+            if self._stopping:
+                return
+            try:
+                await self._reconnect_session()
+                print(f"[session] ✅ 已重连（第 {attempt} 次）", flush=True)
+                self._events.on_status("info", f"已重连（第 {attempt} 次）")
+                return
+            except Exception as exc:  # noqa: BLE001
+                print(f"[session] ❌ 第 {attempt} 次重连失败：{type(exc).__name__}: {exc}",
+                      flush=True)
 
 
 # ================================================================ 音频采集函数

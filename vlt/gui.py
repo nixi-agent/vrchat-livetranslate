@@ -509,6 +509,16 @@ class TranslationGUI:
         if d in ("theirs", "dual"):
             specs.append(("theirs", "theirs", "loopback", b, a or "zh"))
 
+        # 启动时把「方向 + 每条腿的来源/语言 + 输出面」写进日志。
+        # 没有这行的话，事后只能从有没有 [loopback] 打印去反推方向——
+        # 用户报「英文没翻译」时就是这样，明明是没起 loopback 腿，却看着像翻译坏了。
+        _label = {"mine": "我说的话", "theirs": "别人说", "dual": "双向同时"}.get(d, d)
+        print(f"[gui] 启动：方向={_label}({d}) | 输出={','.join(sorted(sinks)) or '无'} | "
+              f"语言对={a}→{b}", flush=True)
+        for _w, _dir, _src, _sl, _tl in specs:
+            print(f"[gui]   腿 {_dir}：来源={'麦克风' if _src == 'mic' else '游戏音频(loopback)'}"
+                  f" | {_sl}→{_tl}", flush=True)
+
         for _who, direction, _src, src_lang, tgt_lang in specs:
             dd = self._cfg.directions.setdefault(direction, Direction())
             dd.source_lang = src_lang
@@ -524,7 +534,12 @@ class TranslationGUI:
         self._start_engine(0)
         self._start_btn.configure(state=tk.DISABLED)
         self._stop_btn.configure(state=tk.NORMAL)
-        self._set_status("info", "正在启动（双向）…" if len(specs) == 2 else "正在启动…")
+        if d == "mine":
+            # 只翻自己的话时明确提示一句：用户放英文视频却没选对方向，
+            # 表现就是「翻译坏了」，而实际是根本没采集对方/视频的声音。
+            self._set_status("info", "正在启动…（只翻译你说的话；要翻译对方/视频请选「双向同时」）")
+        else:
+            self._set_status("info", "正在启动（双向）…" if len(specs) == 2 else "正在启动…")
 
     def _start_engine(self, index: int) -> None:
         specs = self._specs
@@ -923,6 +938,10 @@ class TranslationGUI:
         parts: list[str] = []
         if any(e.running for e in self._engines):
             parts.append("运行中")
+            # 常驻提示：状态栏正文会被引擎消息覆盖，这里不会。
+            # 用户放英文视频却没选对方向时，症状看着就是「翻译坏了」。
+            if self._direction_var.get() == "mine":
+                parts.append("仅翻译你说的话")
         if any(e.chatbox is not None for e in self._engines):
             sent = sum(e.chatbox.sent_ok for e in self._engines if e.chatbox is not None)
             parts.append(f"已翻译 {sent} 条")

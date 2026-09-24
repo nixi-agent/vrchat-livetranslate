@@ -33,8 +33,8 @@ class OverlayConfig:
     alpha: float = 0.9
     size_px: tuple[int, int] = (1024, 320)
     font: str = "C:/Windows/Fonts/msyh.ttc"
-    font_size: int = 48
-    source_font_size: int = 36
+    font_size: int = 42                      # 译文字号（面板 1024x320 时 42~48 都清晰）
+    source_font_size: int = 30               # 原文小字号
     # 配色：统一白色系，层级只靠字号 + 透明度区分（避免出现"蓝原文 + 白译文"这种像残留色的观感）
     color_translation: tuple[int, int, int] = (255, 255, 255)
     color_source: tuple[int, int, int] = (255, 255, 255)
@@ -67,8 +67,8 @@ class OverlayConfig:
             alpha=float(off.get("alpha", d.get("alpha", 0.9))),
             size_px=tuple(d.get("size_px", (1024, 320))),          # type: ignore[arg-type]
             font=d.get("font", "C:/Windows/Fonts/msyh.ttc"),
-            font_size=int(d.get("font_size", 48)),
-            source_font_size=int(d.get("source_font_size", 36)),
+            font_size=int(d.get("font_size", 42)),
+            source_font_size=int(d.get("source_font_size", 30)),
             color_translation=tuple(d.get("color_translation", (255, 255, 255))),   # type: ignore[arg-type]
             color_source=tuple(d.get("color_source", (255, 255, 255))),             # type: ignore[arg-type]
             source_alpha=int(d.get("source_alpha", 205)),
@@ -474,15 +474,35 @@ class WristOverlay:
                                                           self.cfg.curvature)
                     anchor_changed = (new_cfg.anchor != self.cfg.anchor
                                       or new_cfg.tracker_index != self.cfg.tracker_index)
-                    if geo_changed or anchor_changed:
+                    # 影响**贴图内容**的参数（字号 / 面板像素尺寸 / 行数 / 是否显示原文）：
+                    # 这些改了只重应用变换是不够的，必须重新渲染一帧，
+                    # 否则界面上拖字号滑块会「看着生效、屏上没变」。
+                    render_changed = (new_cfg.font_size != self.cfg.font_size
+                                      or new_cfg.source_font_size != self.cfg.source_font_size
+                                      or new_cfg.size_px != self.cfg.size_px
+                                      or new_cfg.max_lines != self.cfg.max_lines
+                                      or new_cfg.show_source != self.cfg.show_source)
+                    if geo_changed or anchor_changed or render_changed:
+                        last_entries = list(self._last_entries or [])
+                        last_render = self._last_render
                         self.cfg = new_cfg
                         if self.available:
                             if anchor_changed:
                                 self._device = self._resolve_anchor()
-                            self._apply_transform()
+                            if geo_changed or anchor_changed:
+                                self._apply_transform()
+                            if render_changed:
+                                if last_entries:
+                                    self._last_entries = None      # 强制重渲
+                                    self.update_entries(last_entries, force=True)
+                                elif last_render:
+                                    self._last_render = None
+                                    self.update(last_render[0], last_render[1], force=True)
                         print(f"[overlay] ♻️ 配置热重载：anchor={new_cfg.anchor} pos={new_cfg.pos} "
                               f"rot={new_cfg.rot} width={new_cfg.width_m}m "
-                              f"curvature={new_cfg.curvature} alpha={new_cfg.alpha}")
+                              f"curvature={new_cfg.curvature} alpha={new_cfg.alpha} "
+                              f"字号={new_cfg.font_size}/{new_cfg.source_font_size} "
+                              f"面板={new_cfg.size_px[0]}x{new_cfg.size_px[1]}")
                 except Exception as exc:  # noqa: BLE001
                     print(f"[overlay] ⚠️ 热重载失败（保留旧配置）：{exc}")
 

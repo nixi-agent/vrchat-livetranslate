@@ -210,6 +210,43 @@ def test_hot_reload_reapplies_geometry(tmp: Path | None = None) -> None:
     print("  热重载（含弯曲/锚点）OK")
 
 
+def test_hot_reload_font_rerenders() -> None:
+    """改字号 / 面板高度必须**重新渲染贴图**（只重应用变换是不够的）。
+
+    用户要能自己调字号：字调小了，同样的高度就能塞下更多字。
+    如果热重载只比对几何参数，界面上拖字号滑块会「看着生效、屏上没变」。
+    """
+    CALLS.clear()
+    _install_fake_openvr()
+    from vlt.output.overlay import WristOverlay
+
+    d = ROOT / "out" / "overlay_cfg_font"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / "config.yaml"
+    f.write_text("overlay:\n  font_size: 42\n  source_font_size: 30\n  size_px: [1024, 320]\n",
+                 encoding="utf-8")
+
+    ov = WristOverlay(_cfg(d), config_path=f)
+    ov.start()
+    ov.update_entries([("theirs", "Hello", "你好"), ("mine", "早上好", "Good morning")],
+                      force=True)
+    assert "setOverlayRaw" in _names(), "首帧没上传贴图"
+    CALLS.clear()
+
+    f.write_text("overlay:\n  font_size: 30\n  source_font_size: 22\n  size_px: [1024, 420]\n",
+                 encoding="utf-8")
+    ov.tick()
+    print("  改字号后调用:", _names())
+    assert "setOverlayRaw" in _names(), "改了字号没有重新渲染贴图（界面上会「看着生效、屏上没变」）"
+    assert ov.cfg.font_size == 30 and ov.cfg.size_px == (1024, 420)
+    # 重新渲染的图确实变高了（面板高度跟着走）
+    from vlt.output.overlay import render_conversation
+    img = render_conversation([("theirs", "Hello", "你好")], ov.cfg)
+    assert img.size == (1024, 420), f"面板高度没生效：{img.size}"
+    ov.close()
+    print("  字号/面板高改动 → 重新渲染 OK")
+
+
 if __name__ == "__main__":
     print("test_overlay_steamvr:")
     test_start_takes_over_steamvr()
@@ -217,4 +254,5 @@ if __name__ == "__main__":
     test_overlay_failure_degrades_without_raising()
     test_update_uploads_texture()
     test_hot_reload_reapplies_geometry()
+    test_hot_reload_font_rerenders()
     print("ALL PASSED")

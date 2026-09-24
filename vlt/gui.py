@@ -468,12 +468,18 @@ class TranslationGUI:
         off = ov.get("offset") or {}
         pos = list(off.get("pos") or [0.0, 0.06, 0.02])
         rot = list(off.get("rot") or [0, 0, 0])
+        _sz = list(ov.get("size_px") or [1024, 320])
+        self._tune_panel_w = int(_sz[0])
         self._tune_values: dict[str, float] = {
             "pos_x": float(pos[0]), "pos_y": float(pos[1]), "pos_z": float(pos[2]),
             "rot_x": float(rot[0]), "rot_y": float(rot[1]), "rot_z": float(rot[2]),
             "width_m": float(off.get("width_m", 0.24)),
             "curvature": float(off.get("curvature", 0.0)),
             "alpha": float(off.get("alpha", 0.9)),
+            # 字号 / 面板高度决定「一块屏能显示多少字」——用户明确要能自己调
+            "font_size": float(ov.get("font_size", 42)),
+            "source_font_size": float(ov.get("source_font_size", 30)),
+            "panel_h": float(_sz[1]),
         }
         self._ov_save_job: str | None = None
         self._anchor_label_to_key = {"右手": "right_hand", "左手": "left_hand",
@@ -507,6 +513,10 @@ class TranslationGUI:
             ("width_m", "大小", 0.05, 0.80, 0.01, "m"),
             ("curvature", "弯曲", 0.0, 0.50, 0.01, ""),
             ("alpha", "透明度", 0.10, 1.00, 0.05, ""),
+            # 显示多少字由这三个决定：字号调小 → 同样高度塞更多字；面板调高 → 多一轮对话
+            ("font_size", "译文字号", 20, 64, 1, ""),
+            ("source_font_size", "原文字号", 14, 48, 1, ""),
+            ("panel_h", "面板高", 240, 560, 10, "px"),
         ]
         for i, (key, label, lo, hi, res, unit) in enumerate(specs):
             row_i, col_i = divmod(i, 3)
@@ -570,13 +580,19 @@ class TranslationGUI:
                 (["overlay", "offset", "width_m"], _fmt_scalar(v["width_m"])),
                 (["overlay", "offset", "curvature"], _fmt_scalar(v["curvature"])),
                 (["overlay", "offset", "alpha"], _fmt_scalar(v["alpha"])),
+                # 字号 / 面板像素高度（改这些会触发 overlay 重新渲染一帧）
+                (["overlay", "font_size"], _fmt_scalar(v["font_size"])),
+                (["overlay", "source_font_size"], _fmt_scalar(v["source_font_size"])),
+                (["overlay", "size_px"], f"[{self._tune_panel_w}, {_fmt_scalar(v['panel_h'])}]"),
             ]
             for key_path, val in updates:
                 text = _yaml_set_in_text(text, key_path, val)
             _write_config_text(p, text)
             print(f"[gui] 手腕屏参数已写入 config.yaml：anchor={updates[0][1]} "
                   f"pos={updates[2][1]} rot={updates[3][1]} width={updates[4][1]}m "
-                  f"curvature={updates[5][1]} alpha={updates[6][1]}（overlay 会热重载，无需重启）",
+                  f"curvature={updates[5][1]} alpha={updates[6][1]} "
+                  f"字号={updates[7][1]}/{updates[8][1]} 面板={updates[9][1]}"
+                  f"（overlay 会热重载，无需重启）",
                   flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[gui] 保存手腕屏参数失败：{exc}", flush=True)

@@ -73,10 +73,10 @@ overlay:
     width_m: 0.24            # 面板宽度（米）
     curvature: 0.0           # >0 则弯曲贴合（0.1~0.3 可试）
     alpha: 0.9
-  size_px: [1024, 320]
+  size_px: [1024, 320]       # 面板像素尺寸（[宽, 高]；界面「面板高」滑块改的就是这个高）
   font: "C:/Windows/Fonts/msyh.ttc"   # 雅黑；日文可用 NotoSansJP-VF.ttf
-  font_size: 48              # 译文字号
-  source_font_size: 36       # 原文小字号
+  font_size: 42              # 译文字号（界面微调面板可拖；调小 → 同样高度能塞更多字）
+  source_font_size: 30       # 原文小字号（同上）
   max_lines: 3               # 译文最多显示几行（超出保留最新）
   show_source: true          # 双行显示：原文 + 译文（3.8 默认就返回源文识别结果，零额外成本）
   fade_after_s: 0.0          # >0 则静默这么久后淡出

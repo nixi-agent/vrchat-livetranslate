@@ -92,7 +92,26 @@ VRChat 开着的话，气泡里应该出现：
 | `--log-events` | 把服务端事件序列写进埋点（排查用） |
 | `--seconds 30` | 只跑 30 秒（默认 0 = 一直跑到 Ctrl+C） |
 
-## 六、改配置（`config.yaml`，改完**不用重启**）
+## 六、图形界面
+
+双击 **`run_gui.bat`** 启动图形界面（Tkinter，零额外依赖，秒开）。
+
+界面功能：
+- **翻译列表**：显示原文 + 译文，流式增量就地更新（不刷屏），可滚动回看历史
+- **一键开关**：开始翻译 / 停止翻译
+- **方向切换**：「我说」/ 「别人说」，各自独立记忆语言选择
+- **语言配置**：源语言（自动检测 / 中 / 英 / 日 / 韩 / 法 / 德 / 西）+ 目标语言
+- **输出选择**：chatbox / 手腕屏，可勾选
+
+语言改动立即生效并写回 `config.yaml`，下次启动保留。
+
+自动化验收：
+
+```bat
+.venv\Scripts\python.exe -m vlt.gui --self-test
+```
+
+## 七、改配置（`config.yaml`，改完**不用重启**）
 
 ```yaml
 session:
@@ -116,7 +135,7 @@ overlay:
   source_alpha: 205      # 原文亮度（150 会显灰像另一个颜色）
 ```
 
-## 七、排障
+## 八、排障
 
 | 现象 | 原因 / 处理 |
 |---|---|
@@ -129,11 +148,13 @@ overlay:
 | `[overlay] SteamVR 未运行或不可用` | 正常降级：只有手腕屏不显示，chatbox 不受影响 |
 | 手腕屏看不见 | 先确认 SteamVR 在跑；再调 `offset.pos` / `width_m`；`--overlay-dry-run` 能出 PNG 说明渲染没问题 |
 
-## 八、项目结构
+## 九、项目结构
 
 ```
 vlt/
-├── app.py                主程序：音源 → 会话 → 输出（含麦克风/环回采集）
+├── app.py                主程序：CLI 入口，委托给 Engine
+├── engine.py             可编程引擎：会话 + 节流 + chatbox + overlay 的启停
+├── gui.py                Tkinter 图形界面
 ├── config.py             配置加载；API key 只从环境变量或 bl CLI 配置读
 ├── session/
 │   ├── base.py           TextDelta / SessionConfig / LiveTranslateSession / create_session
@@ -143,12 +164,12 @@ vlt/
     ├── chatbox.py        OSC ,sTT + 令牌桶 + 最终版补发队列
     └── overlay.py        手腕屏渲染 + SteamVR overlay + 配置热重载
 scripts/                  探针与调试工具（probe_*、osc_listen）
-tests/                    渲染回归测试（拉丁整词保护 / 中文避头尾）
+tests/                    渲染回归测试 + 引擎无头测试
 docs/                     P0.5 / P1 / P2 实测结果
 testdata/                 自带测试音频（中文 8.56s、英文 7.92s，16kHz PCM）
 ```
 
-## 九、设计要点（踩过的坑，别踩第二遍）
+## 十、设计要点（踩过的坑，别踩第二遍）
 
 1. **事件名按模型代次分派**：3.8 纯文本用 `response.text.delta`，文本+音频用 `response.audio_transcript.delta`；
    3.5 用 `response.text.text`（含 `stash` 预测文本）。接错代 → 文本路静默为空。

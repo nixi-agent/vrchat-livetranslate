@@ -21,6 +21,7 @@ from tkinter import ttk
 import yaml
 
 from .config import Direction, DEFAULT_CONFIG, load_config
+from . import crashlog
 from .devices import (
     DeviceInfo,
     enumerate_audio_out_devices,
@@ -569,8 +570,20 @@ class TranslationGUI:
         self._set_status("info", "已停止")
 
     def _on_close(self) -> None:
-        self._stop()
-        self._root.destroy()
+        """关窗口：先停引擎（会在超时内等采集线程真正退出），再销毁窗口。
+
+        顺序很重要——如果先销毁窗口再去等引擎，主线程会阻塞在一个已经失效的
+        Tk 事件循环上，界面看起来就是"卡死后闪退"。
+        """
+        try:
+            self._stop()
+        except Exception as exc:
+            print(f"[gui] 停止引擎时出错（继续关闭）：{exc}", file=sys.stderr)
+        try:
+            self._root.destroy()
+        except Exception:
+            pass
+        crashlog.close()
 
     # ================================================================ 设备选择
 
@@ -1012,6 +1025,11 @@ def main() -> int:
                     help="双向同时验收：两个测试 PCM 同时驱动两个引擎")
     args = ap.parse_args()
 
+    # 崩溃日志：闪退时窗口一关什么都没了，必须落盘。
+    # 在创建界面之前装上，连启动阶段的崩溃也能抓到。
+    crashlog.install(ROOT / "logs", "gui")
+    crashlog.log_startup_info(f"gui {'--self-test-dual' if args.self_test_dual else args.self_test and '--self-test' or ''}")
+
     if args.self_test_dual:
         gui = TranslationGUI(headless=True)
         return gui.run_self_test_dual()
@@ -1020,7 +1038,11 @@ def main() -> int:
         return gui.run_self_test()
 
     gui = TranslationGUI()
-    gui._root.mainloop()
+    crashlog.install_tk(gui._root)      # 接管 Tk 回调异常（默认只打印不退出）
+    try:
+        gui._root.mainloop()
+    finally:
+        crashlog.close()
     return 0
 
 

@@ -131,9 +131,11 @@ class TranslationGUI:
         self._tree.heading("time", text="时间")
         self._tree.heading("source", text="原文")
         self._tree.heading("target", text="译文")
-        self._tree.column("time", width=75, minwidth=60)
-        self._tree.column("source", width=340, minwidth=100)
-        self._tree.column("target", width=340, minwidth=100)
+        self._tree.column("time", width=78, minwidth=60, stretch=False)
+        self._tree.column("source", width=340, minwidth=100, stretch=False)
+        self._tree.column("target", width=340, minwidth=100, stretch=False)
+        # 列宽跟着窗口走：否则窗口拉大后译文列仍按固定宽度截断（长句看不全）
+        self._tree.bind("<Configure>", self._fit_columns)
 
         vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self._tree.yview)
         self._tree.configure(yscrollcommand=self._on_tree_scroll)
@@ -141,11 +143,27 @@ class TranslationGUI:
         self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
+    def _fit_columns(self, event=None) -> None:
+        """按当前窗口宽度重新分配列宽：时间列固定，原文/译文平分剩余空间。"""
+        total = self._tree.winfo_width()
+        if total <= 1:                      # 还没完成布局
+            return
+        time_w = 78
+        rest = max(total - time_w - 20, 200)
+        src_w = int(rest * 0.44)
+        self._tree.column("time", width=time_w)
+        self._tree.column("source", width=src_w)
+        self._tree.column("target", width=rest - src_w)
+
     def _build_status(self) -> None:
         bar = ttk.Frame(self._root, padding=(6, 3))
         bar.pack(fill=tk.X)
+        # 左侧放"最新一条状态消息"，右侧放统计汇总——两者分开，
+        # 否则"等待收尾"这类瞬时消息会把"已翻译 N 条 / 首增量 Xms"覆盖掉。
         self._status_label = ttk.Label(bar, text="就绪", foreground="gray")
         self._status_label.pack(side=tk.LEFT)
+        self._stats_label = ttk.Label(bar, text="", foreground="#666")
+        self._stats_label.pack(side=tk.RIGHT)
 
     # ================================================================ 事件处理
 
@@ -321,6 +339,8 @@ class TranslationGUI:
         self._status_label.configure(text=f"状态：{msg}", foreground=colors.get(level, "gray"))
 
     def _refresh_status(self) -> None:
+        if not hasattr(self, "_stats_label"):
+            return
         parts: list[str] = []
         if self._engine is not None and self._engine.running:
             parts.append("运行中")
@@ -330,8 +350,7 @@ class TranslationGUI:
         ms = self._stats.get("first_delta_ms") or self._stats.get("connect_ms")
         if ms is not None:
             parts.append(f"首增量 {ms:.0f}ms")
-        if parts:
-            self._status_label.configure(text="状态：" + " · ".join(parts))
+        self._stats_label.configure(text=" · ".join(parts))
 
     # ================================================================ 自检
 

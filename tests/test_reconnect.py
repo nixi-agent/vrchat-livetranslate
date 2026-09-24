@@ -138,9 +138,70 @@ def test_watchdog_ignores_healthy_session() -> None:
     print("  健康会话不误重连 OK")
 
 
+def test_black_box_dump_on_disconnect() -> None:
+    """★ 断线时必须打「黑匣子」：静音占比 + 最近译文本 + 服务端事件序列。
+
+    用户的要求是「先加日志把问题钉死，再决定要不要改行为」——
+    服务端 `model repeat output happened` 掐断时，日志要能回答：
+    ① 模型是不是在重复输出同一句？② 输入音频是不是长期静音？
+    """
+    import contextlib
+    import io
+    import time
+
+    from vlt.engine import Engine, EngineEvents
+    from vlt.session.base import TextDelta
+
+    eng = Engine(cfg=_cfg(), direction="mine", source="mic", sinks=set(),
+                 events=EngineEvents())
+    silent = b"\x00\x00" * 1600
+    loud = b"\x00\x20" * 1600
+
+    async def feed() -> None:
+        for _ in range(30):
+            await eng._proxy.send_audio(silent)
+        for _ in range(2):
+            await eng._proxy.send_audio(loud)
+        for i in range(5):                      # 模拟模型重复吐同一句
+            eng._on_text(TextDelta(confirmed="我在测试翻译功能", pending="",
+                                   is_final=(i == 4), source="我在测试"))
+        eng._on_audio(b"\x00\x01" * 240)
+
+    asyncio.run(feed())
+    eng._session_started_at = time.monotonic() - 147.0
+
+    class DeadWithEvents(_FakeSession):
+        def recent_events(self):                 # noqa: ANN201
+            return [("response.audio_transcript.delta", 3.2), ("response.done", 1.1)]
+
+    eng._session = DeadWithEvents(alive=False,
+                                  reason="ConnectionClosedError: 1011 model repeat output happened")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        asyncio.run(eng._watchdog())
+        if eng._reconnect_task is not None:
+            eng._reconnect_task.cancel()
+    out = buf.getvalue()
+
+    checks = [
+        ("会话存活时间", "会话存活 147s" in out),
+        ("静音占比", "静音 30 块" in out and "94%" in out),
+        ("最近有效声音", "最近一次检测到有效声音" in out),
+        ("输入音频总时长", "发送输入音频" in out),
+        ("最近译文本(重复可辨)", out.count("我在测试翻译功能") >= 5),
+        ("服务端事件序列", "response.done" in out),
+    ]
+    bad = [name for name, ok in checks if not ok]
+    print(f"  黑匣子字段：{ {n: o for n, o in checks} }")
+    assert not bad, f"黑匣子缺字段：{bad}\n实际输出：\n{out}"
+    print("  断线黑匣子内容完整 OK")
+
+
 if __name__ == "__main__":
     print("test_reconnect:")
     test_proxy_forwards_to_current_session()
     test_watchdog_reconnects_dead_session()
     test_watchdog_ignores_healthy_session()
+    test_black_box_dump_on_disconnect()
     print("ALL PASSED")

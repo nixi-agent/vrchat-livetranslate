@@ -8,6 +8,7 @@ import asyncio
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from math import gcd
 from pathlib import Path
@@ -29,6 +30,8 @@ ROOT = Path(__file__).resolve().parent.parent
 CHUNK_BYTES = 3200          # 100ms @16kHz s16le mono
 # 音频流静默超过这个时长 = 上一句说完了（给虚拟麦打句尾标记的兜底触发）
 SENTENCE_GAP_S = 0.6
+# 输入音量判「有声音」的峰值门限（16k s16le）。只用于黑匣子统计，不影响功能。
+SILENCE_PEAK = 220
 
 LOOPBACK_FALLBACK = ["steam streaming speakers", "vive virtual", "cable input", "voicemeeter"]
 
@@ -50,10 +53,30 @@ class _SessionProxy:
     def __init__(self, engine: "Engine") -> None:
         self._engine = engine
         self.sent_bytes = 0
+        self.chunks = 0
+        self.silent_chunks = 0
 
     async def send_audio(self, pcm: bytes) -> None:
         session = self._engine._session          # noqa: SLF001
+        eng = self._engine
+        # —— 输入侧埋点（黑匣子用）：这个类能看到**每一个**要发出去的输入块 ——
+        eng._audio_in_chunks += 1                    # noqa: SLF001
+        self.chunks += 1
+        try:
+            import numpy as np
+
+            arr = np.frombuffer(pcm, dtype="<i2")
+            peak = int(np.abs(arr).max()) if arr.size else 0
+        except Exception:  # noqa: BLE001
+            peak = 0
+        if peak >= SILENCE_PEAK:
+            eng._last_loud_ts = time.monotonic()     # noqa: SLF001
+        else:
+            self.silent_chunks += 1
+            eng._silent_chunks += 1                  # noqa: SLF001
         if session is None:
+            # 还没连上（或正在重连）也要计入——这是"输入侧"的度量，用于诊断
+            self.sent_bytes += len(pcm)
             return
         await session.send_audio(pcm)
         self.sent_bytes += len(pcm)
@@ -113,6 +136,14 @@ class Engine:
         self._reconnect_task: asyncio.Task | None = None
         self._last_audio_ts = 0.0      # 上一段 TTS 音频到达时刻（判句边界）
         self._pending_seal = False     # 上一句终版文本已到 → 下一段音频前封句尾
+        # ---- 黑匣子：断线定位用（不影响功能，只在断线时打出来）----
+        self._audio_in_chunks = 0      # 发送出去的输入音频块数
+        self._silent_chunks = 0        # 其中判为静音的块数
+        self._last_loud_ts = 0.0       # 最近一次"有声音"的时刻
+        self._audio_chunks = 0         # 收到的 TTS 音频块数
+        self._text_deltas = 0          # 收到的译文本条数
+        self._text_hist: deque[tuple[float, str]] = deque(maxlen=40)
+        self._session_started_at = 0.0
         self._pump_task: asyncio.Task | None = None
 
         self._connect_ts: list[float] = []
@@ -396,6 +427,7 @@ class Engine:
             on_usage=self._on_usage,
         )
         self._connect_ts.append(time.monotonic())
+        self._session_started_at = time.monotonic()
         ms = (time.perf_counter() - t0) * 1000
         self._events.on_status("info", f"会话已建立（{ms:.0f}ms）")
         self._events.on_stats({"connect_ms": round(ms, 1)})
@@ -458,6 +490,8 @@ class Engine:
     def _on_text(self, d: TextDelta) -> None:
         text = d.display
         if text:
+            self._text_deltas += 1
+            self._text_hist.append((time.monotonic(), text))
             self._events.on_text(d.source or "", text, d.is_final)
         if d.is_final:
             # 一句译音出完了 → 下一段音频起始处给它封句尾（虚拟麦整句丢弃的依据）
@@ -470,6 +504,7 @@ class Engine:
     def _on_audio(self, pcm: bytes) -> None:
         if self._virtualmic is None:
             return
+        self._audio_chunks += 1
         stereo = resample_24k_mono_to_48k_stereo(pcm)
         # 句子边界（两条触发，缺一不可）：
         # ① 上一句的终版文本已到 → 现在这段音频属于新的一句；
@@ -503,7 +538,50 @@ class Engine:
         if self._reconnect_task is not None and not self._reconnect_task.done():
             return                                  # 已有重连在跑
         reason = getattr(self._session, "fail_reason", "") or "连接已断开"
+        self._dump_diagnostics(reason)             # 断线先留证据，再重连
         self._reconnect_task = asyncio.create_task(self._reconnect_loop(reason))
+
+    def _dump_diagnostics(self, reason: str) -> None:
+        """断线时把「黑匣子」打出来 —— 用来定位服务端为什么掐断连接。
+
+        专门回答两个问题：
+        ① 断开前模型是不是在**重复输出**（连续多条译文本内容雷同）；
+        ② 音频输入是不是**长期静音/噪声**（静音喂太久是模型 repeat 的常见诱因）。
+        这些埋点平时不影响功能，只在断线时输出，所以可以放心留着。
+        """
+        now = time.monotonic()
+        alive = (now - self._session_started_at) if self._session_started_at else 0.0
+        sent_s = self._proxy.sent_bytes / 2 / 16000
+        silence_ratio = (self._silent_chunks / self._audio_in_chunks * 100
+                         if self._audio_in_chunks else 0.0)
+        lines = [
+            "─" * 64,
+            f"[diag] 断线诊断（{reason}）",
+            f"[diag] 会话存活 {alive:.0f}s | 发送输入音频 {sent_s:.1f}s "
+            f"（{self._audio_in_chunks} 块，其中静音 {self._silent_chunks} 块 = {silence_ratio:.0f}%）",
+            f"[diag] 收到译文本 {self._text_deltas} 条 | 收到 TTS 音频 {self._audio_chunks} 段",
+        ]
+        if self._last_loud_ts:
+            lines.append(f"[diag] 最近一次检测到有效声音：{now - self._last_loud_ts:.1f}s 前"
+                         f"（峰值门限 {SILENCE_PEAK}）")
+        else:
+            lines.append("[diag] 整段会话**从未**检测到有效声音 —— 一直在喂静音/噪声")
+        lines.append("[diag] 断开前最近 12 条译文本（看是否在重复同一句）：")
+        tail = list(self._text_hist)[-12:]
+        if not tail:
+            lines.append("[diag]   （一条都没有 —— 模型根本没出过文本）")
+        for t, txt in tail:
+            lines.append(f"[diag]   t-{now - t:6.1f}s  {txt[:88]}")
+        evts: list[tuple[str, float]] = []
+        try:
+            evts = list(self._session.recent_events())     # type: ignore[union-attr]
+        except Exception:  # noqa: BLE001
+            pass
+        lines.append(f"[diag] 断开前最近 {len(evts)} 个服务端事件（括号内为距今秒数）：")
+        lines.append("[diag]   " + (" → ".join(f"{n}(-{ts:.1f}s)" for n, ts in evts[-20:])
+                                    or "（无记录）"))
+        lines.append("─" * 64)
+        print("\n".join(lines), flush=True)
 
     async def _reconnect_session(self) -> None:
         """关掉旧会话再建一个（失败会抛，交给重试循环）。"""

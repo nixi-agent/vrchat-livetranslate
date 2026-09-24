@@ -52,6 +52,9 @@ class QwenLiveTranslateSession(LiveTranslateSession):
         self._gen = "38" if cfg.model.lower().startswith("qwen3.8") else "35"
         self._ws: Any = None
         self._recv_task: asyncio.Task | None = None
+        # 黑匣子：最近的服务端事件类型（断线诊断用）
+        self._evt_hist: deque[tuple[str, float]] = deque(maxlen=80)
+        self._evt_counts: dict[str, int] = {}
         self._closing = False
         self._buf: list[str] = []          # 本段已确认文本的增量累加
         self._src_buf: list[str] = []
@@ -125,6 +128,18 @@ class QwenLiveTranslateSession(LiveTranslateSession):
             return False
         return not self._recv_task.done()
 
+    def recent_events(self) -> list[tuple[str, float]]:
+        """最近的服务端事件（类型, 相对现在的秒数）。
+
+        黑匣子用：断线时把这些打出来，能看出服务端在掐断前最后在做什么
+        （例如一直在重复发同一个 delta）。
+        """
+        now = time.monotonic()
+        return [(name, now - ts) for name, ts in self._evt_hist]
+
+    def event_counts(self) -> dict[str, int]:
+        return dict(self._evt_counts)
+
     @property
     def fail_reason(self) -> str:
         """接收循环异常退出时的原因（用于日志与重连提示）。"""
@@ -164,6 +179,10 @@ class QwenLiveTranslateSession(LiveTranslateSession):
                     ev = json.loads(raw)
                 except Exception:
                     continue
+                # 黑匣子：记下事件类型序列（断线时用来还原"服务端最后在做什么"）
+                etype = str(ev.get("type", ""))
+                self._evt_hist.append((etype, time.monotonic()))
+                self._evt_counts[etype] = self._evt_counts.get(etype, 0) + 1
                 self._handle_event(ev)
         except asyncio.CancelledError:
             raise

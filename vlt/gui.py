@@ -246,18 +246,20 @@ class TranslationGUI:
     def _build_ui(self) -> None:
         self._root = tk.Tk()
         self._root.title("VRChat 实时同传")
-        self._root.geometry("920x620")
-        self._root.minsize(860, 460)      # 下限要保证设备行三个下拉 + 刷新按钮都放得下
+        self._root.geometry("920x600")
+        self._root.minsize(860, 460)      # 下限保证第一行（开/停+方向+语言对+设置）不裁切
         self._root.configure(bg=PANEL)
 
         self._apply_theme()          # 必须先于任何控件创建
-        self._build_controls()
-        self._build_device_row()
-        self._build_key_row()
+        # 信息架构：主界面只留**高频**操作（开/停、方向、语言、输出、看译文），
+        # 低频设置（API key、音频设备）收进「⚙ 设置」弹窗 —— 见 _build_settings_dialog。
+        self._build_controls()       # 第一行：开/停 + 方向 + 语言对（会话控制）
+        self._build_output_row()     # 第二行：输出勾选 + 手腕屏微调 + key 状态入口
         self._divider()
         self._build_chat()
         self._divider()
         self._build_status()
+        self._build_settings_dialog()  # 先建好再隐藏：控件属性必须随即可用（测试直接访问）
         self._apply_dark_titlebar()
 
         self._root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -285,6 +287,13 @@ class TranslationGUI:
         style.configure("Dim.TLabel", foreground=TEXT_DIM)
         style.configure("Muted.TLabel", foreground=TEXT_DIM, font=FONT_STATUS)
         style.configure("Status.TLabel", font=FONT_STATUS)
+        # 分区小标题（设置弹窗里的「API KEY / 音频设备」）：小一号、暗色、加粗
+        style.configure("Section.TLabel", foreground=TEXT_DIM,
+                        font=("Microsoft YaHei UI", 8, "bold"))
+        # key 状态入口（第二行右侧的小按钮）：比常规按钮矮半档，不抢视觉
+        style.configure("Chip.TButton", font=FONT_STATUS, padding=(8, 3))
+        # 分割线/分组竖线：用 1px 明度差表达层次，不用 3D 边框
+        style.configure("TSeparator", background=BORDER)
 
         # 按钮：扁平、无边框（clam 的按钮边框会带亮色 bevel，直接不要边框），
         # 悬停/按下有反馈；focuscolor 设成与背景同色，去掉点状焦点框
@@ -345,12 +354,13 @@ class TranslationGUI:
         style.map("Vertical.TScrollbar",
                   background=[("pressed", ACCENT_ACTIVE), ("active", SURFACE_HOVER)])
 
-    def _apply_dark_titlebar(self) -> None:
+    def _apply_dark_titlebar(self, win=None) -> None:
         """Windows 标题栏变深色；老系统不支持就静默跳过（不能因此崩掉）。"""
         try:
             import ctypes
-            self._root.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self._root.winfo_id())
+            w = win if win is not None else self._root
+            w.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(w.winfo_id())
             value = ctypes.c_int(1)
             for attr in (20, 19):          # 20 = Win10 20H1+，19 = 更早版本
                 if ctypes.windll.dwmapi.DwmSetWindowAttribute(
@@ -364,20 +374,33 @@ class TranslationGUI:
         tk.Frame(self._root, bg=BORDER, height=1, bd=0,
                  highlightthickness=0).pack(fill=tk.X)
 
+    @staticmethod
+    def _vsep(parent) -> None:
+        """组间竖向分隔线：比留白更明确地表达「这里换了一组」。"""
+        ttk.Separator(parent, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y,
+                                                       padx=12, pady=5)
+
     def _build_controls(self) -> None:
-        ctrl = ttk.Frame(self._root, padding=(14, 10))
+        """第一行 = 会话控制：开/停 | 方向 | 语言对。VR 里最高频的操作全在这行。"""
+        ctrl = ttk.Frame(self._root, padding=(14, 12, 14, 8))
         ctrl.pack(fill=tk.X)
+
+        # 「⚙ 设置」先打包（side=RIGHT）：窗口变窄时 Tk 先挤压后打包的控件，
+        # 先占住右侧入口，压缩只会发生在左侧分组之间的留白上。
+        ttk.Button(ctrl, text="⚙ 设置", width=8,
+                   command=self._open_settings).pack(side=tk.RIGHT)
 
         self._start_btn = ttk.Button(ctrl, text="开始翻译", style="Accent.TButton",
                                      command=self._start)
         self._start_btn.pack(side=tk.LEFT, padx=(0, 8))
         self._stop_btn = ttk.Button(ctrl, text="停止翻译", command=self._stop,
                                     state=tk.DISABLED)
-        self._stop_btn.pack(side=tk.LEFT, padx=(0, 20))
+        self._stop_btn.pack(side=tk.LEFT)
 
+        self._vsep(ctrl)
         ttk.Label(ctrl, text="方向:").pack(side=tk.LEFT)
         dir_frame = ttk.Frame(ctrl)
-        dir_frame.pack(side=tk.LEFT, padx=(0, 20))
+        dir_frame.pack(side=tk.LEFT)
         self._direction_var = tk.StringVar(value=str((self._cfg.ui or {}).get("direction", "mine")))
         if self._direction_var.get() not in ("mine", "theirs", "dual"):
             self._direction_var.set("mine")
@@ -386,30 +409,40 @@ class TranslationGUI:
         radio_kw = dict(variable=self._direction_var, command=self._on_direction_change,
                         **self._indicator_kw())
         tk.Radiobutton(dir_frame, text="我说", value="mine",
-                       **radio_kw).pack(side=tk.LEFT, padx=(4, 0))
+                       **radio_kw).pack(side=tk.LEFT, padx=(8, 0))
         tk.Radiobutton(dir_frame, text="别人说", value="theirs",
                        **radio_kw).pack(side=tk.LEFT, padx=(10, 0))
         tk.Radiobutton(dir_frame, text="双向同时", value="dual",
                        **radio_kw).pack(side=tk.LEFT, padx=(10, 0))
 
-        ttk.Label(ctrl, text="源:").pack(side=tk.LEFT)
+        self._vsep(ctrl)
+        # 语言对写成「A → B」：翻译方向一目了然，比「源:/目标:」两个标签省地方
         self._source_combo = ttk.Combobox(ctrl, values=list(SOURCE_LANGS.keys()),
-                                           state="readonly", width=10)
-        self._source_combo.pack(side=tk.LEFT, padx=(4, 12))
+                                           state="readonly", width=9)
+        self._source_combo.pack(side=tk.LEFT)
         self._source_combo.bind("<<ComboboxSelected>>", self._on_lang_change)
-
-        ttk.Label(ctrl, text="目标:").pack(side=tk.LEFT)
+        ttk.Label(ctrl, text="→", style="Dim.TLabel").pack(side=tk.LEFT, padx=6)
         self._target_combo = ttk.Combobox(ctrl, values=list(TARGET_LANGS.keys()),
-                                           state="readonly", width=10)
-        self._target_combo.pack(side=tk.LEFT, padx=(4, 20))
+                                           state="readonly", width=9)
+        self._target_combo.pack(side=tk.LEFT)
         self._target_combo.bind("<<ComboboxSelected>>", self._on_lang_change)
 
-        # 输出勾选框**单独一行**：和方向/语言挤在同一行时整行需要 1062px，
-        # 而窗口默认只有 920px —— 超出部分会被 Tk 直接裁掉，
-        # 表现就是「某个选项莫名消失」（用户实测看不到「手腕屏」勾选框）。
-        out_frame = ttk.Frame(self._root, padding=(14, 0))
+    def _build_output_row(self) -> None:
+        """第二行 = 输出面：译文发到哪。勾选框**单独一行**：和方向/语言挤在同一行时
+
+        整行需要 1062px，而窗口默认只有 920px —— 超出部分会被 Tk 直接裁掉，
+        表现就是「某个选项莫名消失」（用户实测看不到「手腕屏」勾选框）。
+        """
+        out_frame = ttk.Frame(self._root, padding=(14, 0, 14, 10))
         out_frame.pack(fill=tk.X)
-        ttk.Label(out_frame, text="输出:").pack(side=tk.LEFT)
+
+        # 右侧：API key 状态入口（先打包占住右侧，理由同「⚙ 设置」）。
+        # 未配置时是一直可见的提醒，点它直接进设置弹窗。
+        self._key_chip = ttk.Button(out_frame, text="", style="Chip.TButton",
+                                    command=self._open_settings)
+        self._key_chip.pack(side=tk.RIGHT)
+
+        ttk.Label(out_frame, text="输出:", style="Dim.TLabel").pack(side=tk.LEFT)
         self._chatbox_var = tk.BooleanVar(value=bool((self._cfg.ui or {}).get("chatbox", True)))
         self._overlay_var = tk.BooleanVar(value=bool((self._cfg.ui or {}).get("overlay", False)))
         # 译音输出：把「我说的话」的译音回灌进虚拟声卡，VRChat 里的对方就能听见外语 TTS。
@@ -422,12 +455,13 @@ class TranslationGUI:
         tk.Checkbutton(out_frame, text="手腕屏", variable=self._overlay_var,
                        command=self._save_ui_state,
                        **self._indicator_kw()).pack(side=tk.LEFT, padx=(10, 0))
+        # 微调按钮紧跟「手腕屏」勾选：它是手腕屏的从属工具，放远了看不出归属
+        self._tune_btn = ttk.Button(out_frame, text="微调 ▸", width=7,
+                                    command=self._toggle_tune_panel)
+        self._tune_btn.pack(side=tk.LEFT, padx=(4, 0))
         tk.Checkbutton(out_frame, text="译音输出", variable=self._vmic_var,
                        command=self._save_audio_flag,
                        **self._indicator_kw()).pack(side=tk.LEFT, padx=(10, 0))
-        self._tune_btn = ttk.Button(out_frame, text="手腕屏微调 ▸", width=13,
-                                    command=self._toggle_tune_panel)
-        self._tune_btn.pack(side=tk.LEFT, padx=(16, 0))
 
         # 微调面板：外层常驻（保证位置固定），只切换内层 body 的显隐——
         # 若整块 pack_forget 再 pack，会被排到窗口最底部去。
@@ -458,12 +492,12 @@ class TranslationGUI:
             # 那 106px 会一直占着把聊天区压扁。必须显式关掉传播并把高度压到 0。
             self._tune_frame.pack_propagate(False)
             self._tune_frame.configure(height=1)
-            self._tune_btn.configure(text="手腕屏微调 ▸")
+            self._tune_btn.configure(text="微调 ▸")
             new_h = max(self._root.minsize()[1], win_h - getattr(self, "_tune_added_h", 0))
         else:
             self._tune_frame.pack_propagate(True)
             self._tune_body.pack(fill=tk.X)
-            self._tune_btn.configure(text="手腕屏微调 ▾")
+            self._tune_btn.configure(text="微调 ▾")
             self._root.update_idletasks()
             self._tune_added_h = self._tune_body.winfo_reqheight() + 8
             new_h = win_h + self._tune_added_h
@@ -608,38 +642,79 @@ class TranslationGUI:
         except Exception as exc:  # noqa: BLE001
             print(f"[gui] 保存手腕屏参数失败：{exc}", flush=True)
 
-    def _build_device_row(self) -> None:
-        row = ttk.Frame(self._root, padding=(14, 6))
-        row.pack(fill=tk.X)
+    # ---------------------------------------------------------------- 设置弹窗（低频设置）
+    def _build_settings_dialog(self) -> None:
+        """低频设置收进弹窗：API key + 音频设备。
 
-        auto = "自动检测"
+        为什么不在主界面：这两组是「装好一次、几乎不动」的设置，常驻只会让
+        主界面变成 4 行控件堆叠（改造前的样子）。弹窗**先建好再 withdraw**——
+        控件属性（_key_entry / _mic_combo 等）必须在弹窗不可见时也随即可用，
+        设备扫描和自动化测试都直接访问它们。
+        """
+        win = tk.Toplevel(self._root)
+        win.title("设置")
+        win.configure(bg=PANEL)
+        win.transient(self._root)
+        win.resizable(False, False)
+        win.withdraw()
+        win.protocol("WM_DELETE_WINDOW", self._close_settings)
+        win.bind("<Escape>", lambda _e: self._close_settings())
+        self._settings_win = win
+        self._apply_dark_titlebar(win)
 
-        # ⚠️ 「刷新」按钮必须先打包（side=RIGHT）：Tk 的 pack 空间不足时**先挤压
-        # 最后打包的控件**，按钮若最后打包会被挤成 1px（实测窗口 860 宽时按钮消失）。
-        # 先占住右侧，让下拉框去吸收压缩。
-        self._refresh_btn = ttk.Button(row, text="刷新", width=5,
+        body = ttk.Frame(win, padding=(18, 16, 18, 14))
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # ---- API Key ----
+        # 安全约束（与 vlt/credentials.py 一致）：
+        # - 输入框用 ● 掩码；保存成功后**立刻清空输入框**，明文不留在界面上；
+        # - 状态只出现打码形式（sk-xx-****yyyy）；明文不进日志、不进 config.yaml。
+        ttk.Label(body, text="API KEY", style="Section.TLabel").pack(anchor=tk.W)
+        key_row = ttk.Frame(body)
+        key_row.pack(fill=tk.X, pady=(8, 4))
+        # 先占右侧，空间不足时才不会把按钮挤没
+        self._key_clear_btn = ttk.Button(key_row, text="清除", width=5,
+                                         command=self._on_clear_key)
+        self._key_clear_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        self._key_save_btn = ttk.Button(key_row, text="保存", width=6,
+                                        command=self._on_save_key)
+        self._key_save_btn.pack(side=tk.RIGHT)
+        self._key_var = tk.StringVar()
+        self._key_entry = ttk.Entry(key_row, textvariable=self._key_var, show="●",
+                                    width=34, style="Key.TEntry")
+        self._key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 12))
+        self._key_entry.bind("<Return>", lambda _e: self._on_save_key())
+        self._key_status = ttk.Label(body, text="", style="Dim.TLabel")
+        self._key_status.pack(anchor=tk.W)
+        self._refresh_key_status()
+
+        ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=14)
+
+        # ---- 音频设备 ----
+        dev_head = ttk.Frame(body)
+        dev_head.pack(fill=tk.X)
+        ttk.Label(dev_head, text="音频设备", style="Section.TLabel").pack(side=tk.LEFT)
+        self._refresh_btn = ttk.Button(dev_head, text="刷新", width=5,
                                        command=self._on_refresh_devices)
-        self._refresh_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self._refresh_btn.pack(side=tk.RIGHT)
 
-        ttk.Label(row, text="麦克风:", style="Dim.TLabel").pack(side=tk.LEFT)
-        self._mic_combo = ttk.Combobox(row, values=[auto], state="readonly", width=24)
-        # fill+expand：随窗口伸缩。设备名普遍 30~50 字符，固定宽度要么截断要么把
-        # "刷新"按钮挤出窗口（实测固定 30 时设备行需要 1046px，窗口只有 920px）
-        self._mic_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 12))
-        self._mic_combo.set(auto)
-        self._mic_combo.bind("<<ComboboxSelected>>", self._on_device_change)
-
-        ttk.Label(row, text="VRChat 音频:", style="Dim.TLabel").pack(side=tk.LEFT)
-        self._loopback_combo = ttk.Combobox(row, values=[auto], state="readonly", width=24)
-        self._loopback_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 12))
-        self._loopback_combo.set(auto)
-        self._loopback_combo.bind("<<ComboboxSelected>>", self._on_device_change)
-
-        ttk.Label(row, text="译音输出:", style="Dim.TLabel").pack(side=tk.LEFT)
-        self._audio_out_combo = ttk.Combobox(row, values=[auto], state="readonly", width=24)
-        self._audio_out_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 12))
-        self._audio_out_combo.set(auto)
-        self._audio_out_combo.bind("<<ComboboxSelected>>", self._on_device_change)
+        grid = ttk.Frame(body)
+        grid.pack(fill=tk.X, pady=(8, 2))
+        grid.columnconfigure(1, weight=1)
+        auto = "自动检测"
+        # ⚠️ 控件名不能改：设备扫描结果直接往这三个下拉里写值
+        self._mic_combo = ttk.Combobox(grid, values=[auto], state="readonly")
+        self._loopback_combo = ttk.Combobox(grid, values=[auto], state="readonly")
+        self._audio_out_combo = ttk.Combobox(grid, values=[auto], state="readonly")
+        for i, (label, combo) in enumerate((
+                ("麦克风:", self._mic_combo),
+                ("VRChat 音频:", self._loopback_combo),
+                ("译音输出:", self._audio_out_combo))):
+            ttk.Label(grid, text=label, style="Dim.TLabel").grid(
+                row=i, column=0, sticky="w", pady=3)
+            combo.grid(row=i, column=1, sticky="ew", padx=(8, 0), pady=3)
+            combo.set(auto)
+            combo.bind("<<ComboboxSelected>>", self._on_device_change)
 
         # 从配置恢复选择
         capture_cfg = (self._cfg.output or {}).get("capture") or {}
@@ -648,36 +723,34 @@ class TranslationGUI:
         self._loopback_combo.set(capture_cfg.get("loopback_device") or auto)
         self._audio_out_combo.set(audio_cfg.get("device_name") or auto)
 
-    def _build_key_row(self) -> None:
-        """API key 输入行。
+        ttk.Label(body, text="设备选择自动保存到 config.yaml",
+                  style="Muted.TLabel").pack(anchor=tk.W, pady=(6, 0))
 
-        安全约束（与 vlt/credentials.py 一致）：
-        - 输入框用 ● 掩码；保存成功后**立刻清空输入框**，明文不留在界面上；
-        - 状态栏/日志只出现打码形式（`sk-ws-****0F2k（116 字符）`）；
-        - 明文既不进日志也不进 config.yaml —— key 存在用户目录，不进仓库。
-        """
-        row = ttk.Frame(self._root, padding=(14, 0, 14, 6))
-        row.pack(fill=tk.X)
+    def _open_settings(self) -> None:
+        """打开设置弹窗（已建好，只是显示出来），定位到主窗口附近。"""
+        win = self._settings_win
+        self._refresh_key_status()          # 每次打开都刷新来源/打码显示
+        win.update_idletasks()
+        rx, ry = self._root.winfo_x(), self._root.winfo_y()
+        rw = self._root.winfo_width()
+        ww, wh = win.winfo_reqwidth(), win.winfo_reqheight()
+        win.geometry(f"+{rx + max((rw - ww) // 2, 20)}+{ry + 48}")
+        win.deiconify()
+        win.lift()
+        win.focus_set()
+        # 建窗时它处于 withdraw 状态，那时调 DWM 拿不到有效 hwnd、会静默失败
+        # （实测弹窗标题栏仍是浅色、跟主窗口不一致）。显示出来之后再设一次。
+        self._apply_dark_titlebar(win)
 
-        # 与设备行同理：先占右侧，空间不足时才不会把按钮挤成 1px
-        self._key_clear_btn = ttk.Button(row, text="清除", width=5, command=self._on_clear_key)
-        self._key_clear_btn.pack(side=tk.RIGHT, padx=(6, 0))
-        self._key_save_btn = ttk.Button(row, text="保存", width=6, command=self._on_save_key)
-        self._key_save_btn.pack(side=tk.RIGHT)
-
-        ttk.Label(row, text="API Key:", style="Dim.TLabel").pack(side=tk.LEFT)
-        self._key_var = tk.StringVar()
-        self._key_entry = ttk.Entry(row, textvariable=self._key_var, show="●", width=34,
-                                    style="Key.TEntry")
-        self._key_entry.pack(side=tk.LEFT, padx=(4, 12))
-        self._key_entry.bind("<Return>", lambda _e: self._on_save_key())
-
-        self._key_status = ttk.Label(row, text="", style="Dim.TLabel")
-        self._key_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self._refresh_key_status()
+    def _close_settings(self) -> None:
+        self._settings_win.withdraw()
 
     def _refresh_key_status(self) -> None:
-        """只显示来源 + 打码值，绝不显示明文。"""
+        """只显示来源 + 打码值，绝不显示明文。
+
+        写两处：设置弹窗里的完整状态（_key_status）+ 主界面第二行右侧的
+        入口按钮（_key_chip）——key 没配时用户不看弹窗也能一眼看到提醒。
+        """
         try:
             from .credentials import key_source
 
@@ -687,8 +760,12 @@ class TranslationGUI:
             return
         if masked:
             self._key_status.config(text=f"当前：{src} {masked}")
+            chip = "API key ✓"
         else:
-            self._key_status.config(text="⚠️ 未配置 API key —— 在左边粘贴后点「保存」")
+            self._key_status.config(text="⚠️ 未配置 API key —— 在上面粘贴后点「保存」")
+            chip = "⚠ 未配置 API key"
+        if hasattr(self, "_key_chip"):
+            self._key_chip.configure(text=chip)
 
     def _on_save_key(self) -> None:
         from .credentials import load_saved_key, mask_key, save_api_key
@@ -721,7 +798,8 @@ class TranslationGUI:
 
     def _build_chat(self) -> None:
         chat_frame = ttk.Frame(self._root)
-        chat_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        # 与头部两行同一个 14px 左边距：左右边界对齐才有「一栏到底」的秩序感
+        chat_frame.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
 
         # Treeview 不支持多行/换行，聊天气泡用 Canvas 手绘圆角矩形
         self._canvas = tk.Canvas(chat_frame, bg=BG, highlightthickness=1,

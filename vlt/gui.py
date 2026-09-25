@@ -290,8 +290,14 @@ class TranslationGUI:
         # 分区小标题（设置弹窗里的「API KEY / 音频设备」）：小一号、暗色、加粗
         style.configure("Section.TLabel", foreground=TEXT_DIM,
                         font=("Microsoft YaHei UI", 8, "bold"))
-        # key 状态入口（第二行右侧的小按钮）：比常规按钮矮半档，不抢视觉
+        # key 状态入口（第二行右侧的小按钮）：比常规按钮矮半档，不抢视觉。
+        # 未配置时切 ChipWarn（警示橙文字），让「还没配 key」一眼可见——入口本身
+        # 仍是按钮（样式不动），只是文字用颜色表达状态。
         style.configure("Chip.TButton", font=FONT_STATUS, padding=(8, 3))
+        style.configure("ChipWarn.TButton", font=FONT_STATUS, padding=(8, 3),
+                        foreground=COLOR_WARN)
+        style.map("ChipWarn.TButton",
+                  foreground=[("active", COLOR_WARN), ("pressed", COLOR_WARN)])
         # 分割线/分组竖线：用 1px 明度差表达层次，不用 3D 边框
         style.configure("TSeparator", background=BORDER)
 
@@ -760,12 +766,12 @@ class TranslationGUI:
             return
         if masked:
             self._key_status.config(text=f"当前：{src} {masked}")
-            chip = "API key ✓"
+            chip_text, chip_style = "API key 已配置 ›", "Chip.TButton"
         else:
             self._key_status.config(text="⚠️ 未配置 API key —— 在上面粘贴后点「保存」")
-            chip = "⚠ 未配置 API key"
+            chip_text, chip_style = "⚠ 未配置 API key ›", "ChipWarn.TButton"
         if hasattr(self, "_key_chip"):
-            self._key_chip.configure(text=chip)
+            self._key_chip.configure(text=chip_text, style=chip_style)
 
     def _on_save_key(self) -> None:
         from .credentials import load_saved_key, mask_key, save_api_key

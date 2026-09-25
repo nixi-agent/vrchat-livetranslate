@@ -275,6 +275,7 @@ class TranslationGUI:
         # Tk 会从最后打包的控件开始裁（实测 860 时目标语言下拉被裁到 40px）。
         self._root.minsize(928, 460)
         self._root.configure(bg=PANEL)
+        self._set_window_icon()      # 标题栏/任务栏图标（失败只留痕，不影响启动）
 
         self._apply_theme()          # 必须先于任何控件创建
         # 信息架构：主界面只留**高频**操作（开/停、方向、语言、输出、看译文），
@@ -388,6 +389,28 @@ class TranslationGUI:
                         arrowcolor=TEXT_DIM, gripcount=0)
         style.map("Vertical.TScrollbar",
                   background=[("pressed", ACCENT_ACTIVE), ("active", SURFACE_HOVER)])
+
+    def _set_window_icon(self) -> None:
+        """窗口 / 任务栏图标。资源走 bundle_dir()（源码 = 仓库根，打包后 = _MEIPASS）。
+
+        Windows 上优先 `.ico` + `iconbitmap(default=...)`：它同时管标题栏和**任务栏**；
+        没有 .ico 时退回 `iconphoto(png)`。整段失败只打一行日志，绝不影响启动。
+        """
+        assets = BUNDLE_DIR / "assets"
+        try:
+            ico = assets / "app.ico"
+            if ico.exists():
+                self._root.iconbitmap(default=str(ico))
+                return
+            png = assets / "app.png"
+            if png.exists():
+                self._icon_img = tk.PhotoImage(file=str(png))   # 留引用防 GC
+                self._root.iconphoto(True, self._icon_img)
+                return
+            print(f"[gui] ⚠️ 没找到窗口图标（{assets}），用系统默认图标", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[gui] ⚠️ 设置窗口图标失败（不影响功能）：{type(exc).__name__}: {exc}",
+                  flush=True)
 
     def _apply_dark_titlebar(self, win=None) -> None:
         """Windows 标题栏变深色；老系统不支持就静默跳过（不能因此崩掉）。"""

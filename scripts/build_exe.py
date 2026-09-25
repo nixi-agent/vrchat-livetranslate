@@ -35,6 +35,7 @@ ENTRY = REPO / "run_gui.py"
 APP_NAME = "VRChatLiveTranslate"          # 文件名用 ASCII：跨工具链更省事
 DIST = REPO / "dist"
 BUILD = REPO / "build"
+ICON = REPO / "assets" / "app.ico"        # exe 图标（16/24/32/48/64/128/256 多尺寸）
 
 # 按需导入的库（静态分析看不到）→ 显式声明
 HIDDEN = [
@@ -94,8 +95,10 @@ def build() -> Path:
            "--paths", str(REPO),
            "--add-data", f"{REPO / 'config.example.yaml'}{';'}.",   # 首次运行要生成 config.yaml
            "--add-data", f"{REPO / 'testdata'}{';'}testdata",        # --self-test 用
-           "--add-data", f"{REPO / 'assets'}{';'}assets",            # 赞助弹窗的两张收款码
-           ]
+           "--add-data", f"{REPO / 'assets'}{';'}assets",            # 图标 + 赞助弹窗的两张收款码
+           ] + (["--icon", str(ICON)] if ICON.exists() else [])
+    if not ICON.exists():
+        print(f"[!] 没找到图标 {ICON}，本次打包不带自定义图标", flush=True)
     for h in HIDDEN:
         cmd += ["--hidden-import", h]
     for c in COLLECT_ALL:

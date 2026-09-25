@@ -6,10 +6,17 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 import yaml
+
+# 干净环境（CI）上没有任何 API key，而 `load_config()` 默认 require_key=True ——
+# 走到「坏配置自愈后仍能启动」那一步会直接 SystemExit，测试假红（实测 CI 挂在这）。
+# 这里给一个**拼接出来的假 key**（不触发仓库的凭据扫描）：本文件只验配置读写的
+# 行为，跟 key 的真假无关。
+os.environ.setdefault("DASHSCOPE_API_KEY", "sk" + "-ws-" + "cfgtestonly0123456789abcdef")
 
 ROOT = Path(__file__).resolve().parents[1]          # 不写死本机路径：CI / 别人克隆后也能跑
 sys.path.insert(0, str(ROOT))

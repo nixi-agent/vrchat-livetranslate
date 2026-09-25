@@ -10,6 +10,18 @@
 
 ---
 
+## 零、下载现成的 exe（不想折腾环境就用这个）
+
+到 **[Releases](https://github.com/nixi-agent/vrchat-livetranslate/releases/latest)** 下载
+`VRChatLiveTranslate.exe`（单文件、免安装、无控制台窗口），**双击即用**。
+
+- 仍然要自备一个**阿里云百炼 API key**：界面「⚙ 设置」里粘贴保存，或设环境变量 `DASHSCOPE_API_KEY`
+- 配置与日志写在 `%APPDATA%\vrchat-livetranslate`（exe 放在只读目录也能跑）；
+  想做成绿色版（配置跟着 exe 走）→ 在 exe 旁边放一个空的 `portable.txt`
+- 想看源码 / 自己打包 / 改代码 → 从下面的「一」开始
+
+---
+
 ## 一、前置条件
 
 1. **Windows 10/11**（用到 WASAPI 与 SteamVR）

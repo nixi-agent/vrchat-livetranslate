@@ -1,0 +1,82 @@
+name: CI
+
+# 每次推 main / 开 PR 都跑一遍：语法、凭据扫描、全部离线测试，最后确认「还打得出来 exe」。
+# 所有测试都必须能在没有 API key、没有麦克风/VRChat/SteamVR 的机器上跑（CI 就是这么台机器），
+# 需要真 key 的 --self-test 不在这里跑（它在 release.yml 里也显式跳过）。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: 语法检查（不导入，只编译）
+        run: python -m compileall -q vlt scripts tests
+
+      - name: 凭据扫描（仓库自带的钩子脚本，防 key 进历史）
+        run: python scripts/check_no_secrets.py --once
+
+      - name: 跑全部离线测试
+        shell: bash
+        run: |
+          set -o pipefail
+          fail=0
+          for t in tests/test_*.py; do
+            echo "::group::$t"
+            if python "$t"; then
+              echo "PASS $t"
+            else
+              echo "::error file=$t::测试失败（见本组日志）"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
+  package:
+    # 能过测试还不代表打得出来 —— 打包链路（PyInstaller + 资源 + 图标）单独验一次
+    needs: tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install "pyinstaller>=6.6"
+
+      - name: 打包（跳过需要真 key 的自检）
+        run: python scripts/build_exe.py --no-verify
+
+      - name: 断言产物可用
+        shell: pwsh
+        run: |
+          $exe = "dist/VRChatLiveTranslate.exe"
+          if (-not (Test-Path $exe)) { Write-Error "没产出 exe"; exit 1 }
+          $len = (Get-Item $exe).Length
+          Write-Host ("打包成功：{0:N1} MB" -f ($len / 1MB))
+          if ($len -lt 20MB) { Write-Error "体积异常，打包不完整"; exit 1 }

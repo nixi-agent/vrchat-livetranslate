@@ -1,0 +1,103 @@
+name: Release
+
+# 打 v* 标签 → 在 Windows 上真打包一次单文件 exe → 建 Release 并把 exe 当附件传上去。
+# 为什么放 CI 而不是本机手工传：手工那次没人能复现「这个 exe 到底是哪个 commit 打的」，
+# 而这里 tag 与包内 __version__ 会先对一次账，产物还带 SHA256。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:            # 手动跑一次只产出 artifact（不建 release）
+
+permissions:
+  contents: write               # 建 release / 传附件需要
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # 打包脚本会读 git HEAD 做版本溯源
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"  # 与 README 要求一致（3.12 未测）
+
+      - name: 对账 tag 与包内版本
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $m = Select-String -Path vlt/__init__.py -Pattern '__version__\s*=\s*"([^"]+)"'
+          $py = $m.Matches[0].Groups[1].Value
+          Write-Host "tag=$tag  包内 __version__=$py"
+          if ($tag -ne $py) {
+            Write-Error "tag 与 vlt/__init__.py 的 __version__ 不一致：先改代码再打 tag"
+            exit 1
+          }
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install "pyinstaller>=6.6"
+
+      - name: 打包单文件 exe
+        # --no-verify：打完自带的自检要真 API key + 联网，CI 里没有 → 跳过
+        run: python scripts/build_exe.py --no-verify
+
+      - name: 自检产物（存在性 / 大小 / 图标资源）
+        shell: pwsh
+        run: |
+          $exe = "dist/VRChatLiveTranslate.exe"
+          if (-not (Test-Path $exe)) { Write-Error "没找到产物 $exe"; exit 1 }
+          $f = Get-Item $exe
+          Write-Host ("产物：{0}  {1:N1} MB" -f $f.Name, ($f.Length / 1MB))
+          if ($f.Length -lt 20MB) { Write-Error "产物体积异常（<20MB），大概率没打全"; exit 1 }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+          "$hash  VRChatLiveTranslate.exe" | Out-File -Encoding ascii dist/SHA256SUMS.txt
+          Get-Content dist/SHA256SUMS.txt
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: VRChatLiveTranslate-exe
+          path: |
+            dist/VRChatLiveTranslate.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: 建 Release 并附上 exe
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            ## VRChat 实时同传 ${{ github.ref_name }}
+
+            **下载附件里的 `VRChatLiveTranslate.exe`（单文件、免安装、无控制台），双击即用。**
+            同一个 exe 的 SHA256 见 `SHA256SUMS.txt`。
+
+            ### 用它之前需要什么
+            - Windows 10/11
+            - **一个阿里云百炼 API key**（自备，按量计费）：界面「⚙ 设置」粘贴保存，或设环境变量 `DASHSCOPE_API_KEY`
+            - VRChat 设置里打开 **OSC**（`OSC enabled: True`）、chat bubble visibility 设为 **Everyone**
+            - 用手腕屏还需要 **SteamVR** 在跑；用译音回灌还需要装 **虚拟声卡**（VoiceMeeter 之类）
+
+            ### 这版有什么
+            - 我说 → **chatbox 气泡**：麦克风 → 实时语音翻译 → 气泡里逐字刷新，句末刷最终版
+            - 别人说 → **VR 手腕屏**：采集 VRChat 播放输出 → 中文渲染到 SteamVR overlay，有更新立刻上屏
+            - 图形界面：深色主题、聊天气泡视图（译文大字 + 原文小字）、方向/语言一键切换、设备下拉自动扫描
+            - 「⚙ 设置」里可存 API key、选音频设备；**日志一键导出压缩包**（自动脱敏，不含密钥）
+            - 未配置 API key 时，主界面右上角会变成「一键开通百炼」的入口
+
+            ### 已知限制
+            - 译音回灌（让对方听见译音）**尚未实现**，需要虚拟声卡
+            - 采集 VRChat 音频必须在**物理控制台会话**里跑（远程桌面会话里采不到声音）
+            - 16px 图标档看不清五官（源图细节量决定，属正常）
+
+            完整说明见仓库 [README](https://github.com/nixi-agent/vrchat-livetranslate#readme)。
+          files: |
+            dist/VRChatLiveTranslate.exe
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true

@@ -345,6 +345,13 @@ def log_startup_info(tag: str = "") -> None:
     print("=" * 64)
     print(f"[startup] {tag}  {_dt.datetime.now().isoformat(timespec='seconds')}")
     print(f"[startup] python {sys.version.split()[0]} | {platform.platform()}")
+    try:
+        from . import __version__ as _ver
+
+        _how = "打包 exe" if getattr(sys, "frozen", False) else "源码运行"
+        print(f"[startup] 版本 v{_ver}（{_how}）")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] 版本读取失败：{exc}")
     print(f"[startup] cwd {Path.cwd()}")
     print("[startup] 日志时间戳为行首 HH:MM:SS.mmm（本机本地时间 = UTC+8）")
     try:

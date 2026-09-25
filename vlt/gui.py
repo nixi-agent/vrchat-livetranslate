@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -66,6 +67,17 @@ COLOR_ERROR   = "#e05a5a"
 # 原文小字的颜色：比译文暗一档但仍清晰可读（按气泡底色分别取，保证对比度）
 COLOR_SRC_MINE = "#c3d4ee"
 COLOR_SRC_THEIRS = TEXT_DIM
+
+# ---- 赞助弹窗 ----
+SPONSOR_URL = "https://ko-fi.com/kcmnixi"
+SPONSOR_QR_SIZE = 240          # 收款码等比缩放的目标边长（严禁拉伸：拉变形就扫不出来）
+
+
+def _sponsor_qr_specs() -> list[tuple[str, Path]]:
+    """赞助弹窗的两张收款码：(标签, 图片路径)。只读资源一律走 bundle_dir()。"""
+    assets = BUNDLE_DIR / "assets"
+    return [("微信", assets / "sponsor-wechat.png"),
+            ("支付宝", assets / "sponsor-alipay.png")]
 
 SOURCE_LANGS = {
     "自动检测": None,
@@ -225,6 +237,10 @@ class TranslationGUI:
         self._canvas_w = 600
         self._relayout_job: str | None = None
         self._last_status_level = ""
+        # 赞助弹窗（懒建：点开才创建；关掉即销毁，再点重建）
+        self._sponsor_win: tk.Toplevel | None = None
+        self._sponsor_imgs: list = []          # PhotoImage 必须留引用，否则被 GC 后变空白
+        self._sponsor_qr_labels: list = []     # 两张收款码对应的 Label（测试要验证）
 
         # 设备选择
         self._mic_names: list[str] = []
@@ -248,8 +264,10 @@ class TranslationGUI:
     def _build_ui(self) -> None:
         self._root = tk.Tk()
         self._root.title("VRChat 实时同传")
-        self._root.geometry("920x600")
-        self._root.minsize(860, 460)      # 下限保证第一行（开/停+方向+语言对+设置）不裁切
+        self._root.geometry("940x600")
+        # 下限按第一行实测需求定（含「☕ 赞助」后整行 req=920px）：小于这个宽度
+        # Tk 会从最后打包的控件开始裁（实测 860 时目标语言下拉被裁到 40px）。
+        self._root.minsize(928, 460)
         self._root.configure(bg=PANEL)
 
         self._apply_theme()          # 必须先于任何控件创建
@@ -395,6 +413,11 @@ class TranslationGUI:
         self._settings_btn = ttk.Button(ctrl, text="⚙ 设置", width=8,
                                         command=self._open_settings)
         self._settings_btn.pack(side=tk.RIGHT)
+        # 「☕ 赞助」紧跟其后打包（也在右侧，排在「⚙ 设置」左边）：右侧控件必须
+        # 全部先于左侧控件打包，否则空间不足时会被 Tk 从最后打包的开始裁掉。
+        self._sponsor_btn = ttk.Button(ctrl, text="☕ 赞助", width=8,
+                                       command=self._open_sponsor)
+        self._sponsor_btn.pack(side=tk.RIGHT, padx=(0, 8))
 
         self._start_btn = ttk.Button(ctrl, text="开始翻译", style="Accent.TButton",
                                      command=self._start)
@@ -824,6 +847,124 @@ class TranslationGUI:
 
     def _close_settings(self) -> None:
         self._settings_win.withdraw()
+
+    # ---------------------------------------------------------------- 赞助弹窗
+    def _open_kofi(self) -> None:
+        """打开 Ko-fi 赞助页面（独立成小方法：测试打桩它，绝不真开浏览器）。"""
+        try:
+            webbrowser.open(SPONSOR_URL)
+            print(f"[gui] 已打开赞助页面 {SPONSOR_URL}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[gui] ⚠️ 打不开浏览器：{type(exc).__name__}: {exc}", flush=True)
+            self._set_status("warn", f"打不开浏览器，请手动访问 {SPONSOR_URL}")
+
+    def _open_sponsor(self) -> None:
+        """打开赞助弹窗；已经开着时只聚焦/置顶已有窗口，绝不 new 第二个。"""
+        if self._sponsor_win is not None:
+            try:
+                if self._sponsor_win.winfo_exists():
+                    self._sponsor_win.deiconify()
+                    self._sponsor_win.lift()
+                    self._sponsor_win.focus_set()
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+            self._sponsor_win = None
+        try:
+            self._build_sponsor_dialog()
+        except Exception as exc:  # noqa: BLE001
+            # 辅助功能挂掉绝不能拖垮主窗口：留痕 + 状态栏提示，不往上抛
+            self._sponsor_win = None
+            print(f"[gui] ⚠️ 赞助弹窗创建失败（不影响主功能）："
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            self._set_status("warn", f"赞助弹窗打不开：{exc}")
+
+    def _build_sponsor_dialog(self) -> None:
+        """赞助弹窗：Ko-fi 按钮 + 可复制地址 + 两张收款码（微信/支付宝）。
+
+        深色主题完全复用主窗口的颜色常量与 ttk style，不自创颜色。
+        收款码必须**等比**缩放（LANCZOS，目标边长 240px）——拉变形就扫不出来。
+        """
+        win = tk.Toplevel(self._root)
+        win.title("赞助")
+        win.configure(bg=PANEL)
+        win.transient(self._root)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self._close_sponsor)
+        win.bind("<Escape>", lambda _e: self._close_sponsor())
+        self._sponsor_win = win
+        self._sponsor_imgs = []
+        self._sponsor_qr_labels = []
+
+        body = ttk.Frame(win, padding=(20, 16, 20, 14))
+        body.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(body, text="☕ 请我喝一杯",
+                  font=("Microsoft YaHei UI", 13, "bold")).pack(anchor=tk.CENTER)
+
+        ttk.Button(body, text="打开 Ko-fi 赞助页面", style="Accent.TButton",
+                   command=self._open_kofi).pack(anchor=tk.CENTER, pady=(12, 8))
+
+        # 地址用只读 Entry：用户可以选中复制，但改不了（Label 在 Windows 上选不中文字）
+        self._sponsor_url_var = tk.StringVar(value=SPONSOR_URL)
+        url_entry = ttk.Entry(body, textvariable=self._sponsor_url_var,
+                              style="Key.TEntry", justify=tk.CENTER, width=30)
+        url_entry.configure(state="readonly")
+        url_entry.pack(anchor=tk.CENTER, pady=(0, 14))
+
+        # 两张收款码并排，各带文字标签，码与码之间留间距
+        qr_row = ttk.Frame(body)
+        qr_row.pack(anchor=tk.CENTER)
+        for label, path in _sponsor_qr_specs():
+            cell = ttk.Frame(qr_row)
+            cell.pack(side=tk.LEFT, padx=14)
+            self._load_qr(cell, path).pack(anchor=tk.CENTER)
+            ttk.Label(cell, text=label, style="Dim.TLabel").pack(anchor=tk.CENTER,
+                                                                 pady=(6, 0))
+
+        ttk.Label(body, text="扫码支持 · 你给的钱会变成 API token，然后被我烧掉",
+                  style="Dim.TLabel").pack(anchor=tk.CENTER, pady=(14, 4))
+        ttk.Button(body, text="关闭", width=8,
+                   command=self._close_sponsor).pack(anchor=tk.CENTER, pady=(8, 0))
+
+        # 定位到主窗口附近 + 深色标题栏（与设置弹窗同一套做法）
+        win.update_idletasks()
+        rx, ry = self._root.winfo_x(), self._root.winfo_y()
+        rw = self._root.winfo_width()
+        ww = win.winfo_reqwidth()
+        win.geometry(f"+{rx + max((rw - ww) // 2, 20)}+{ry + 48}")
+        self._apply_dark_titlebar(win)
+
+    def _load_qr(self, parent, path: Path):  # noqa: ANN001
+        """等比缩放加载一张收款码；图片缺失/加载失败时降级成一行文字 + WARN 日志，
+        绝不抛异常 —— 辅助功能挂掉不能拖垮主窗口。"""
+        try:
+            from PIL import Image, ImageTk
+
+            if not path.exists():
+                raise FileNotFoundError(path)
+            im = Image.open(path)
+            im.thumbnail((SPONSOR_QR_SIZE, SPONSOR_QR_SIZE), Image.LANCZOS)  # 等比，绝不拉伸
+            photo = ImageTk.PhotoImage(im)
+            self._sponsor_imgs.append(photo)      # 留引用防 GC
+            lbl = tk.Label(parent, image=photo, bg=PANEL, bd=0,
+                           highlightthickness=1, highlightbackground=BORDER)
+            self._sponsor_qr_labels.append(lbl)
+            return lbl
+        except Exception as exc:  # noqa: BLE001
+            print(f"[gui] ⚠️ 收款码加载失败（已降级为文字提示）：{path} "
+                  f"→ {type(exc).__name__}: {exc}", flush=True)
+            return ttk.Label(parent, text="二维码图片缺失", style="Dim.TLabel")
+
+    def _close_sponsor(self) -> None:
+        win, self._sponsor_win = self._sponsor_win, None
+        self._sponsor_imgs = []
+        self._sponsor_qr_labels = []
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _refresh_key_status(self) -> None:
         """只显示来源 + 打码值，绝不显示明文。

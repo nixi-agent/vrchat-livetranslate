@@ -94,6 +94,7 @@ def build() -> Path:
            "--paths", str(REPO),
            "--add-data", f"{REPO / 'config.example.yaml'}{';'}.",   # 首次运行要生成 config.yaml
            "--add-data", f"{REPO / 'testdata'}{';'}testdata",        # --self-test 用
+           "--add-data", f"{REPO / 'assets'}{';'}assets",            # 赞助弹窗的两张收款码
            ]
     for h in HIDDEN:
         cmd += ["--hidden-import", h]

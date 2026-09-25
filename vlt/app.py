@@ -27,8 +27,10 @@ from .engine import (
     pick_input_device, pick_loopback_device, list_devices,
 )
 
-ROOT = Path(__file__).resolve().parent.parent
-LOG_DIR = ROOT / "logs"
+from .paths import APP_DIR
+
+ROOT = APP_DIR
+LOG_DIR = APP_DIR / "logs"
 
 
 class Telemetry:

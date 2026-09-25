@@ -13,10 +13,12 @@ import yaml
 
 from .session.base import SessionConfig
 
-ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG = ROOT / "config.yaml"
+from .paths import APP_DIR, BUNDLE_DIR
+
+ROOT = APP_DIR                                    # 保留别名，兼容既有引用
+DEFAULT_CONFIG = APP_DIR / "config.yaml"           # 可写：用户配置
 # 入库的是模板；config.yaml 是用户自己的配置（设备名/语言偏好），已被 gitignore。
-EXAMPLE_CONFIG = ROOT / "config.example.yaml"
+EXAMPLE_CONFIG = BUNDLE_DIR / "config.example.yaml"  # 只读：随程序分发的模板
 
 
 def ensure_config(path: Path | None = None) -> Path:

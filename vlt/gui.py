@@ -33,7 +33,9 @@ from .devices import (
 )
 from .engine import Engine, EngineEvents
 
-ROOT = Path(__file__).resolve().parent.parent
+from .paths import APP_DIR, BUNDLE_DIR
+
+ROOT = APP_DIR
 
 FONT = ("Microsoft YaHei UI", 11)          # 译文（主）
 FONT_SMALL = ("Microsoft YaHei UI", 9)     # 原文（辅，小一号）
@@ -1527,7 +1529,7 @@ class TranslationGUI:
     # ================================================================ 自检
 
     def run_self_test(self) -> int:
-        pcm_path = ROOT / "testdata" / "zh_test_16k.pcm"
+        pcm_path = BUNDLE_DIR / "testdata" / "zh_test_16k.pcm"
         if not pcm_path.exists():
             print(f"GUI_SELFTEST_FAIL: 测试音频不存在 {pcm_path}", file=sys.stderr)
             return 1
@@ -1564,8 +1566,8 @@ class TranslationGUI:
 
     def run_self_test_dual(self) -> int:
         """双向同时验收：两个测试 PCM 同时驱动两个引擎，左右两侧都必须出气泡。"""
-        zh = ROOT / "testdata" / "zh_test_16k.pcm"
-        en = ROOT / "testdata" / "en_test_16k.pcm"
+        zh = BUNDLE_DIR / "testdata" / "zh_test_16k.pcm"
+        en = BUNDLE_DIR / "testdata" / "en_test_16k.pcm"
         for p in (zh, en):
             if not p.exists():
                 print(f"GUI_SELFTEST_DUAL_FAIL: 测试音频不存在 {p}", file=sys.stderr)

@@ -17,7 +17,8 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+# 调试帧是"跑完要看"的产物 → 可写目录（exe 旁），不是临时解包目录
+from ..paths import APP_DIR as ROOT
 
 
 # ---------------------------------------------------------------- 配置

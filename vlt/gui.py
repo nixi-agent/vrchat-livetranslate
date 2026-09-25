@@ -253,6 +253,7 @@ class TranslationGUI:
         self._apply_theme()          # 必须先于任何控件创建
         self._build_controls()
         self._build_device_row()
+        self._build_key_row()
         self._divider()
         self._build_chat()
         self._divider()
@@ -637,6 +638,76 @@ class TranslationGUI:
         self._loopback_combo.set(capture_cfg.get("loopback_device") or auto)
         self._audio_out_combo.set(audio_cfg.get("device_name") or auto)
 
+    def _build_key_row(self) -> None:
+        """API key 输入行。
+
+        安全约束（与 vlt/credentials.py 一致）：
+        - 输入框用 ● 掩码；保存成功后**立刻清空输入框**，明文不留在界面上；
+        - 状态栏/日志只出现打码形式（`sk-ws-****0F2k（116 字符）`）；
+        - 明文既不进日志也不进 config.yaml —— key 存在用户目录，不进仓库。
+        """
+        row = ttk.Frame(self._root, padding=(14, 0, 14, 6))
+        row.pack(fill=tk.X)
+
+        # 与设备行同理：先占右侧，空间不足时才不会把按钮挤成 1px
+        self._key_clear_btn = ttk.Button(row, text="清除", width=5, command=self._on_clear_key)
+        self._key_clear_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        self._key_save_btn = ttk.Button(row, text="保存", width=6, command=self._on_save_key)
+        self._key_save_btn.pack(side=tk.RIGHT)
+
+        ttk.Label(row, text="API Key:", style="Dim.TLabel").pack(side=tk.LEFT)
+        self._key_var = tk.StringVar()
+        self._key_entry = ttk.Entry(row, textvariable=self._key_var, show="●", width=34)
+        self._key_entry.pack(side=tk.LEFT, padx=(4, 10))
+        self._key_entry.bind("<Return>", lambda _e: self._on_save_key())
+
+        self._key_status = ttk.Label(row, text="", style="Dim.TLabel")
+        self._key_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._refresh_key_status()
+
+    def _refresh_key_status(self) -> None:
+        """只显示来源 + 打码值，绝不显示明文。"""
+        try:
+            from .credentials import key_source
+
+            src, masked = key_source()
+        except Exception as exc:  # noqa: BLE001
+            self._key_status.config(text=f"⚠️ 读取 key 状态失败：{exc}")
+            return
+        if masked:
+            self._key_status.config(text=f"当前：{src} {masked}")
+        else:
+            self._key_status.config(text="⚠️ 未配置 API key —— 在左边粘贴后点「保存」")
+
+    def _on_save_key(self) -> None:
+        from .credentials import load_saved_key, mask_key, save_api_key
+
+        raw = self._key_var.get()
+        try:
+            path = save_api_key(raw)
+        except ValueError as exc:
+            self._key_var.set("")                      # 明文不留在界面上
+            self._key_status.config(text=f"❌ 没保存：{exc}")
+            self._set_status("error", f"API key 保存失败：{exc}")
+            print(f"[gui] ❌ API key 保存失败：{exc}", flush=True)
+            return
+        self._key_var.set("")
+        shown = mask_key(load_saved_key() or "")
+        self._refresh_key_status()
+        self._set_status("ok", f"API key 已保存（{shown}）")
+        print(f"[gui] ✅ API key 已保存（{shown}）→ {path}", flush=True)
+        self._check_api_key()
+
+    def _on_clear_key(self) -> None:
+        from .credentials import clear_saved_key
+
+        removed = clear_saved_key()
+        self._refresh_key_status()
+        msg = "已清除保存的 API key" if removed else "本来就没有保存过 API key"
+        self._set_status("info", msg)
+        print(f"[gui] {msg}", flush=True)
+        self._check_api_key()
+
     def _build_chat(self) -> None:
         chat_frame = ttk.Frame(self._root)
         chat_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
@@ -668,6 +739,7 @@ class TranslationGUI:
     # ================================================================ 事件处理
 
     def _check_api_key(self) -> None:
+        self._refresh_key_status()
         try:
             from .config import load_api_key
             load_api_key()

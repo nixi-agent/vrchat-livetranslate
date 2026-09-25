@@ -37,9 +37,24 @@ def ensure_config(path: Path | None = None) -> Path:
 
 
 def load_api_key(explicit: str | None = None) -> str:
-    """API key 读取顺序：显式参数 → 环境变量 DASHSCOPE_API_KEY → ~/.bailian/config.json（bl CLI）。"""
+    """API key 读取顺序：显式参数 → 界面保存的 → 环境变量 → ~/.bailian/config.json（bl CLI）。
+
+    界面保存的排第二（仅次于显式传参）：用户在界面上填了 key，就是最明确的意图，
+    不该被环境变量或 CLI 配置盖掉。来源会打一行日志（**只打码、绝不打明文**），
+    否则"为什么连的还是旧 key"根本查不出来。
+    """
     if explicit:
         return explicit.strip()
+    try:
+        from .credentials import load_saved_key, mask_key
+
+        saved = load_saved_key()
+        if saved:
+            print(f"[config] API key 来源：界面保存（{mask_key(saved)}）", flush=True)
+            return saved
+    except Exception as exc:  # noqa: BLE001
+        print(f"[config] ⚠️ 读取界面保存的 key 失败，继续走其它来源："
+              f"{type(exc).__name__}: {exc}", flush=True)
     env = os.environ.get("DASHSCOPE_API_KEY")
     if env:
         return env.strip()

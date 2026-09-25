@@ -903,14 +903,10 @@ class TranslationGUI:
                   font=("Microsoft YaHei UI", 13, "bold")).pack(anchor=tk.CENTER)
 
         ttk.Button(body, text="打开 Ko-fi 赞助页面", style="Accent.TButton",
-                   command=self._open_kofi).pack(anchor=tk.CENTER, pady=(12, 8))
+                   command=self._open_kofi).pack(anchor=tk.CENTER, pady=(12, 14))
 
-        # 地址用只读 Entry：用户可以选中复制，但改不了（Label 在 Windows 上选不中文字）
-        self._sponsor_url_var = tk.StringVar(value=SPONSOR_URL)
-        url_entry = ttk.Entry(body, textvariable=self._sponsor_url_var,
-                              style="Key.TEntry", justify=tk.CENTER, width=30)
-        url_entry.configure(state="readonly")
-        url_entry.pack(anchor=tk.CENTER, pady=(0, 14))
+        # 弹窗里**不放** Ko-fi 地址：蓝按钮点一下就直接开浏览器了，再摆一行地址纯属多余
+        # （用户口径：2026-09-25）。地址并没有丢：_open_kofi 打不开浏览器时会把它写进状态栏。
 
         # 两张收款码并排，各带文字标签，码与码之间留间距
         qr_row = ttk.Frame(body)

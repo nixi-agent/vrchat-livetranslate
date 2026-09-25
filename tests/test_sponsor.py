@@ -87,8 +87,10 @@ def test_popup_contents() -> None:
         assert "扫码支持 · 你给的钱会变成 API token，然后被我烧掉" in joined, "缺说明文字"
         assert "关闭" in buttons, "缺关闭按钮"
         assert "微信" in joined and "支付宝" in joined, "缺码的标签"
-        assert gui_mod.SPONSOR_URL in joined or \
-            gui._sponsor_url_var.get() == gui_mod.SPONSOR_URL, "缺 Ko-fi 地址"
+        # 用户口径（2026-09-25）：「点那个蓝按钮就直接开浏览器了，地址没必要放」→ 弹窗里不再展示 URL。
+        # 地址也没丢：_open_kofi 打不开浏览器时会把 SPONSOR_URL 写进状态栏（用例 ③ 覆盖）。
+        assert gui_mod.SPONSOR_URL not in joined, f"弹窗里不该再出现 Ko-fi 地址：{joined!r}"
+        assert not hasattr(gui, "_sponsor_url_var"), "地址输入框应已移除，不该留残留属性"
 
         # 两张码：两个带图 Label，PhotoImage 非空、尺寸约 240 且等比（原图 ≈ 方形）
         assert len(gui._sponsor_qr_labels) == 2, \

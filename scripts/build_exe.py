@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -109,9 +110,21 @@ def build() -> Path:
     return exe
 
 
+def frozen_app_dir(exe: Path) -> Path:
+    """打包后的**可写目录**：`%APPDATA%\\vrchat-livetranslate`。
+
+    与 `vlt/paths.app_dir()` 保持一致（那边跑在 exe 内部，这里跑在构建脚本里）。
+    例外：exe 旁边有 `portable.txt` → 用 exe 所在目录（绿色版）。
+    """
+    if (exe.parent / "portable.txt").exists():
+        return exe.parent
+    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return Path(appdata) / "vrchat-livetranslate"
+
+
 def verify(exe: Path, timeout_s: int = 180) -> bool:
     """真跑一遍 exe，并从它自己写的日志里确认结果（无控制台，看不到 stdout）。"""
-    log_dir = exe.parent / "logs"          # 打包后日志落在 exe 旁边（APP_DIR）
+    log_dir = frozen_app_dir(exe) / "logs"
     for old in log_dir.glob("gui_*.log"):
         old.unlink(missing_ok=True)
     print(f"\n开始自检：{exe.name} --self-test（最多等 {timeout_s}s）", flush=True)
@@ -135,7 +148,7 @@ def verify(exe: Path, timeout_s: int = 180) -> bool:
     print(("✅ 自检通过" if ok else "❌ 自检未通过") + "（判定依据：退出码 + 日志里的 GUI_SELFTEST_OK）",
           flush=True)
     if not ok and not logs:
-        print("   ⚠️ exe 旁的 logs/ 里没有日志 —— 说明连崩溃日志都没写出来，"
+        print("   ⚠️ 可写目录的 logs/ 里没有日志 —— 说明连崩溃日志都没写出来，"
               "多半是启动阶段就挂了", flush=True)
     return ok
 
@@ -151,8 +164,9 @@ def main() -> int:
     exe = build()
     size_mb = exe.stat().st_size / 1024 / 1024
     print(f"\n✅ 产物：{exe}\n   大小：{size_mb:.1f} MB（单文件、无控制台）", flush=True)
-    print("   首次运行时会在**同一个目录**生成 config.yaml 和 logs/，"
-          "把整个 dist 文件夹一起发给别人即可", flush=True)
+    print(f"   配置与日志写在：{frozen_app_dir(exe)}"
+          "（exe 放在只读目录也能跑；想改成绿色版——配置跟 exe 走——"
+          "在 exe 旁边放一个 portable.txt 即可）", flush=True)
 
     if args.no_verify:
         return 0

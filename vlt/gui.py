@@ -733,6 +733,79 @@ class TranslationGUI:
         ttk.Label(body, text="设备选择自动保存到 config.yaml",
                   style="Muted.TLabel").pack(anchor=tk.W, pady=(6, 0))
 
+        # ---- 日志 ----
+        ttk.Separator(body).pack(fill=tk.X, pady=(14, 10))
+        log_head = ttk.Frame(body)
+        log_head.pack(fill=tk.X)
+        ttk.Label(log_head, text="日志", style="Section.TLabel").pack(side=tk.LEFT)
+        self._log_export_btn = ttk.Button(log_head, text="导出日志压缩包…",
+                                          command=self._on_export_logs)
+        self._log_export_btn.pack(side=tk.RIGHT)
+        self._log_info = ttk.Label(body, text="", style="Muted.TLabel", justify=tk.LEFT)
+        self._log_info.pack(anchor=tk.W, pady=(6, 0))
+        self._refresh_log_info()
+
+    def _log_dir(self) -> Path:
+        from .crashlog import _LOG_PATH      # noqa: SLF001  （跟着实际日志走）
+
+        if _LOG_PATH is not None:
+            return Path(_LOG_PATH).parent
+        return ROOT / "logs"
+
+    def _refresh_log_info(self) -> None:
+        """把日志目录/体积/上限显示出来 —— 用户才知道会不会把磁盘吃爆。"""
+        from .crashlog import MAX_LOG_TOTAL_BYTES
+
+        d = self._log_dir()
+        try:
+            files = [p for p in d.glob("*.log*") if p.is_file()]
+            total = sum(p.stat().st_size for p in files)
+        except OSError:
+            files, total = [], 0
+        cap_mb = MAX_LOG_TOTAL_BYTES // 1024 // 1024
+        self._log_info.config(
+            text=(f"共 {len(files)} 个文件，{total / 1024 / 1024:.1f} MB"
+                  f"（超过 {cap_mb} MB 自动删最旧的）\n{d}\n"
+                  f"出问题时导出压缩包发给维护者即可（自动脱敏，不含密钥）"))
+
+    def _on_export_logs(self) -> None:
+        """把日志打成 zip 到用户指定位置 —— 给朋友用来自证问题的入口。"""
+        import datetime as _dt
+        from tkinter import filedialog, messagebox
+
+        from .crashlog import export_logs
+
+        stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            dest = filedialog.asksaveasfilename(
+                parent=self._settings_win, title="导出日志压缩包",
+                initialfile=f"vrchat-livetranslate-logs-{stamp}.zip",
+                defaultextension=".zip",
+                filetypes=[("ZIP 压缩包", "*.zip"), ("所有文件", "*.*")])
+        except Exception as exc:  # noqa: BLE001
+            self._set_status("error", f"打不开保存对话框：{exc}")
+            return
+        if not dest:
+            print("[gui] 导出日志：用户取消", flush=True)
+            return
+        try:
+            path, n, size, redacted = export_logs(Path(dest), log_dir=self._log_dir())
+        except Exception as exc:  # noqa: BLE001
+            self._set_status("error", f"导出日志失败：{exc}")
+            print(f"[gui] ❌ 导出日志失败：{type(exc).__name__}: {exc}", flush=True)
+            return
+        msg = f"日志已导出：{path}（{n} 个文件，{size / 1024:.0f} KB）"
+        if redacted:
+            msg += f"｜已脱敏 {len(redacted)} 个文件"
+        self._set_status("ok", msg)
+        print(f"[gui] ✅ {msg}", flush=True)
+        self._refresh_log_info()
+        try:
+            messagebox.showinfo("导出完成", f"{msg}\n\n把这个压缩包发给维护者即可。",
+                                parent=self._settings_win)
+        except Exception:
+            pass
+
     def _open_settings(self) -> None:
         """打开设置弹窗（已建好，只是显示出来），定位到主窗口附近。"""
         win = self._settings_win
@@ -1622,6 +1695,12 @@ def main() -> int:
 
     # 崩溃日志：闪退时窗口一关什么都没了，必须落盘。
     # 在创建界面之前装上，连启动阶段的崩溃也能抓到。
+    # 可写目录（打包后是 %APPDATA%\vrchat-livetranslate）：先迁移旧版放在 exe 旁边的
+    # 配置、再确保目录存在，最后才装崩溃日志 —— 顺序反了日志就会写到旧位置/临时目录。
+    from .paths import ensure_app_dir, migrate_legacy_files
+
+    migrate_legacy_files()
+    ensure_app_dir()
     crashlog.install(ROOT / "logs", "gui")
     crashlog.log_startup_info(f"gui {'--self-test-dual' if args.self_test_dual else args.self_test and '--self-test' or ''}")
 

@@ -321,6 +321,10 @@ def build_matrix(pos: tuple[float, float, float], rot_deg: tuple[float, float, f
 class WristOverlay:
     """SteamVR overlay 生命周期管理 + 文本刷新 + 配置热重载。"""
 
+    # 健康心跳间隔（秒）：日志里留一条「面板还活着 / 已经多久没成功上传」的定期证据。
+    # 用户报的「隔一阵手腕屏就消失」没有这行时，事后完全看不出是哪个时刻掉的。
+    HEARTBEAT_S = 30.0
+
     def __init__(self, cfg: OverlayConfig, config_path: Path | None = None, dry_run: bool = False) -> None:
         self.cfg = cfg
         self.config_path = config_path
@@ -335,6 +339,15 @@ class WristOverlay:
         self._upload_fails = 0             # 贴图连续上传失败次数（用于降噪 + 触发重建）
         self._last_cfg_mtime = 0.0
         self._last_text_at = 0.0
+        # ---- 自愈状态机 + 诊断（用户实测「手腕屏隔一阵就消失」，见 _upload 的注释）----
+        self._last_ok_at = 0.0             # 最后一次成功上传贴图的时刻（monotonic）
+        self._recover_stage = "none"       # none / rebuild / reinit
+        self._fails_in_stage = 0           # 本阶段内连续失败次数（到 3 就升级到下一阶段）
+        self._rebuilds_since_ok = 0        # 自上次成功以来重建几次
+        self._reinits_since_ok = 0         # 自上次成功以来硬重启几次
+        self._rebuilds = 0                 # 累计
+        self._reinits = 0
+        self._last_heartbeat = 0.0
         self.available = False
         self.frames_updated = 0
 
@@ -491,25 +504,28 @@ class WristOverlay:
         except Exception as exc:  # noqa: BLE001
             self._upload_fails += 1
             f = self._upload_fails
+            self._fails_in_stage += 1
             # 降噪：连失败 86 次时每帧打一行会把日志彻底淹没（用户实测就是这样），
-            # 只报第一次 + 每隔 50 次汇总一条。
+            # 只报第一次 + 每隔 50 次汇总一条；但**第一次**要带上现场，
+            # 否则事后只有一句 RequestFailed，谁也判断不出是「面板卡住」还是「面板被丢掉」。
             if f == 1:
                 print(f"[overlay] ❌ setOverlayRaw 失败：{type(exc).__name__}: {exc}")
+                print(f"[overlay][diag] 失败现场：{self._state_brief()}")
             if f % 50 == 0:
                 print(f"[overlay] ❌ 贴图上传已连续失败 {f} 次（面板会停在最后一帧）")
-            # ★ 重建必须**反复**试，不能只在第 3 次试一次：
-            # 用户实测日志（2026-09-25 19:26）里第 3 次失败时重建过一次，之后又连续失败
-            # 150 次都没有第二次补救，手腕屏一直停在最后一帧，直到用户重启引擎 —— 自愈
-            # 只试一次等于没自愈。现在改成「第 3 次 + 之后每 50 次」各重建一次
-            # （间隔足够长，不会每帧都去重建）。
-            if f == 3 or f % 50 == 0:
-                print(f"[overlay] ♻️ 贴图连续失败 {f} 次 → 重建 overlay 再试一次")
-                self._recreate_overlay()
+                print(f"[overlay][diag] {self._state_brief()}")
+            self._escalate()
             return
         self.frames_updated += 1
+        self._last_ok_at = time.monotonic()
         if self._upload_fails:
-            print(f"[overlay] ✅ 贴图恢复上传（其间连续失败 {self._upload_fails} 次）")
+            print(f"[overlay] ✅ 贴图恢复上传（连续失败 {self._upload_fails} 次；"
+                  f"期间重建 {self._rebuilds_since_ok} 次、硬重启 {self._reinits_since_ok} 次）")
             self._upload_fails = 0
+            self._recover_stage = "none"
+            self._fails_in_stage = 0
+            self._rebuilds_since_ok = 0
+            self._reinits_since_ok = 0
         # 也别每帧都打：第 1 帧 + 每 50 帧一条（保留"还在刷"的证据，但不淹日志）
         if self.frames_updated == 1 or self.frames_updated % 50 == 0:
             print(f"[overlay] ← 贴图已更新（{w}x{h}, 第 {self.frames_updated} 帧）")
@@ -536,8 +552,12 @@ class WristOverlay:
             self.available = True
             self._apply_transform()
             self._overlay.showOverlay(self._handle)
+            self._rebuilds += 1
+            self._rebuilds_since_ok += 1
+            self._recover_stage = "rebuild"
+            self._fails_in_stage = 0
             print(f"[overlay] ♻️ 已重建 overlay 并重新贴到 {self.cfg.anchor}"
-                  f"（device={self._device}）")
+                  f"（device={self._device}，自上次成功以来第 {self._rebuilds_since_ok} 次）")
             if entries:                        # 新 overlay 是空的，立刻把内容贴回去
                 self._last_entries = None
                 self.update_entries(entries, force=True)
@@ -545,6 +565,147 @@ class WristOverlay:
         except Exception as exc:  # noqa: BLE001
             print(f"[overlay] ⚠️ 重建 overlay 失败：{type(exc).__name__}: {exc}")
             return False
+
+    # ---------- 自愈升级 + 诊断 ----------
+    def _escalate(self) -> None:
+        """贴图连续失败时的自愈升级：重建 handle → 硬重启 openvr 上下文。
+
+        用户实测（2026-09-25 20:32，家里那台机器）证明「重建 handle」这一级不够用：
+
+            20:32:07  ← 贴图已更新（第 200 帧）              # 一切正常
+            20:32:09  ❌ setOverlayRaw 失败：OverlayError_RequestFailed
+                      ♻️ 连续失败 50/100/…/350 次 → 每次都重建，**仍然全程失败**
+            20:35:09  会话结束
+
+        面板一旦进入这个状态，**换 handle 救不回来**：换 handle 换不掉已经死掉的
+        openvr 上下文（SteamVR 合成器重启 / 头显待机回来 / vrserver 换了一代之后，
+        手里这份接口指针会永远返回失败）。所以再加一级：shutdown + init + 重建。
+        """
+        if self.dry_run or self._overlay is None:
+            return
+        if self._fails_in_stage < 3:
+            return
+        if self._recover_stage == "none":
+            print(f"[overlay] ♻️ 贴图连续失败 {self._upload_fails} 次 → 重建 overlay")
+            self._recreate_overlay()
+        elif self._recover_stage == "rebuild":
+            print(f"[overlay] ♻️ 重建之后仍然连续失败 {self._fails_in_stage} 次"
+                  f"（换 handle 没用）→ 硬重启 openvr 连接")
+            self._hard_reinit()
+        elif self._upload_fails % 50 == 0:
+            # 已经硬重启过还在失败：别每 3 帧就重启一次 openvr（那等于自己把自己拖死），
+            # 每 50 次失败再试一次。
+            print(f"[overlay] ♻️ 硬重启之后仍然连续失败 {self._upload_fails} 次 → 再硬重启一次")
+            self._hard_reinit()
+
+    def _hard_reinit(self) -> bool:
+        """整条 openvr 连接重启：shutdown → init → 重建 overlay → 把内容贴回去。
+
+        ⚠️ 进程里只有**手腕屏这一处**在用 openvr（GUI 双引擎模式下也只给 owner 那条腿挂），
+        所以 shutdown 不会波及别的组件；调用点都在同一个引擎线程（init 与 shutdown 同线程）。
+        """
+        if self.dry_run:
+            return False
+        try:
+            import openvr
+        except Exception as exc:  # noqa: BLE001
+            print(f"[overlay] ⚠️ 硬重启失败（openvr 不可用）：{exc}")
+            return False
+        try:
+            openvr.shutdown()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[overlay]   硬重启：shutdown 报错（忽略，继续 init）：{type(exc).__name__}: {exc}")
+        try:
+            self._vr = openvr.init(openvr.VRApplication_Background)
+            self._overlay = openvr.IVROverlay()
+            self._handle = self._overlay.createOverlay(self.cfg.overlay_key, "VLT 手腕屏")
+            self._device = self._resolve_anchor()
+            self.available = True
+            self._apply_transform()
+            self._overlay.showOverlay(self._handle)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[overlay] ⚠️ 硬重启 openvr 失败（下轮失败时再试）："
+                  f"{type(exc).__name__}: {exc}")
+            self.available = False
+            return False
+        self._reinits += 1
+        self._reinits_since_ok += 1
+        self._recover_stage = "reinit"
+        self._fails_in_stage = 0
+        print(f"[overlay] ♻️♻️ 已硬重启 openvr 连接并重建 overlay"
+              f"（累计第 {self._reinits} 次，device={self._device}）")
+        entries = list(self._last_entries or [])
+        if entries:                            # 新 overlay 是空的，立刻把内容贴回去
+            self._last_entries = None
+            self.update_entries(entries, force=True)
+        return True
+
+    def _overlay_exists(self) -> bool | None:
+        """我们那把 key 还在 SteamVR 里吗？None = 判断不了。
+
+        这行决定「面板消失」的两种可能里到底是哪种：
+        - 还在   → 面板只是**卡在最后一帧**（上传被拒，对象本身没死）
+        - 已不在 → 面板是**真被 SteamVR 丢掉了**（合成器重启/被清理），必须重建
+        """
+        if self._overlay is None or self._handle is None:
+            return None
+        try:
+            self._overlay.findOverlay(self.cfg.overlay_key)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            name = f"{type(exc).__name__}{exc}"
+            if "UnknownOverlay" in name:
+                return False
+            return None
+
+    def _hmd_present(self) -> str:
+        try:
+            import openvr
+
+            fn = getattr(openvr, "VR_IsHmdPresent", None)
+            if fn is None:
+                return "?"
+            return "是" if fn() else "否"
+        except Exception:  # noqa: BLE001
+            return "?"
+
+    def _visible_str(self) -> str:
+        if self._overlay is None or self._handle is None:
+            return "?"
+        try:
+            return "是" if self._overlay.isOverlayVisible(self._handle) else "否"
+        except Exception:  # noqa: BLE001
+            return "?"
+
+    def _state_brief(self) -> str:
+        """一行现场信息，故障时决定下一步查什么（永不抛异常）。"""
+        age = time.monotonic() - self._last_ok_at if self._last_ok_at else -1.0
+        exists = self._overlay_exists()
+        bits = [
+            f"最后成功上传 {age:.0f}s 前" if age >= 0 else "还没成功上传过",
+            f"帧数={self.frames_updated}",
+            {True: "overlay在", False: "overlay已被丢弃", None: "overlay状态未知"}[exists],
+            f"可见={self._visible_str()}",
+            f"HMD在线={self._hmd_present()}",
+            f"重建={self._rebuilds}/硬重启={self._reinits}",
+        ]
+        return " | ".join(bits)
+
+    def _log_heartbeat(self) -> None:
+        """每 HEARTBEAT_S 秒一行状态 —— 「面板隔一阵就消失」全靠这行定位。"""
+        print(f"[overlay][diag] 心跳：{self._state_brief()}")
+        if self._overlay_exists() is False:
+            print("[overlay] ⚠️ SteamVR 里已经没有这把 key 了 —— 面板是**真消失**"
+                  "（不是卡在最后一帧）→ 重建 overlay")
+            self._recreate_overlay()
+        elif self._visible_str() == "否":
+            # 对象还在、只是被藏起来了（SteamVR 在某些界面切换里会这么做）——
+            # 重新 show 一次就好，不必重建。
+            print("[overlay] ⚠️ 面板存在但**不可见**（被 SteamVR 藏起来了）→ 重新 showOverlay")
+            try:
+                self._overlay.showOverlay(self._handle)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[overlay]   showOverlay 失败：{type(exc).__name__}: {exc}")
 
     # ---------- 周期任务：热重载 + 淡出 ----------
     def tick(self) -> None:
@@ -599,6 +760,17 @@ class WristOverlay:
                               f"面板={new_cfg.size_px[0]}x{new_cfg.size_px[1]}")
                 except Exception as exc:  # noqa: BLE001
                     print(f"[overlay] ⚠️ 热重载失败（保留旧配置）：{exc}")
+
+        # 健康心跳：定期把「面板还活着吗」写进日志，并在 overlay 已被 SteamVR 丢掉时重建。
+        # 放在热重载与淡出之前——它是最该先出结果的一条诊断。
+        if self.available:
+            now = time.monotonic()
+            if now - self._last_heartbeat >= self.HEARTBEAT_S:
+                self._last_heartbeat = now
+                try:
+                    self._log_heartbeat()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[overlay] ⚠️ 心跳失败（不影响翻译）：{type(exc).__name__}: {exc}")
 
         # 可选淡出
         if self.available and self.cfg.fade_after_s > 0 and self._last_text_at:

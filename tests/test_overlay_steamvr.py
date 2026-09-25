@@ -30,6 +30,8 @@ sys.path.insert(0, str(ROOT))
 
 CALLS: list[tuple] = []
 RAW_FAIL_PLAN = {"remaining": 0}     # >0 时 setOverlayRaw 抛错（模拟 OverlayError_RequestFailed）
+OVERLAY_GONE = {"gone": False}       # True 时 findOverlay 抛 UnknownOverlay（模拟面板被 SteamVR 丢掉）
+OVERLAY_VISIBLE = {"on": True}       # False 时 isOverlayVisible 返回假（模拟面板被藏起来）
 
 
 class _FakeHmdMatrix34_t:
@@ -67,6 +69,15 @@ class _FakeIVROverlay:
     def showOverlay(self, handle):  # noqa: ANN001
         CALLS.append(("showOverlay", handle))
 
+    def findOverlay(self, key):  # noqa: ANN001, ANN201
+        """真实 API：key 不存在时抛 `OverlayError_UnknownOverlay`。"""
+        if OVERLAY_GONE["gone"]:
+            raise RuntimeError("OverlayError_UnknownOverlay")
+        return 7
+
+    def isOverlayVisible(self, handle):  # noqa: ANN001, ANN201
+        return OVERLAY_VISIBLE["on"] and not OVERLAY_GONE["gone"]
+
     def destroyOverlay(self, handle):  # noqa: ANN001
         CALLS.append(("destroyOverlay", handle))
 
@@ -91,6 +102,7 @@ def _install_fake_openvr(overlay_factory=None):  # noqa: ANN001
     m.k_unTrackedDeviceIndex_Hmd = 0
     m.HmdMatrix34_t = _FakeHmdMatrix34_t
     m.init = lambda app_type: _FakeIVRSystem()
+    m.VR_IsHmdPresent = lambda: not OVERLAY_GONE["gone"]
     m.IVROverlay = overlay_factory or (lambda: _FakeIVROverlay())
     m.shutdown = lambda: CALLS.append(("shutdown",))
     sys.modules["openvr"] = m
@@ -324,6 +336,126 @@ def test_upload_failure_keeps_retrying_rebuild() -> None:
     print(f"  持续失败会反复重建 OK（createOverlay {recreated} 次）")
 
 
+def test_upload_failure_escalates_to_openvr_reinit() -> None:
+    """★ 只重建 handle 救不回来时，必须升级到「硬重启 openvr 连接」。
+
+    用户实测（2026-09-25 20:32，家里那台 Win10）：
+        20:32:07  ← 贴图已更新（第 200 帧）                # 之前一切正常
+        20:32:09  ❌ setOverlayRaw 失败：OverlayError_RequestFailed
+                  ♻️ 连续失败 50/100/…/350 次，**每次都重建 overlay，仍然全程失败**
+        20:35:09  会话结束
+    也就是说面板进了这个状态就再也没回来。换 handle 换不掉已经死掉的 openvr 上下文
+    （SteamVR 合成器重启 / 头显待机回来 / vrserver 换代），只有 shutdown + init 才有救。
+    """
+    import contextlib
+    import io
+
+    CALLS.clear()
+    OVERLAY_GONE["gone"] = False
+    RAW_FAIL_PLAN["remaining"] = 10 ** 9          # 永久失败
+    _install_fake_openvr()
+    from vlt.output.overlay import WristOverlay
+
+    ov = WristOverlay(_cfg(Path(".")))
+    ov.start()
+    created_before = sum(1 for c in CALLS if c[0] == "createOverlay")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        for i in range(12):
+            ov.update_entries([("theirs", f"hi{i}", f"你好{i}")], force=True)
+    out = buf.getvalue()
+
+    assert "硬重启 openvr 连接" in out, f"没有升级到硬重启：\n{out}"
+    assert ("shutdown",) in CALLS, f"没有真的 shutdown openvr：{CALLS[:12]}"
+    assert ov._reinits >= 1, f"硬重启计数没涨：{ov._reinits}\n{out}"
+    created_after = sum(1 for c in CALLS if c[0] == "createOverlay")
+    assert created_after >= created_before + 2, \
+        f"重建次数不足（{created_before} → {created_after}）：\n{out}"
+    ov.close()
+    RAW_FAIL_PLAN["remaining"] = 0
+    print(f"  失败持续时升级到硬重启 OK（重建 {ov._rebuilds} 次 / 硬重启 {ov._reinits} 次）")
+
+
+def test_heartbeat_reports_state_and_rebuilds_when_overlay_lost() -> None:
+    """心跳要能在日志里回答「面板是卡住了、还是被 SteamVR 丢掉了」。
+
+    用户要的就是这个：事后光看日志就能定位，而不用再猜。
+    """
+    import contextlib
+    import io
+
+    CALLS.clear()
+    RAW_FAIL_PLAN["remaining"] = 0
+    OVERLAY_GONE["gone"] = False
+    _install_fake_openvr()
+    from vlt.output.overlay import WristOverlay
+
+    ov = WristOverlay(_cfg(Path(".")))
+    ov.start()
+    ov.update("你好", "hello", force=True)      # 先成功上传一帧，心跳里才有「最后成功上传」
+    ov.HEARTBEAT_S = 0.0                       # 下一次 tick 立刻心跳
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ov.tick()
+    out = buf.getvalue()
+    assert "[overlay][diag] 心跳" in out, f"心跳没打出来：{out}"
+    for field in ("overlay在", "可见=", "HMD在线=", "最后成功上传", "重建="):
+        assert field in out, f"心跳缺字段 {field!r}：{out}"
+
+    # 面板被 SteamVR 丢掉（合成器重启/被清理）→ 心跳里应判定为「真消失」并自动重建
+    OVERLAY_GONE["gone"] = True
+    created_before = sum(1 for c in CALLS if c[0] == "createOverlay")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ov.tick()
+    out = buf.getvalue()
+    assert "overlay已被丢弃" in out, f"没识别出 overlay 被丢弃：{out}"
+    assert "真消失" in out and "重建 overlay" in out, f"没有触发重建：{out}"
+    assert sum(1 for c in CALLS if c[0] == "createOverlay") > created_before, \
+        f"没有真的重建：{out}"
+
+    OVERLAY_GONE["gone"] = False
+    OVERLAY_VISIBLE["on"] = True
+    ov.close()
+    print("  心跳能区分「卡住 / 被丢弃」并自动重建 OK")
+
+
+def test_heartbeat_reshows_hidden_overlay() -> None:
+    """面板还在、只是被藏起来时，心跳要重新 show 一次（而不是白重建一遍）。"""
+    import contextlib
+    import io
+
+    CALLS.clear()
+    RAW_FAIL_PLAN["remaining"] = 0
+    OVERLAY_GONE["gone"] = False
+    OVERLAY_VISIBLE["on"] = False               # 对象在，但不可见
+    _install_fake_openvr()
+    from vlt.output.overlay import WristOverlay
+
+    ov = WristOverlay(_cfg(Path(".")))
+    ov.start()
+    ov.update("你好", "hello", force=True)
+    ov.HEARTBEAT_S = 0.0
+    shows_before = sum(1 for c in CALLS if c[0] == "showOverlay")
+    created_before = sum(1 for c in CALLS if c[0] == "createOverlay")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ov.tick()
+    out = buf.getvalue()
+    assert "可见=否" in out, f"心跳没反映出不可见：{out}"
+    assert "重新 showOverlay" in out, f"没有重新 show：{out}"
+    assert sum(1 for c in CALLS if c[0] == "showOverlay") == shows_before + 1, \
+        f"showOverlay 调用次数没变：{CALLS[-6:]}"
+    assert sum(1 for c in CALLS if c[0] == "createOverlay") == created_before, \
+        "只是不可见，不该重建 overlay"
+
+    OVERLAY_VISIBLE["on"] = True
+    ov.close()
+    print("  不可见时重新 show（不白重建）OK")
+
+
 if __name__ == "__main__":
     print("test_overlay_steamvr:")
     test_start_takes_over_steamvr()
@@ -334,4 +466,7 @@ if __name__ == "__main__":
     test_hot_reload_font_rerenders()
     test_upload_failure_recovers_and_logs_quietly()
     test_upload_failure_keeps_retrying_rebuild()
+    test_upload_failure_escalates_to_openvr_reinit()
+    test_heartbeat_reports_state_and_rebuilds_when_overlay_lost()
+    test_heartbeat_reshows_hidden_overlay()
     print("ALL PASSED")

@@ -11,6 +11,11 @@ on:
 permissions:
   contents: write               # 建 release / 传附件需要
 
+# ⚠️ 必须开 UTF-8：Windows runner 的 stdout 默认是 cp1252，脚本里带 emoji/中文的 print
+# 会 UnicodeEncodeError 直接打挂这一步（CI 上实测过 check_no_secrets.py 崩在「✅」）。
+env:
+  PYTHONUTF8: "1"
+
 jobs:
   build:
     runs-on: windows-latest

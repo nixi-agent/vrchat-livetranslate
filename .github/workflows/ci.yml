@@ -12,6 +12,12 @@ on:
 permissions:
   contents: read
 
+# ⚠️ 必须开 UTF-8：Windows runner 的 stdout 默认是 cp1252，脚本里一句带 emoji/中文的 print
+# 就会 UnicodeEncodeError 把整步打挂（实测：check_no_secrets.py 的「✅」直接崩了 CI）。
+# Python 3.7+ 的 UTF-8 模式让 stdout/stderr 与 open() 默认都走 UTF-8，一次覆盖所有步骤。
+env:
+  PYTHONUTF8: "1"
+
 jobs:
   tests:
     runs-on: windows-latest

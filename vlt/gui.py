@@ -72,6 +72,12 @@ COLOR_SRC_THEIRS = TEXT_DIM
 SPONSOR_URL = "https://ko-fi.com/kcmnixi"
 SPONSOR_QR_SIZE = 240          # 收款码等比缩放的目标边长（严禁拉伸：拉变形就扫不出来）
 
+# ---- 百炼开通页（未配置 API key 时，状态按钮点击跳转）----
+# 链接逐字符照抄需求简报，不做任何 URL 解码/重组 —— % 编码、@@、~ 都是原样的一部分。
+BAILIAN_SIGNUP_URL = "https://www.aliyun.com/product/bailian?scm=20140722.S_card@@%E4%BA%A7%E5%93%81@@2983180.S_new~UND~card.ID_card@@%E4%BA%A7%E5%93%81@@2983180-RL_%E7%99%BE%E7%82%BC%E5%A4%A7%E6%A8%A1%E5%9E%8B%E6%9C%8D%E5%8A%A1%E5%B9%B3%E5%8F%B0-LOC_2024SPSearchCard-OR_ser-PAR1_0bc0590417903159041562532e6a54-V_4-RE_new12-P0_0-P1_0&source=5176.29345612&userCode=q8nma978"
+# 按钮文案档位（按顺序试，取最小宽度 928 下能完整显示的第一档；实测见改动报告）。
+KEY_BTN_TEXT = "⚠ 未配置 API key · 点此开通百炼 ▸"
+
 
 def _sponsor_qr_specs() -> list[tuple[str, Path]]:
     """赞助弹窗的两张收款码：(标签, 图片路径)。只读资源一律走 bundle_dir()。"""
@@ -310,11 +316,17 @@ class TranslationGUI:
         # 分区小标题（设置弹窗里的「API KEY / 音频设备」）：小一号、暗色、加粗
         style.configure("Section.TLabel", foreground=TEXT_DIM,
                         font=("Microsoft YaHei UI", 8, "bold"))
-        # API key 状态（**纯展示，不是按钮**）：右上角「⚙ 设置」是填 key 的唯一入口。
-        # 原先这里也是个按钮，两个入口通往同一处 —— 用户实测反馈重复，已改成 Label。
-        # 未配置时切 ChipWarn（警示橙），让「还没配 key」一眼可见。
+        # API key 状态槽位里的两个控件：**已配置 → 纯展示标签**（「⚙ 设置」是改 key 的入口，
+        # 标签不可点）；**未配置 → 可点按钮**，点击用默认浏览器打开百炼开通页（BAILIAN_SIGNUP_URL）。
         style.configure("Chip.TLabel", font=FONT_STATUS, foreground=TEXT_DIM)
         style.configure("ChipWarn.TLabel", font=FONT_STATUS, foreground=COLOR_WARN)
+        # 未配置按钮：暗橙底 + 警示橙字，悬停/按下亮一档 —— 警示色系但不刺眼。
+        style.configure("ChipWarn.TButton", font=FONT_STATUS, foreground=COLOR_WARN,
+                        background="#33291c", borderwidth=0, focusthickness=0,
+                        focuscolor="#33291c", padding=(8, 2))
+        style.map("ChipWarn.TButton",
+                  background=[("pressed", "#453723"), ("active", "#453723")],
+                  foreground=[("active", "#e8a85c")])
         # 分割线/分组竖线：用 1px 明度差表达层次，不用 3D 边框
         style.configure("TSeparator", background=BORDER)
 
@@ -465,12 +477,17 @@ class TranslationGUI:
         out_frame = ttk.Frame(self._root, padding=(14, 0, 14, 10))
         out_frame.pack(fill=tk.X)
 
-        # 右侧：API key 状态入口（先打包占住右侧，理由同「⚙ 设置」）。
-        # 未配置时是一直可见的提醒，点它直接进设置弹窗。
-        # 状态展示，**不是按钮**：右上角「⚙ 设置」已经是填 key 的唯一入口，
-        # 两个按钮通向同一个地方纯属重复（用户实测后指出）。这里只显示状态。
-        self._key_chip = ttk.Label(out_frame, text="", style="Chip.TLabel")
-        self._key_chip.pack(side=tk.RIGHT, padx=(0, 4))
+        # 右侧：API key 状态槽位（**先 pack 占住右侧**——本行空间不足时 Tk 从最后 pack 的开始裁）。
+        # 槽位里两个控件互斥显示：已配置 → 纯展示标签；未配置 → 可点按钮（跳百炼开通页）。
+        # 显隐只换**常驻容器**里的孩子：若直接对控件 pack_forget/重 pack，它会被排到本行
+        # packing list 末尾，运行时切换后反而成了空间不足时第一个被裁的。
+        self._key_slot = ttk.Frame(out_frame)
+        self._key_slot.pack(side=tk.RIGHT, padx=(0, 4))
+        self._key_chip = ttk.Label(self._key_slot, text="", style="Chip.TLabel")
+        self._key_btn = ttk.Button(self._key_slot, text="", style="ChipWarn.TButton",
+                                   command=self._open_bailian_signup)
+        # 初始先放标签；随后 _build_settings_dialog() 里的 _refresh_key_status() 会按真实状态切换。
+        self._key_chip.pack()
 
         ttk.Label(out_frame, text="输出:", style="Dim.TLabel").pack(side=tk.LEFT)
         self._chatbox_var = tk.BooleanVar(value=bool((self._cfg.ui or {}).get("chatbox", True)))
@@ -965,8 +982,9 @@ class TranslationGUI:
     def _refresh_key_status(self) -> None:
         """只显示来源 + 打码值，绝不显示明文。
 
-        写两处：设置弹窗里的完整状态（_key_status）+ 主界面第二行右侧的
-        入口按钮（_key_chip）——key 没配时用户不看弹窗也能一眼看到提醒。
+        写两处：设置弹窗里的完整状态（_key_status）+ 主界面第二行右侧的状态槽位
+        ——已配置时显示纯展示标签（_key_chip），未配置时换成可点按钮（_key_btn，
+        点击打开百炼开通页）；保存/清除 key 后本方法会被再次调用，界面立刻切换。
         """
         try:
             from .credentials import key_source
@@ -977,12 +995,44 @@ class TranslationGUI:
             return
         if masked:
             self._key_status.config(text=f"当前：{src} {masked}")
-            chip_text, chip_style = "API key 已配置", "Chip.TLabel"
         else:
             self._key_status.config(text="⚠️ 未配置 API key —— 在上面粘贴后点「保存」")
-            chip_text, chip_style = "⚠ 未配置 API key", "ChipWarn.TLabel"
         if hasattr(self, "_key_chip"):
-            self._key_chip.configure(text=chip_text, style=chip_style)
+            if masked:
+                # 已配置：恢复纯展示标签（按钮收起，不残留）
+                self._key_chip.configure(text="API key 已配置", style="Chip.TLabel")
+                if self._key_btn.winfo_manager():
+                    self._key_btn.pack_forget()
+                if not self._key_chip.winfo_manager():
+                    self._key_chip.pack()
+            else:
+                # 未配置：换成可点按钮（跳转百炼开通页）
+                self._key_btn.configure(text=KEY_BTN_TEXT)
+                if self._key_chip.winfo_manager():
+                    self._key_chip.pack_forget()
+                if not self._key_btn.winfo_manager():
+                    self._key_btn.pack()
+
+    def _open_bailian_signup(self) -> None:
+        """「未配置」状态按钮：用默认浏览器打开百炼开通页。
+
+        绝不抛异常、绝不影响主功能：失败时把链接写进状态栏让用户手动复制；
+        成功/失败都打一行日志。链接原文使用，不做任何解码/重组。
+        """
+        try:
+            ok = bool(webbrowser.open(BAILIAN_SIGNUP_URL))
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            print(f"[gui] ⚠ 打开浏览器失败（{exc}），请手动访问：{BAILIAN_SIGNUP_URL}",
+                  flush=True)
+        else:
+            if ok:
+                print(f"[gui] 已在默认浏览器打开百炼开通页：{BAILIAN_SIGNUP_URL}", flush=True)
+            else:
+                print(f"[gui] ⚠ webbrowser.open 返回 False，请手动访问：{BAILIAN_SIGNUP_URL}",
+                      flush=True)
+        if not ok:
+            self._set_status("warn", f"打不开浏览器，请手动复制访问：{BAILIAN_SIGNUP_URL}")
 
     def _on_save_key(self) -> None:
         from .credentials import load_saved_key, mask_key, save_api_key

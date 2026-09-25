@@ -192,17 +192,17 @@ def test_gui_starts_without_any_key() -> None:
 
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             gui = TranslationGUI()                 # 关键：不能抛，窗口要建起来
-        chip = gui._key_chip.cget("text")
-        assert chip.startswith("⚠ 未配置"), f"未配置时状态文案不对：{chip!r}"
-        assert gui._key_chip.cget("style") == "ChipWarn.TLabel", "未配置时应用警示样式（橙字）"
 
-        # ★ 用户实测反馈：API key 状态原先也是个按钮，与「⚙ 设置」重复（两个入口
-        # 通往同一处）。约定：**设置是唯一可点入口，key 状态纯展示**。
-        assert gui._key_chip.winfo_class() == "TLabel", \
-            f"API key 状态应当是不可点的纯展示，实际控件类：{gui._key_chip.winfo_class()}"
-        assert "›" not in chip, f"非按钮不该带可点提示符 ›：{chip!r}"
-        assert gui._settings_btn.winfo_class() == "TButton", "「⚙ 设置」应当是按钮（唯一入口）"
-        print(f"  无 key 时界面仍能启动 OK（状态：{chip}；可点入口：⚙ 设置）")
+        # ★ 未配置态：状态槽位显示**可点按钮**（跳转百炼开通页），不是纯展示标签。
+        # （旧约定「状态永远不可点」已被本次需求推翻——仅限未配置态。）
+        assert gui._key_btn.winfo_manager() == "pack", "未配置时应显示可点按钮"
+        assert gui._key_btn.winfo_class() == "TButton", \
+            f"未配置时状态应当是可点按钮，实际控件类：{gui._key_btn.winfo_class()}"
+        btn_text = gui._key_btn.cget("text")
+        assert btn_text.startswith("⚠ 未配置"), f"未配置时按钮文案不对：{btn_text!r}"
+        assert not gui._key_chip.winfo_manager(), "未配置时纯展示标签不应残留"
+        assert gui._settings_btn.winfo_class() == "TButton", "「⚙ 设置」应当是按钮"
+        print(f"  无 key 时界面仍能启动 OK（未配置态显示可点按钮：{btn_text}）")
     finally:
         if gui is not None:
             try:
@@ -217,6 +217,86 @@ def test_gui_starts_without_any_key() -> None:
                 os.environ[k] = v
 
 
+# 期望值原样写死在测试里：防止实现抄错、或被格式化工具改写（% 编码、@@、~ 都必须原样）。
+_EXPECTED_BAILIAN_URL = "https://www.aliyun.com/product/bailian?scm=20140722.S_card@@%E4%BA%A7%E5%93%81@@2983180.S_new~UND~card.ID_card@@%E4%BA%A7%E5%93%81@@2983180-RL_%E7%99%BE%E7%82%BC%E5%A4%A7%E6%A8%A1%E5%9E%8B%E6%9C%8D%E5%8A%A1%E5%B9%B3%E5%8F%B0-LOC_2024SPSearchCard-OR_ser-PAR1_0bc0590417903159041562532e6a54-V_4-RE_new12-P0_0-P1_0&source=5176.29345612&userCode=q8nma978"
+
+
+def test_key_chip_button_switching() -> None:
+    """★ 未配置 → 可点按钮（点击打桩调 webbrowser.open）；已配置 → 恢复纯展示 TLabel。
+
+    覆盖三条：链接逐字符正确、点击行为（绝不真开浏览器）、保存/清除后的运行时切换。
+    """
+    _use_temp_storage()
+    buf = io.StringIO()
+    gui = None
+    # 同 test_gui_starts_without_any_key：隔绝本机可能存在的 key（环境变量 / ~/.bailian）。
+    tmp_env = tempfile.mkdtemp(prefix="vlt-nokey-env-")
+    saved_env = {k: os.environ.get(k) for k in ("USERPROFILE", "HOME", "DASHSCOPE_API_KEY")}
+    os.environ["USERPROFILE"] = tmp_env
+    os.environ["HOME"] = tmp_env
+    os.environ.pop("DASHSCOPE_API_KEY", None)
+    try:
+        from vlt import gui as gui_mod
+        from vlt.gui import BAILIAN_SIGNUP_URL, TranslationGUI
+
+        # 链接必须逐字符等于简报里那一行
+        assert BAILIAN_SIGNUP_URL == _EXPECTED_BAILIAN_URL, \
+            f"BAILIAN_SIGNUP_URL 与简报不一致：{BAILIAN_SIGNUP_URL!r}"
+
+        with contextlib.redirect_stdout(buf):
+            gui = TranslationGUI()
+
+        # ---- 未配置态：按钮可见、可点，点击 → webbrowser.open(BAILIAN_SIGNUP_URL) ----
+        assert gui._key_btn.winfo_manager() == "pack", "未配置时应显示可点按钮"
+        assert not gui._key_chip.winfo_manager(), "未配置时标签不应显示"
+        calls = []
+        orig_open = gui_mod.webbrowser.open
+        gui_mod.webbrowser.open = lambda url: calls.append(url) or True
+        try:
+            with contextlib.redirect_stdout(buf):
+                gui._key_btn.invoke()                # 打桩：绝不真开浏览器
+        finally:
+            gui_mod.webbrowser.open = orig_open
+        assert calls == [BAILIAN_SIGNUP_URL], \
+            f"点击按钮应以 BAILIAN_SIGNUP_URL 调 webbrowser.open，实际：{calls!r}"
+        out = buf.getvalue()
+        assert "[gui]" in out and BAILIAN_SIGNUP_URL in out, "点击成功/失败都要打日志"
+        print("  未配置态：按钮点击 → webbrowser.open(BAILIAN_SIGNUP_URL) OK（已打桩）")
+
+        # ---- 运行时切换：保存 key → 立刻变回纯展示 TLabel（按钮不残留） ----
+        with contextlib.redirect_stdout(buf):
+            gui._key_var.set(FAKE_KEY)
+            gui._on_save_key()
+        assert gui._key_chip.winfo_manager() == "pack", "保存 key 后应恢复纯展示标签"
+        assert gui._key_chip.winfo_class() == "TLabel", \
+            f"已配置时状态应当是不可点的纯展示，实际控件类：{gui._key_chip.winfo_class()}"
+        assert not gui._key_btn.winfo_manager(), "已配置时按钮不应残留"
+        chip_text = gui._key_chip.cget("text")
+        assert "›" not in chip_text and "▸" not in chip_text, \
+            f"非按钮不该带可点提示符：{chip_text!r}"
+        print(f"  保存 key 后立刻变回 TLabel OK（{chip_text}）")
+
+        # ---- 运行时切换：清除 key → 立刻变回可点按钮 ----
+        with contextlib.redirect_stdout(buf):
+            gui._on_clear_key()
+        assert gui._key_btn.winfo_manager() == "pack", "清除 key 后应变回可点按钮"
+        assert gui._key_btn.cget("text").startswith("⚠ 未配置"), "清除后按钮文案不对"
+        assert not gui._key_chip.winfo_manager(), "未配置时标签不应显示"
+        print("  清除 key 后立刻变回可点按钮 OK")
+    finally:
+        if gui is not None:
+            try:
+                gui._root.destroy()
+            except Exception:
+                pass
+        _reset_storage()
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 if __name__ == "__main__":
     print("test_api_key_gui:")
     test_roundtrip_and_mask()
@@ -224,4 +304,5 @@ if __name__ == "__main__":
     test_load_api_key_prefers_gui_saved()
     test_gui_key_row_saves_without_leaking()
     test_gui_starts_without_any_key()
+    test_key_chip_button_switching()
     print("ALL PASSED")

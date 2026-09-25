@@ -109,7 +109,25 @@ class AppConfig:
         return self.directions[name]
 
 
-def load_config(path: str | Path | None = None, api_key: str | None = None) -> AppConfig:
+def _resolve_api_key(api_key: str | None, require_key: bool) -> str:
+    """取 key；`require_key=False` 时"还没有 key"不抛错，而是返回空串。
+
+    界面用得上：启动时**不能**因为没填 key 就起不来 —— 那样用户连"去哪填 key"
+    的入口都看不到（首次使用、或换台电脑给朋友用，就是死局）。
+    调用方（`_start`）会检查空 key 并给出明确指引。
+    """
+    try:
+        return load_api_key(api_key)
+    except SystemExit:
+        if require_key:
+            raise
+        print("[config] ⚠️ 尚未配置 API key —— 界面照常启动；"
+              "开始翻译前请点主界面右上角的 API key 入口填一个", file=sys.stderr, flush=True)
+        return ""
+
+
+def load_config(path: str | Path | None = None, api_key: str | None = None,
+                require_key: bool = True) -> AppConfig:
     p = ensure_config(Path(path) if path else None)   # 缺文件时从 config.example.yaml 生成
     raw: dict[str, Any] = {}
     if p.exists():
@@ -143,7 +161,7 @@ def load_config(path: str | Path | None = None, api_key: str | None = None) -> A
         "reconnect_backoff": s.get("reconnect_backoff", [2, 5, 10, 30]),
         "max_new_sessions_per_minute": s.get("max_new_sessions_per_minute", 4),
         "final_silence_s": float(s.get("final_silence_s", 1.2)),
-        "api_key": load_api_key(api_key),
+        "api_key": _resolve_api_key(api_key, require_key),
     }
     directions = {}
     for name, d in (raw.get("directions") or {}).items():

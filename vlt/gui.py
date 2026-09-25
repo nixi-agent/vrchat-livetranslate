@@ -230,7 +230,7 @@ class TranslationGUI:
         self._audio_out_names: list[str] = []
         self._device_scan_pending = False
 
-        self._cfg = load_config()
+        self._cfg = load_config(require_key=False)   # 没填 key 也要能起界面（否则没法填 key）
         mine = self._cfg.directions.get("mine")
         # 语言对：我的语言 A ↔ 对方语言 B。别人说方向自动镜像（B → A）。
         self._lang_pair = {
@@ -979,6 +979,11 @@ class TranslationGUI:
 
     def _start(self) -> None:
         if any(e.running for e in self._engines):
+            return
+        if not (self._cfg.session_base.get("api_key") or "").strip():
+            # 没 key 就别白连一次（会撞 401），直接把用户送到填 key 的地方
+            self._set_status("error", "还没配置 API key —— 点右上角「API key ›」填一个再开始")
+            self._open_settings()
             return
         d = self._direction_var.get()
 

@@ -20,11 +20,11 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0          # 打包脚本会读 git HEAD 做版本溯源
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"  # 与 README 要求一致（3.12 未测）
 
@@ -64,7 +64,7 @@ jobs:
           Get-Content dist/SHA256SUMS.txt
 
       - name: 上传构建产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: VRChatLiveTranslate-exe
           path: |
@@ -74,7 +74,7 @@ jobs:
 
       - name: 建 Release 并附上 exe
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: ${{ github.ref_name }}
           body: |

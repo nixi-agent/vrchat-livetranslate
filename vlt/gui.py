@@ -304,6 +304,16 @@ class TranslationGUI:
                               ("disabled", "#22374f")],
                   foreground=[("disabled", "#6b87ab")])
 
+        # API key 输入行：不加这条会沿用 clam 的浅色默认底 —— 深色界面里出现一块白，很扎眼
+        # （截图复核时发现的）。字段底/文字/插入符/边框全部对齐 SURFACE/TEXT/BORDER 体系。
+        style.configure("Key.TEntry", fieldbackground=SURFACE, background=SURFACE,
+                        foreground=TEXT, insertcolor=TEXT, bordercolor=BORDER,
+                        lightcolor=SURFACE, darkcolor=SURFACE, padding=(8, 4))
+        style.map("Key.TEntry",
+                  bordercolor=[("focus", ACCENT), ("active", SURFACE_HOVER)],
+                  fieldbackground=[("disabled", BG), ("readonly", SURFACE)],
+                  foreground=[("disabled", TEXT_DIM)])
+
         # 下拉框：字段、箭头、边框都变深；readonly 下保持深色
         style.configure("TCombobox", fieldbackground=SURFACE, background=SURFACE,
                         foreground=TEXT, arrowcolor=TEXT_DIM, bordercolor=BORDER,
@@ -657,8 +667,9 @@ class TranslationGUI:
 
         ttk.Label(row, text="API Key:", style="Dim.TLabel").pack(side=tk.LEFT)
         self._key_var = tk.StringVar()
-        self._key_entry = ttk.Entry(row, textvariable=self._key_var, show="●", width=34)
-        self._key_entry.pack(side=tk.LEFT, padx=(4, 10))
+        self._key_entry = ttk.Entry(row, textvariable=self._key_var, show="●", width=34,
+                                    style="Key.TEntry")
+        self._key_entry.pack(side=tk.LEFT, padx=(4, 12))
         self._key_entry.bind("<Return>", lambda _e: self._on_save_key())
 
         self._key_status = ttk.Label(row, text="", style="Dim.TLabel")

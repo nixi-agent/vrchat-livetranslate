@@ -4,6 +4,9 @@
     .venv/Scripts/python.exe scripts/build_exe.py            # 打包 + 自检
     .venv/Scripts/python.exe scripts/build_exe.py --no-verify  # 只打包不跑自检
 
+    # 没建项目 venv 也能跑（CI / conda / 系统 Python）：自动退回当前解释器
+    python scripts/build_exe.py --no-verify
+
 产物：`dist/VRChatLiveTranslate.exe`（单文件，双击即用，无控制台窗口）
 
 ## 为什么要这么多 --collect-all / --hidden-import
@@ -30,7 +33,11 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-PY = REPO / ".venv" / "Scripts" / "python.exe"
+_VENV_PY = REPO / ".venv" / "Scripts" / "python.exe"
+# 没建项目 venv 也能跑（CI / conda / 系统 Python 直接调）：退回**当前解释器**。
+# 唯一前提是「PyInstaller 与 requirements 装在它里面」——CI 就是靠这条，
+# 以前这里写死 .venv 路径，一上 CI 直接报「找不到虚拟环境解释器」。
+PY = _VENV_PY if _VENV_PY.exists() else Path(sys.executable)
 ENTRY = REPO / "run_gui.py"
 APP_NAME = "VRChatLiveTranslate"          # 文件名用 ASCII：跨工具链更省事
 DIST = REPO / "dist"
@@ -60,7 +67,7 @@ def ensure_pyinstaller() -> None:
     if have.returncode == 0:
         print(f"PyInstaller 已就绪：{have.stdout.strip()}", flush=True)
         return
-    print("未安装 PyInstaller，正在装入 .venv ...", flush=True)
+    print(f"未安装 PyInstaller，正在装入 {PY} ...", flush=True)
     # ⚠️ 这个 venv 是 `uv venv` 建的，**不带 pip** —— `python -m pip` 会直接
     # 报 `No module named pip`。所以先试 uv（本项目一贯的装法），失败再退回 pip。
     attempts = [
@@ -163,7 +170,9 @@ def main() -> int:
     args = ap.parse_args()
 
     if not PY.exists():
-        raise SystemExit(f"找不到虚拟环境解释器：{PY}\n先按 README 建 .venv 并装依赖")
+        raise SystemExit(f"找不到可用的解释器：{PY}")
+    if not _VENV_PY.exists():
+        print(f"[i] 没找到项目 venv（{_VENV_PY}）→ 用当前解释器打包：{PY}", flush=True)
     ensure_pyinstaller()
     exe = build()
     size_mb = exe.stat().st_size / 1024 / 1024

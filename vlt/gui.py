@@ -94,6 +94,7 @@ SOURCE_LANGS = {
     "法语": "fr",
     "德语": "de",
     "西班牙语": "es",
+    "俄语": "ru",
 }
 
 TARGET_LANGS = {
@@ -104,6 +105,7 @@ TARGET_LANGS = {
     "法语": "fr",
     "德语": "de",
     "西班牙语": "es",
+    "俄语": "ru",
 }
 
 

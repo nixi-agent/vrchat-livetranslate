@@ -35,7 +35,7 @@ directions:
   # ① 我说 → chatbox（对方看得见，我自己也看得见）
   mine:
     source_lang: zh
-    target_lang: en          # 可改 ja / ko / fr / de / es ...
+    target_lang: en          # 可改 ja / ko / fr / de / es / ru ...
     output_audio: false      # true 则同时拿译音（走虚拟声卡那条腿）
     hotwords: {}             # 例：{"VRChat": "VRChat", "逆袭": "Nixi"}
   # ② 别人说 → 手腕屏

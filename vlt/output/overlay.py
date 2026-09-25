@@ -91,16 +91,44 @@ CLOSING_PUNCT = "。，、；：！？）」』】》〉·…—.,;:!?)]}\"'"
 OPENING_PUNCT = "（「『【《〈([{"
 
 
+# 用空格分词的字母文字（拉丁/西里尔/希腊…）算「整词」；CJK 逐字切，
+# 韩文用空格分词所以也算整词。见 _is_word_char。
+_CJK_RANGES = ((0x3000, 0x303F),      # CJK 标点
+               (0x3040, 0x30FF),      # 平假名 / 片假名
+               (0x3400, 0x4DBF),      # 扩展 A
+               (0x4E00, 0x9FFF),      # 统一表意
+               (0xF900, 0xFAFF),      # 兼容表意
+               (0x20000, 0x2FA1F))    # 扩展 B 及以上
+
+
+def _is_cjk(ch: str) -> bool:
+    o = ord(ch)
+    return any(lo <= o <= hi for lo, hi in _CJK_RANGES)
+
+
+def _is_word_char(ch: str) -> bool:
+    """该字符算「同一个词内」吗（整词保护用，别把单词从中间劈开）。"""
+    if _is_cjk(ch):
+        return False                       # 中日文没有空格 → 逐字断行
+    if ch.isascii():
+        return ch.isalnum() or ch in "-_'/"
+    return ch.isalnum()                    # 西里尔 П、希腊 ω、带音标拉丁 é
+
+
 def _tokens(text: str) -> list[str]:
-    """切分：拉丁词整词为一个 token，CJK 逐字，标点单独成 token。
+    """切分：整词为一个 token（拉丁/西里尔/希腊/韩文…），CJK 逐字，标点单独成 token。
 
     纯按字符切会把英文单词劈开（实测出现 transla/ted、y/our），
     纯按词切又对中文无效（中文没有空格）——所以必须混合切。
+
+    ⚠️ 原实现只把 **ASCII** 字母数字当词内字符，于是所有非 ASCII 的拼音文字
+    （俄语、希腊语、带音标的拉丁语…）都退化成逐字切、单词被从中间劈开
+    （实测俄语 `строк` → `стро` + `к`，看着像排版坏了）。
     """
     tokens: list[str] = []
     buf = ""
     for ch in text:
-        if ch.isascii() and (ch.isalnum() or ch in "-_'/"):
+        if _is_word_char(ch):
             buf += ch
         else:
             if buf:
@@ -134,7 +162,18 @@ def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont
             continue
         if cur:
             lines.append(cur.rstrip())
-        cur = "" if tk == " " else tk
+        if tk == " ":                      # 空格放不下 = 就在这里断行
+            cur = ""
+            continue
+        # 单个整词就比整行还宽（超长单词 / 一长串无空格字符）→ 按字符硬切，
+        # 否则整词独占一行会直接溢出面板边缘（比断词更难看）。
+        while len(tk) > 1 and draw.textlength(tk, font=font) > max_w:
+            cut = 1
+            while cut < len(tk) and draw.textlength(tk[:cut + 1], font=font) <= max_w:
+                cut += 1
+            lines.append(tk[:cut])
+            tk = tk[cut:]
+        cur = tk
     if cur.strip():
         lines.append(cur.rstrip())
     return lines

@@ -290,14 +290,11 @@ class TranslationGUI:
         # 分区小标题（设置弹窗里的「API KEY / 音频设备」）：小一号、暗色、加粗
         style.configure("Section.TLabel", foreground=TEXT_DIM,
                         font=("Microsoft YaHei UI", 8, "bold"))
-        # key 状态入口（第二行右侧的小按钮）：比常规按钮矮半档，不抢视觉。
-        # 未配置时切 ChipWarn（警示橙文字），让「还没配 key」一眼可见——入口本身
-        # 仍是按钮（样式不动），只是文字用颜色表达状态。
-        style.configure("Chip.TButton", font=FONT_STATUS, padding=(8, 3))
-        style.configure("ChipWarn.TButton", font=FONT_STATUS, padding=(8, 3),
-                        foreground=COLOR_WARN)
-        style.map("ChipWarn.TButton",
-                  foreground=[("active", COLOR_WARN), ("pressed", COLOR_WARN)])
+        # API key 状态（**纯展示，不是按钮**）：右上角「⚙ 设置」是填 key 的唯一入口。
+        # 原先这里也是个按钮，两个入口通往同一处 —— 用户实测反馈重复，已改成 Label。
+        # 未配置时切 ChipWarn（警示橙），让「还没配 key」一眼可见。
+        style.configure("Chip.TLabel", font=FONT_STATUS, foreground=TEXT_DIM)
+        style.configure("ChipWarn.TLabel", font=FONT_STATUS, foreground=COLOR_WARN)
         # 分割线/分组竖线：用 1px 明度差表达层次，不用 3D 边框
         style.configure("TSeparator", background=BORDER)
 
@@ -393,8 +390,9 @@ class TranslationGUI:
 
         # 「⚙ 设置」先打包（side=RIGHT）：窗口变窄时 Tk 先挤压后打包的控件，
         # 先占住右侧入口，压缩只会发生在左侧分组之间的留白上。
-        ttk.Button(ctrl, text="⚙ 设置", width=8,
-                   command=self._open_settings).pack(side=tk.RIGHT)
+        self._settings_btn = ttk.Button(ctrl, text="⚙ 设置", width=8,
+                                        command=self._open_settings)
+        self._settings_btn.pack(side=tk.RIGHT)
 
         self._start_btn = ttk.Button(ctrl, text="开始翻译", style="Accent.TButton",
                                      command=self._start)
@@ -444,9 +442,10 @@ class TranslationGUI:
 
         # 右侧：API key 状态入口（先打包占住右侧，理由同「⚙ 设置」）。
         # 未配置时是一直可见的提醒，点它直接进设置弹窗。
-        self._key_chip = ttk.Button(out_frame, text="", style="Chip.TButton",
-                                    command=self._open_settings)
-        self._key_chip.pack(side=tk.RIGHT)
+        # 状态展示，**不是按钮**：右上角「⚙ 设置」已经是填 key 的唯一入口，
+        # 两个按钮通向同一个地方纯属重复（用户实测后指出）。这里只显示状态。
+        self._key_chip = ttk.Label(out_frame, text="", style="Chip.TLabel")
+        self._key_chip.pack(side=tk.RIGHT, padx=(0, 4))
 
         ttk.Label(out_frame, text="输出:", style="Dim.TLabel").pack(side=tk.LEFT)
         self._chatbox_var = tk.BooleanVar(value=bool((self._cfg.ui or {}).get("chatbox", True)))
@@ -766,10 +765,10 @@ class TranslationGUI:
             return
         if masked:
             self._key_status.config(text=f"当前：{src} {masked}")
-            chip_text, chip_style = "API key 已配置 ›", "Chip.TButton"
+            chip_text, chip_style = "API key 已配置", "Chip.TLabel"
         else:
             self._key_status.config(text="⚠️ 未配置 API key —— 在上面粘贴后点「保存」")
-            chip_text, chip_style = "⚠ 未配置 API key ›", "ChipWarn.TButton"
+            chip_text, chip_style = "⚠ 未配置 API key", "ChipWarn.TLabel"
         if hasattr(self, "_key_chip"):
             self._key_chip.configure(text=chip_text, style=chip_style)
 

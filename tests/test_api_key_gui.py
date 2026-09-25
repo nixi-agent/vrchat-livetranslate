@@ -193,9 +193,16 @@ def test_gui_starts_without_any_key() -> None:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             gui = TranslationGUI()                 # 关键：不能抛，窗口要建起来
         chip = gui._key_chip.cget("text")
-        assert chip.startswith("⚠ 未配置"), f"未配置时入口文案不对：{chip!r}"
-        assert gui._key_chip.cget("style") == "ChipWarn.TButton", "未配置时应用警示样式（橙字）"
-        print(f"  无 key 时界面仍能启动 OK（入口：{chip}）")
+        assert chip.startswith("⚠ 未配置"), f"未配置时状态文案不对：{chip!r}"
+        assert gui._key_chip.cget("style") == "ChipWarn.TLabel", "未配置时应用警示样式（橙字）"
+
+        # ★ 用户实测反馈：API key 状态原先也是个按钮，与「⚙ 设置」重复（两个入口
+        # 通往同一处）。约定：**设置是唯一可点入口，key 状态纯展示**。
+        assert gui._key_chip.winfo_class() == "TLabel", \
+            f"API key 状态应当是不可点的纯展示，实际控件类：{gui._key_chip.winfo_class()}"
+        assert "›" not in chip, f"非按钮不该带可点提示符 ›：{chip!r}"
+        assert gui._settings_btn.winfo_class() == "TButton", "「⚙ 设置」应当是按钮（唯一入口）"
+        print(f"  无 key 时界面仍能启动 OK（状态：{chip}；可点入口：⚙ 设置）")
     finally:
         if gui is not None:
             try:

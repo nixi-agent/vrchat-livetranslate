@@ -198,10 +198,64 @@ def test_black_box_dump_on_disconnect() -> None:
     print("  断线黑匣子内容完整 OK")
 
 
+def test_send_failure_does_not_kill_leg() -> None:
+    """★ 发送失败绝不能打死采集循环（否则看门狗连机会都没有）。
+
+    用户实测日志（2026-09-25 19:30/19:33）：服务端 1011 掐断连接后，
+    `[session] 事件循环中断：ConnectionClosedError` 与 `[xx][error] 运行错误：…`
+    只差 7ms —— 采集循环里 `session.send_audio()` 抛的异常一路冒到 `_run` 外层，
+    整条腿就此结束，**重连那条日志一行都没有**。正确行为：代理吞掉这一次失败
+    （留痕 + 丢弃该块），采集继续跑，看门狗随后换会话，音频转到新会话上。
+    """
+    import contextlib
+    import io
+
+    from vlt.engine import Engine, EngineEvents
+
+    class _DeadOnSend(_FakeSession):
+        async def send_audio(self, pcm: bytes) -> None:
+            raise ConnectionResetError(
+                "received 1011 (internal error) model repeat output happened")
+
+    eng = Engine(cfg=_cfg(), direction="mine", source="mic", sinks=set(),
+                 events=EngineEvents())
+    eng._session = _DeadOnSend(alive=False,
+                               reason="ConnectionClosedError: received 1011 (internal error)")
+
+    async def run() -> int:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):          # 不许抛
+            await eng._proxy.send_audio(b"x" * 320)
+            await eng._proxy.send_audio(b"x" * 320)
+        out = buf.getvalue()
+        assert "发送音频失败" in out, f"发送失败必须留痕（否则无从排查）：{out!r}"
+        assert eng._proxy.send_fails == 2, f"失败计数不对：{eng._proxy.send_fails}"
+        assert eng._proxy.sent_bytes == 640, \
+            f"发送量应按「尝试发送」计（诊断要用），实际 {eng._proxy.sent_bytes}"
+        # 看门狗接手 → 换新会话 → 后续音频发到新会话
+        fresh = _FakeSession(alive=True)
+
+        async def fake_create(scfg):                   # noqa: ANN001, ANN202
+            eng._session = fresh
+            eng._connect_ts.append(0.0)
+
+        eng._create_session = fake_create              # type: ignore[assignment]
+        await eng._watchdog()
+        assert eng._reconnect_task is not None, "会话不健康却没安排重连"
+        await asyncio.wait_for(eng._reconnect_task, timeout=5)
+        await eng._proxy.send_audio(b"y" * 100)
+        return fresh.received
+
+    got = asyncio.run(run())
+    assert got == 100, f"重连后音频没发到新会话，新会话只收到 {got} 字节"
+    print("  发送失败不打死采集循环 + 重连后音频转到新会话 OK")
+
+
 if __name__ == "__main__":
     print("test_reconnect:")
     test_proxy_forwards_to_current_session()
     test_watchdog_reconnects_dead_session()
     test_watchdog_ignores_healthy_session()
     test_black_box_dump_on_disconnect()
+    test_send_failure_does_not_kill_leg()
     print("ALL PASSED")

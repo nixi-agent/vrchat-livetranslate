@@ -451,16 +451,21 @@ class WristOverlay:
             self._overlay.setOverlayRaw(self._handle, buf, w, h, 4)
         except Exception as exc:  # noqa: BLE001
             self._upload_fails += 1
+            f = self._upload_fails
             # 降噪：连失败 86 次时每帧打一行会把日志彻底淹没（用户实测就是这样），
             # 只报第一次 + 每隔 50 次汇总一条。
-            if self._upload_fails == 1:
+            if f == 1:
                 print(f"[overlay] ❌ setOverlayRaw 失败：{type(exc).__name__}: {exc}")
-            elif self._upload_fails == 3:
-                print("[overlay] ⚠️ 贴图连续 3 次上传失败 → 尝试重建 overlay 恢复")
+            if f % 50 == 0:
+                print(f"[overlay] ❌ 贴图上传已连续失败 {f} 次（面板会停在最后一帧）")
+            # ★ 重建必须**反复**试，不能只在第 3 次试一次：
+            # 用户实测日志（2026-09-25 19:26）里第 3 次失败时重建过一次，之后又连续失败
+            # 150 次都没有第二次补救，手腕屏一直停在最后一帧，直到用户重启引擎 —— 自愈
+            # 只试一次等于没自愈。现在改成「第 3 次 + 之后每 50 次」各重建一次
+            # （间隔足够长，不会每帧都去重建）。
+            if f == 3 or f % 50 == 0:
+                print(f"[overlay] ♻️ 贴图连续失败 {f} 次 → 重建 overlay 再试一次")
                 self._recreate_overlay()
-            elif self._upload_fails % 50 == 0:
-                print(f"[overlay] ❌ 贴图上传已连续失败 {self._upload_fails} 次"
-                      f"（面板会停在最后一帧）")
             return
         self.frames_updated += 1
         if self._upload_fails:

@@ -55,6 +55,7 @@ class _SessionProxy:
         self.sent_bytes = 0
         self.chunks = 0
         self.silent_chunks = 0
+        self.send_fails = 0          # 发送失败的块数（不计入静音统计，只用于留痕/诊断）
 
     async def send_audio(self, pcm: bytes) -> None:
         session = self._engine._session          # noqa: SLF001
@@ -78,8 +79,24 @@ class _SessionProxy:
             # 还没连上（或正在重连）也要计入——这是"输入侧"的度量，用于诊断
             self.sent_bytes += len(pcm)
             return
-        await session.send_audio(pcm)
+        # 发送量按「尝试发送」口径计（与上面 session is None 一致）：出问题时要靠它
+        # 判断"到底说了多少话"，漏计会让诊断把"一直在说话"误读成"几乎没说话"。
         self.sent_bytes += len(pcm)
+        try:
+            await session.send_audio(pcm)
+        except Exception as exc:  # noqa: BLE001
+            # ★ 采集循环是**长跑任务**，绝不能因为一次发送失败就整条腿死掉。
+            # 用户实测日志（2026-09-25）：服务端 1011 掐断连接后，这里抛出的
+            # ConnectionClosedError 一路冒到 `_run` 外层 → 该腿「运行错误」结束，
+            # `_pump_loop` 里的看门狗根本没机会重连（日志里「事件循环中断」与
+            # 「运行错误」只差 7ms，重连那条日志一行都没有）。
+            # 这里只留痕并丢弃这一块：会话的接收循环已把它标成不健康，看门狗会在
+            # 0.3s 内发起重连，之后的音频由本代理发到**新**会话上。
+            self.send_fails += 1
+            if self.send_fails == 1 or self.send_fails % 500 == 0:
+                print(f"[session] ⚠️ 发送音频失败（第 {self.send_fails} 次，丢弃该块，"
+                      f"等看门狗重连）：{type(exc).__name__}: {exc}", flush=True)
+            return
 
 
 class Engine:

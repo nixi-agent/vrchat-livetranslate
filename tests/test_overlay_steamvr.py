@@ -290,6 +290,40 @@ def test_upload_failure_recovers_and_logs_quietly() -> None:
     print("  上传失败降噪 + 自动重建 + 恢复日志 OK")
 
 
+def test_upload_failure_keeps_retrying_rebuild() -> None:
+    """★ 回归：上传一直失败时要**反复**重建，不能只在第 3 次试一次。
+
+    用户实测日志（2026-09-25 19:26）：第 3 次失败时重建过一次，之后又连续失败
+    50/100/150 次，**再也没有第二次补救** —— 手腕屏一直停在最后一帧，直到用户
+    在 19:28 手动重启引擎。「自愈只试一次」等于没自愈。
+    """
+    import contextlib
+    import io
+
+    CALLS.clear()
+    RAW_FAIL_PLAN["remaining"] = 10 ** 9          # 一直失败
+    _install_fake_openvr()
+    from vlt.output.overlay import WristOverlay
+
+    ov = WristOverlay(_cfg(Path(".")))
+    ov.start()
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            for i in range(60):
+                ov.update_entries([("theirs", f"hi{i}", f"你好{i}")], force=True)
+        out = buf.getvalue()
+        recreated = sum(1 for c in CALLS if c[0] == "createOverlay")
+        assert recreated >= 3, \
+            f"持续失败时应反复重建（start 一次 + 第 3 次 + 第 50 次），实际 createOverlay {recreated} 次：\n{out}"
+        assert "已连续失败 50 次" in out, f"缺 50 次的汇总日志（降噪不能把信息降没）：\n{out}"
+        assert ov._upload_fails >= 60, f"失败计数不应被重建清零（要能继续累计触发下一次），实际 {ov._upload_fails}"
+    finally:
+        RAW_FAIL_PLAN["remaining"] = 0
+        ov.close()
+    print(f"  持续失败会反复重建 OK（createOverlay {recreated} 次）")
+
+
 if __name__ == "__main__":
     print("test_overlay_steamvr:")
     test_start_takes_over_steamvr()
@@ -299,4 +333,5 @@ if __name__ == "__main__":
     test_hot_reload_reapplies_geometry()
     test_hot_reload_font_rerenders()
     test_upload_failure_recovers_and_logs_quietly()
+    test_upload_failure_keeps_retrying_rebuild()
     print("ALL PASSED")

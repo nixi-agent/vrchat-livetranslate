@@ -152,10 +152,69 @@ def test_gui_key_row_saves_without_leaking() -> None:
         _reset_storage()
 
 
+def test_gui_starts_without_any_key() -> None:
+    """★ 一个 key 都没有时，界面必须照样起得来。
+
+    真实事故（我复核 kimi3 第二轮改动时抓到的）：无 key 状态下启动 GUI，
+    `load_config()` → `load_api_key()` 抛 `SystemExit`，**窗口还没建就退出** ——
+    进程起完就没了。后果是：首次拿到程序的人 / 换台电脑给朋友用，
+    连"去哪填 key"的入口都看不到，直接死局。而"给朋友用"正是这个项目的目标场景。
+
+    同时守卫：CLI/引擎路径的行为**不能变**（`require_key=True` 时仍要抛）。
+    """
+    import tempfile
+
+    from vlt import credentials
+
+    tmp = tempfile.mkdtemp(prefix="vlt-nokey-")
+    saved = {k: os.environ.get(k) for k in ("USERPROFILE", "HOME", "DASHSCOPE_API_KEY")}
+    old_override = credentials._storage_dir_override
+    gui = None
+    try:
+        os.environ["USERPROFILE"] = tmp
+        os.environ["HOME"] = tmp
+        os.environ.pop("DASHSCOPE_API_KEY", None)
+        credentials._storage_dir_override = lambda: Path(tmp)
+
+        from vlt.config import load_config
+
+        cfg = load_config(require_key=False)
+        assert cfg.session_base["api_key"] == "", "没 key 时应给空串，而不是抛错"
+
+        raised = False
+        try:
+            load_config(require_key=True)
+        except SystemExit:
+            raised = True
+        assert raised, "require_key=True 时行为不能变：仍应抛 SystemExit（CLI 依赖它）"
+
+        from vlt.gui import TranslationGUI
+
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            gui = TranslationGUI()                 # 关键：不能抛，窗口要建起来
+        chip = gui._key_chip.cget("text")
+        assert chip.startswith("⚠ 未配置"), f"未配置时入口文案不对：{chip!r}"
+        assert gui._key_chip.cget("style") == "ChipWarn.TButton", "未配置时应用警示样式（橙字）"
+        print(f"  无 key 时界面仍能启动 OK（入口：{chip}）")
+    finally:
+        if gui is not None:
+            try:
+                gui._root.destroy()
+            except Exception:
+                pass
+        credentials._storage_dir_override = old_override
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 if __name__ == "__main__":
     print("test_api_key_gui:")
     test_roundtrip_and_mask()
     test_invalid_key_rejected()
     test_load_api_key_prefers_gui_saved()
     test_gui_key_row_saves_without_leaking()
+    test_gui_starts_without_any_key()
     print("ALL PASSED")

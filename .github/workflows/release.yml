@@ -77,6 +77,9 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           name: ${{ github.ref_name }}
+          # 自动附加「本版更新」：把上个 tag 以来的提交按分类列出来，
+          # 免得每次发版的说明都是同一段静态文案（v0.0.1 → v0.0.2 实测过这个坑）。
+          generate_release_notes: true
           body: |
             ## VRChat 实时同传 ${{ github.ref_name }}
 

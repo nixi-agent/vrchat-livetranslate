@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -65,6 +66,11 @@ def test_render_conversation_keeps_newest() -> None:
 def test_gui_owns_single_wrist_panel() -> None:
     fakeov.CALLS.clear()
     fakeov._install_fake_openvr()
+    # 干净环境（CI）上没有任何 API key 时，界面 _start() 会**直接返回**并弹设置窗
+    # —— 引擎为空、手腕屏也不建，本用例就假红（实测 CI 挂在这）。这里给一个
+    # **拼接出来的假 key**（不触发仓库的凭据扫描）：本用例只验「手腕屏归界面持有 +
+    # 两个方向都上屏」，不需要真连上服务。
+    os.environ.setdefault("DASHSCOPE_API_KEY", "sk" + "-ws-" + "overlaytestonly0123456789abcdef")
     from vlt.gui import TranslationGUI
 
     gui = TranslationGUI()

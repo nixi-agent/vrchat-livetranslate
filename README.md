@@ -216,7 +216,9 @@ testdata/                 自带测试音频（中文 8.56s、英文 7.92s，16k
 
 项目免费、源码全开，但 API 是**按量计费**的（现在的账都是我自己在付）。
 
-- ☕ **Ko-fi**（海外 / 信用卡 / PayPal）：<https://ko-fi.com/kcmnixi>
+- ☕ **Ko-fi**（海外 / 信用卡 / PayPal）：
+
+  [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/S7Y527MI45)
 - 国内：微信 / 支付宝扫码
 
 ![收款码](assets/sponsor-qrcodes.png)

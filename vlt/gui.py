@@ -738,6 +738,9 @@ class TranslationGUI:
         win.deiconify()
         win.lift()
         win.focus_set()
+        # 建窗时它处于 withdraw 状态，那时调 DWM 拿不到有效 hwnd、会静默失败
+        # （实测弹窗标题栏仍是浅色、跟主窗口不一致）。显示出来之后再设一次。
+        self._apply_dark_titlebar(win)
 
     def _close_settings(self) -> None:
         self._settings_win.withdraw()

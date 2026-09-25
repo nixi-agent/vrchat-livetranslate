@@ -1,6 +1,9 @@
 """独立复核线上 Release 附件（不依赖 CI 的自检结论）。
 
-用法：.venv/Scripts/python.exe scripts/_verify_release.py v0.0.2
+用法：.venv/Scripts/python.exe scripts/verify_release.py v0.0.3 "硬重启"
+
+第二个参数 = 本版新增功能里必定出现的字符串（默认「俄语」）。判据是「在解包出来的
+字节码里搜得到」——不是搜 exe 原始字节（那是压缩过的 PYZ，永远搜不到）。
 
 复核项：
   1. 附件下载（exe + SHA256SUMS.txt）
@@ -27,6 +30,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 TAG = sys.argv[1] if len(sys.argv) > 1 else "v0.0.2"
+NEEDLE = sys.argv[2] if len(sys.argv) > 2 else "俄语"      # 本版新功能里必定出现的字符串
 ROOT = Path(__file__).resolve().parents[1]
 WORK = Path(tempfile.mkdtemp(prefix="verify_release_"))
 
@@ -117,10 +121,10 @@ else:
                        text=True, encoding="utf-8", errors="replace", timeout=900)
     check("pyinstxtractor-ng 解包成功", r.returncode == 0 and unpacked.is_dir(),
           f"rc={r.returncode}，产物目录 {'存在' if unpacked.is_dir() else '不存在'}")
-    needle = "俄语".encode("utf-8")
+    needle = NEEDLE.encode("utf-8")
     pycs = [p for p in unpacked.rglob("*.pyc")] if unpacked.is_dir() else []
     hits = [p.relative_to(unpacked).as_posix() for p in pycs if needle in p.read_bytes()]
-    check("exe 内含新增的「俄语」选项（解包后在字节码里搜到）", bool(hits),
+    check(f"exe 内含新增的「{NEEDLE}」（解包后在字节码里搜到）", bool(hits),
           f"{len(pycs)} 个 pyc 里命中：{hits[:3]}")
     # 顺带核：包内版本号是这次的、不是上一个版本的残留
     init = next((p for p in pycs if p.name == "__init__.pyc" and "vlt" in p.as_posix()), None)

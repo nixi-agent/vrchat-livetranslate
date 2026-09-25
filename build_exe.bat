@@ -1,15 +1,26 @@
 @echo off
 REM ============================================================
-REM  双击本文件即可把界面打包成单文件 exe（无控制台窗口）
-REM  产物：dist\VRChatLiveTranslate.exe
-REM  加 --no-verify 可跳过打完之后的自动自检
+REM  Build the GUI into a single-file exe (no console window).
+REM  Output: dist\VRChatLiveTranslate.exe
+REM  Add --no-verify to skip the self-check that runs after build.
+REM
+REM  NOTE 1: keep this file ASCII-only.  .bat files containing
+REM          non-ASCII text get mis-decoded on a GBK console
+REM          (cmd merges lines, then runs the leftovers as commands).
+REM  NOTE 2: keep CRLF line endings - same reason.  See .gitattributes.
 REM ============================================================
 setlocal
-cd /d "%~dp0.."
+cd /d "%~dp0"
 
 if not exist ".venv\Scripts\python.exe" (
-    echo [X] 没找到 .venv\Scripts\python.exe
-    echo     请先按 README 建好虚拟环境并安装依赖，再跑本脚本。
+    echo [X] .venv\Scripts\python.exe not found.
+    echo     Run setup.bat first to create the venv and install dependencies.
+    pause
+    exit /b 1
+)
+
+if not exist "scripts\build_exe.py" (
+    echo [X] scripts\build_exe.py not found - put this script in the repo root.
     pause
     exit /b 1
 )
@@ -19,9 +30,9 @@ set RC=%ERRORLEVEL%
 
 echo.
 if %RC%==0 (
-    echo [OK] 打包完成 —— 产物在 dist\ 目录，整个文件夹一起发给别人即可。
+    echo [OK] Build finished - output is in dist\. Send the whole folder.
 ) else (
-    echo [X] 打包或自检失败，退出码 %RC%
+    echo [X] Build or self-check failed, exit code %RC%
 )
 pause
 exit /b %RC%

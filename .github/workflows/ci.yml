@@ -43,8 +43,15 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          # 不进 CI 的（都写清理由，别让「跳过」变成静默）：
+          #   test_engine —— 要真 API key 打真会话，属本机实测项
+          SKIP="tests/test_engine.py"
           fail=0
           for t in tests/test_*.py; do
+            if [[ " $SKIP " == *" $t "* ]]; then
+              echo "::notice::$t 已跳过（需要真实 API key / 硬件，见 workflow 注释）"
+              continue
+            fi
             echo "::group::$t"
             if python "$t"; then
               echo "PASS $t"

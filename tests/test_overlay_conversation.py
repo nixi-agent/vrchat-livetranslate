@@ -94,7 +94,21 @@ def test_gui_owns_single_wrist_panel() -> None:
         gui._root.after(200, gui._on_close)
 
     gui._root.after(0, step_start)
-    gui._root.after(2500, step_check)
+
+    def wait_ready(tries: int = 0) -> None:
+        """等手腕屏真的起来再断言。
+
+        以前是固定 `after(2500, step_check)` —— 本机够用，CI runner 上设备扫描 + 建 overlay
+        更慢，于是「界面没有成功接管手腕屏」假红（实测 CI 就是这么挂的）。
+        改成轮询就绪、最多等 15s，与机器快慢解耦。
+        """
+        ready = gui._overlay_out is not None and gui._overlay_out.available
+        if ready or tries >= 75:
+            step_check()
+        else:
+            gui._root.after(200, lambda: wait_ready(tries + 1))
+
+    gui._root.after(200, wait_ready)
     gui._root.mainloop()
 
     print(f"  引擎输出面={got['engine_sinks']} 手腕屏帧数={got['frames']} "

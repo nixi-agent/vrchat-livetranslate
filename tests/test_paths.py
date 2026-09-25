@@ -100,7 +100,11 @@ def test_portable_marker_overrides() -> None:
     mod, saved, old = _reload(exe_dir / "app.exe", meipass, appdata)
     try:
         assert mod.is_portable(), "有 portable.txt 应判定为绿色版"
-        assert mod.app_dir() == exe_dir, f"绿色版 APP_DIR 应为 exe 目录，实际 {mod.app_dir()}"
+        # 用 samefile 比「是不是同一个目录」：Windows 上 mkdtemp 的路径与
+        # resolve() 出来的大小写/短名形式可能不同（CI runner 上实测就是这样），
+        # 直接比字符串会假红。
+        assert os.path.samefile(mod.app_dir(), exe_dir), \
+            f"绿色版 APP_DIR 应为 exe 目录，实际 {mod.app_dir()}"
         print("  绿色版（portable.txt）OK —— APP_DIR = exe 所在目录")
     finally:
         _restore(saved, old)

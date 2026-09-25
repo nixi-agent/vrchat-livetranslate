@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-ROOT = Path(r"D:/workspace/vrchat-livetranslate")
+ROOT = Path(__file__).resolve().parents[1]          # 不写死本机路径：CI / 别人克隆后也能跑
 sys.path.insert(0, str(ROOT))
 CONFIG = ROOT / "config.yaml"
 BACKUP = ROOT / "out" / "cfg_backup.yaml"
@@ -27,6 +27,12 @@ def top_keys(t: str) -> list[str]:
 
 
 def main() -> int:
+    if not CONFIG.exists():
+        # config.yaml 是被 gitignore 的个人配置，首次运行由程序从模板生成。
+        # CI / 新克隆上它本来就不存在，这里照做一次（否则直接 FileNotFoundError）。
+        CONFIG.write_text((ROOT / "config.example.yaml").read_text(encoding="utf-8"),
+                          encoding="utf-8")
+        print(f"config.yaml 不存在 → 已从 config.example.yaml 生成（{CONFIG}）")
     before = CONFIG.read_text(encoding="utf-8")
     BACKUP.parent.mkdir(parents=True, exist_ok=True)
     BACKUP.write_text(before, encoding="utf-8")

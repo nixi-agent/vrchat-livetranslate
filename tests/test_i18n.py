@@ -100,15 +100,18 @@ def _walk_texts(win, out: list[str]) -> None:
 
 def test_catalog_completeness() -> None:
     """★ 机械守卫：AST 扫 vlt/**/*.py 里所有 `t("字面量")`，每个 key 都必须能在
-    en.py 的 STRINGS 里找到 —— 漏翻直接红。
+    **每一套**词表（en / ja / ko / ru）的 STRINGS 里找到 —— 任一语言漏翻直接红。
 
     用 AST 而不是正则：隐式拼接的多行字面量在 AST 里已经合并成完整字符串，
     正则处理多行拼接既脆弱又容易漏。
     """
-    from vlt.locales.en import STRINGS
+    import importlib
+
+    catalogs = {code: importlib.import_module(f"vlt.locales.{code}").STRINGS
+                for code in ("en", "ja", "ko", "ru")}
 
     used = 0
-    missing: list[str] = []
+    missing: dict[str, list[str]] = {code: [] for code in catalogs}
     for path in sorted((ROOT / "vlt").rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
@@ -122,13 +125,19 @@ def test_catalog_completeness() -> None:
             first = node.args[0]
             if isinstance(first, ast.Constant) and isinstance(first.value, str):
                 used += 1
-                if first.value not in STRINGS:
-                    missing.append(f"  {path.relative_to(ROOT)}:{first.lineno} "
-                                   f"{first.value[:70]!r}")
+                for code, cat in catalogs.items():
+                    if first.value not in cat:
+                        missing[code].append(f"  {path.relative_to(ROOT)}:{first.lineno} "
+                                             f"{first.value[:70]!r}")
     assert used > 100, f"扫描面太小了（{used} 处），守卫形同虚设"
-    assert not missing, (f"以下 {len(missing)} 处 t() 的 key 在 en.py 里缺词条（漏翻）：\n"
-                         + "\n".join(missing))
-    print(f"  ✓ 词表完整性：{used} 处 t() 字面量全部在 en.STRINGS 里有词条")
+    for code, miss in missing.items():
+        assert not miss, (f"以下 {len(miss)} 处 t() 的 key 在 {code}.py 里缺词条（漏翻）：\n"
+                          + "\n".join(miss))
+    # 各词表条数一致（多的那些说明词表里留了没人用的 key，也是漂移）
+    sizes = {code: len(cat) for code, cat in catalogs.items()}
+    assert len(set(sizes.values())) == 1, f"各语言词表条数不一致：{sizes}"
+    print(f"  ✓ 词表完整性：{used} 处 t() 字面量在 {len(catalogs)} 套词表里全有词条"
+          f"（各 {sizes['en']} 条）")
 
 
 # ---------------------------------------------------------------- ② 格式化与回落
@@ -173,7 +182,8 @@ def test_normalize_language() -> None:
 
 
 def test_detect_system_language_stubbed() -> None:
-    """detect_system_language 打桩：zh-CN→zh、en-US→en、其它语言→en、异常→zh。"""
+    """detect_system_language 打桩：支持的五种语言各归各的；
+    **已知但未支持**的语言（德语/法语）→ en；异常 → zh。"""
     from vlt import i18n
 
     class _K:
@@ -195,7 +205,11 @@ def test_detect_system_language_stubbed() -> None:
         for langid, want in ((0x0804, "zh"),   # zh-CN
                              (0x0404, "zh"),   # zh-TW：主语言也是 0x04
                              (0x0409, "en"),   # en-US
-                             (0x0411, "en")):  # ja-JP：非中文一律按英文接待
+                             (0x0411, "ja"),   # ja-JP
+                             (0x0412, "ko"),   # ko-KR
+                             (0x0419, "ru"),   # ru-RU
+                             (0x0407, "en"),   # de-DE：已知但未支持 → 按英文接待
+                             (0x040c, "en")):  # fr-FR：同上
             _K.langid = langid
             got = i18n.detect_system_language()
             assert got == want, f"langid={langid:#06x} → {got!r}，期望 {want!r}"
@@ -205,7 +219,19 @@ def test_detect_system_language_stubbed() -> None:
     finally:
         if orig is not None:
             i18n.ctypes.windll = orig
-    print("  ✓ detect_system_language：zh-CN/zh-TW→zh，en-US/ja-JP→en，异常→zh（已打桩）")
+    print("  ✓ detect_system_language：zh/en/ja/ko/ru 各归各的；"
+          "de/fr→en；异常→zh（已打桩）")
+
+
+def test_available_languages_order() -> None:
+    """语言列表：五种、顺序固定、名字用各自母语写法（不随界面语言变）。"""
+    from vlt.i18n import available_languages
+
+    want = [("zh", "简体中文"), ("en", "English"), ("ja", "日本語"),
+            ("ko", "한국어"), ("ru", "Русский")]
+    got = available_languages()
+    assert got == want, f"语言列表不对：{got!r}"
+    print(f"  ✓ 语言列表：{[c for c, _ in got]}（顺序与母语写法都对）")
 
 
 # ---------------------------------------------------------------- ③ 英文界面无汉字守卫（真 Tk）
@@ -237,6 +263,63 @@ def test_english_ui_has_no_cjk() -> int:
         _restore_env(saved_env)
         from vlt import i18n
         i18n.set_language("zh")
+
+
+# ---------------------------------------------------------------- ③b 各语言界面守卫（真 Tk）
+
+HANGUL_RE = re.compile(r"[\uac00-\ud7af]")
+KANA_RE = re.compile(r"[\u3040-\u30ff]")
+
+
+def test_all_ui_languages_window_guard() -> None:
+    """★ 分语言界面守卫：en / ja / ko / ru 各起一次真窗口（主窗口 + 设置弹窗），
+    按各语言的书写系统断言：
+
+    - `en` / `ru` / `ko`：不得出现中日韩汉字（`[一-鿿]`）；
+    - `en` / `ru` / `ja`：不得出现谚文（`[가-힣]`）；
+    - `en` / `ru` / `ko`：不得出现假名（`[぀-ヿ]`）—— 出现说明串了日文词表；
+    - `ja`：不做汉字断言（日语本来就用汉字），但**假名比例必须 ≥ 50%** ——
+      整片中文没翻译时这个比例会掉到 0，一样能抓住。
+
+    下拉框的「值」不在 text 属性里（界面语言母语名/语言对名），不在扫描面内。
+    """
+    from vlt import i18n
+
+    reports: list[str] = []
+    for lang in ("en", "ja", "ko", "ru"):
+        saved_env = _isolate_env(Path(tempfile.mkdtemp(prefix="vlt-i18n-env-")))
+        gui = None
+        try:
+            gui = _make_gui(_temp_config(lang))
+            assert i18n.current_language() == lang, \
+                f"前提：界面语言应是 {lang}，实际 {i18n.current_language()!r}"
+            texts = [gui._root.title(), gui._settings_win.title()]
+            _walk_texts(gui._root, texts)
+            _walk_texts(gui._settings_win, texts)
+            assert len(texts) > 50, f"{lang}：扫到的文案太少（{len(texts)} 条），守卫形同虚设"
+
+            bad: list[str] = []
+            if lang in ("en", "ko", "ru"):
+                bad += [f"[汉字] {x!r}" for x in texts if CJK_RE.search(x)]
+            if lang in ("en", "ja", "ru"):
+                bad += [f"[谚文] {x!r}" for x in texts if HANGUL_RE.search(x)]
+            if lang in ("en", "ko", "ru"):
+                bad += [f"[假名] {x!r}" for x in texts if KANA_RE.search(x)]
+            assert not bad, (f"{lang} 界面出现不该有的书写系统（{len(bad)} 条）：\n"
+                             + "\n".join(f"  {b}" for b in bad[:15]))
+
+            if lang == "ja":
+                ratio = len([x for x in texts if KANA_RE.search(x)]) / len(texts)
+                assert ratio >= 0.5, \
+                    f"日文界面含假名的文案只有 {ratio:.0%}（<50%）—— 像是整片没翻译"
+                reports.append(f"{lang}:{len(texts)}条(假名{ratio:.0%})")
+            else:
+                reports.append(f"{lang}:{len(texts)}条")
+        finally:
+            _destroy(gui)
+            _restore_env(saved_env)
+            i18n.set_language("zh")
+    print("  ✓ 分语言界面守卫：" + "，".join(reports) + " —— 书写系统均正确")
 
 
 # ---------------------------------------------------------------- ④ 语言下拉写 ui.lang
@@ -333,7 +416,9 @@ def main() -> int:
         test_format_and_fallback,
         test_normalize_language,
         test_detect_system_language_stubbed,
+        test_available_languages_order,
         test_english_ui_has_no_cjk,
+        test_all_ui_languages_window_guard,
         test_language_combo_writes_config,
         test_open_log_folder_button,
     ]

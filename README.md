@@ -1,5 +1,7 @@
 # VRChat 实时同传
 
+> [English](README.en.md) | 中文
+
 [![CI](https://github.com/nixi-agent/vrchat-livetranslate/actions/workflows/ci.yml/badge.svg)](https://github.com/nixi-agent/vrchat-livetranslate/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/nixi-agent/vrchat-livetranslate?label=release)](https://github.com/nixi-agent/vrchat-livetranslate/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](#一前置条件)
@@ -55,6 +57,14 @@
 - 更新**不会动你的配置和 API key**；更新成功后下次启动会告诉你一声
 
 **从源码跑的**：不走上面这套，在仓库目录 `git pull` 即可（源码运行时点「立即更新」也会这样提示你）。
+
+### 界面语言
+
+界面支持 **简体中文 / English / 日本語 / 한국어 / Русский** 五种语言：
+
+- **默认跟随 Windows 的显示语言**（认得出日/韩/俄就用对应语言；其它语言按英文接待；中文环境保持中文）
+- 想手动改 → 「⚙ 设置 → 界面语言」选一种，**重启程序后生效**（选完会明确告诉你这一点）
+- 语言只影响**界面文案**，不影响翻译方向的语种选择（那是另一组下拉）
 
 想看源码 / 自己打包 / 改代码 → 从下面「一」开始。
 

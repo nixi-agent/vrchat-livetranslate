@@ -13,8 +13,19 @@ from __future__ import annotations
 import ctypes
 import importlib
 
-# (语言代码, 母语写法)。语言名永远用各自的母语写法，不随界面语言变化。
-_LANGS: list[tuple[str, str]] = [("zh", "简体中文"), ("en", "English")]
+# (语言代码, 母语写法)。语言名永远用各自的母语写法，不随界面语言变化；
+# 列表顺序即设置里下拉的显示顺序。
+_LANGS: list[tuple[str, str]] = [
+    ("zh", "简体中文"),
+    ("en", "English"),
+    ("ja", "日本語"),
+    ("ko", "한국어"),
+    ("ru", "Русский"),
+]
+
+# Windows 主语言 ID → 界面语言。表里没有的（德语/法语等已知但未支持的语言）按 en 接待；
+# 详见 detect_system_language 的注释。
+_PRIMARY_LANG: dict[int, str] = {0x04: "zh", 0x09: "en", 0x11: "ja", 0x12: "ko", 0x19: "ru"}
 
 # None = 尚未设置过（此时 t() 按基准语言 zh 处理）。启动时由界面解析后 set_language。
 _current: str | None = None
@@ -46,17 +57,20 @@ def normalize_language(code: str | None) -> str:
 def detect_system_language() -> str:
     """读 Windows 用户默认 UI 语言（`GetUserDefaultUILanguage`）。
 
-    返回 LANGID（如 0x0804=zh-CN、0x0409=en-US），低 10 位是主语言 ID
-    （0x04=中文、0x09=英文）。取舍：本软件界面目前只有中/英两种语言，
-    **zh\\* → "zh"，其余一律 → "en"** —— 非中文用户按英文接待远比按中文合理。
-    任何异常 / 非 Windows / 取不到值都回落 "zh"：保持老用户（中文环境）行为不变。
+    返回 LANGID（如 0x0804=zh-CN、0x0409=en-US），低 10 位是主语言 ID。
+    三条分界（都写死在 `_PRIMARY_LANG` 与下面的注释里，别改口径）：
+
+    - **支持的语言**：0x04→zh、0x09→en、0x11→ja、0x12→ko、0x19→ru；
+    - **已知但不在支持列表里的语言**（0x07 德语、0x0c 法语、0x0a 西班牙语…）→ **"en"**：
+      这些用户按英文接待远比按中文合理，也不至于看到方块或空白；
+    - **取不到值 / 非 Windows / 任何异常** → **"zh"**：保持老用户（中文环境）行为不变。
     """
     try:
         langid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
         primary = int(langid) & 0x3FF
     except Exception:  # noqa: BLE001 — 非 Windows / 任何意外都按 zh
         return "zh"
-    return "zh" if primary == 0x04 else "en"
+    return _PRIMARY_LANG.get(primary, "en")
 
 
 def set_language(code: str | None) -> None:

@@ -1,6 +1,6 @@
 """独立复核线上 Release 附件（不依赖 CI 的自检结论）。
 
-用法：.venv/Scripts/python.exe scripts/verify_release.py v0.1.0 "打字"
+用法：.venv/Scripts/python.exe scripts/verify_release.py v0.1.1 "chatbox 只发"
 
 第二个参数 = 本版新增功能里必定出现的字符串（默认「俄语」）。判据是「在解包出来的
 字节码里搜得到」——不是搜 exe 原始字节（那是压缩过的 PYZ，永远搜不到）。

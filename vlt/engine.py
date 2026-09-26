@@ -25,6 +25,9 @@ from .output.merger import Merger
 from .output.overlay import OverlayConfig, WristOverlay
 from .output.virtualmic import VirtualMic, pick_output_device, resample_24k_mono_to_48k_stereo
 from .session.base import SessionConfig, TextDelta, create_session
+from .textin import DEFAULT_MODEL as DEFAULT_TEXT_MODEL
+from .textin import DEFAULT_TIMEOUT_S as DEFAULT_TEXT_TIMEOUT_S
+from .textin import TextTranslateError, split_for_chatbox, translate_text
 
 ROOT = Path(__file__).resolve().parent.parent
 CHUNK_BYTES = 3200          # 100ms @16kHz s16le mono
@@ -538,6 +541,55 @@ class Engine:
 
     def _on_usage(self, u: dict) -> None:
         self._events.on_stats({k: v for k, v in u.items() if isinstance(v, int)})
+
+    # ---------------------------------------------------------------- 打字输入
+
+    def send_text(self, text: str) -> bool:
+        """打字替代说话：翻译后当作「我说的一句终版」送进本引擎的输出面。
+
+        线程安全（界面线程直接调用）；空文本 / 引擎没在跑 / 方向不是「我说」→ False。
+        """
+        text = (text or "").strip()
+        if not text or self._loop is None or not self.running:
+            return False
+        if self._direction != "mine":
+            # 打字替代的是**麦克风**，只对「我说」方向有意义；「别人说」那条腿的
+            # 目标语言是用户自己的母语，把打字内容塞进去等于自己跟自己翻译。
+            return False
+        asyncio.run_coroutine_threadsafe(self._async_send_text(text), self._loop)
+        return True
+
+    async def _async_send_text(self, text: str) -> None:
+        d = self._cfg.directions.get(self._direction) or Direction()
+        tcfg = self._cfg.text_input or {}
+        try:
+            translated = await asyncio.to_thread(
+                translate_text, text,
+                target_lang=d.target_lang or "en",
+                source_lang=d.source_lang,
+                model=str(tcfg.get("model") or DEFAULT_TEXT_MODEL),
+                api_key=str(self._cfg.session_base.get("api_key") or ""),
+                timeout=float(tcfg.get("timeout_s", DEFAULT_TEXT_TIMEOUT_S)),
+            )
+        except TextTranslateError as exc:
+            self._events.on_status("error", f"打字翻译失败：{exc}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._events.on_status("error", f"打字翻译异常：{type(exc).__name__}: {exc}")
+            return
+
+        # 下游与说话**完全一致**：界面气泡 + 手腕屏。唯一区别在 chatbox：
+        # 说话是流式增量，超长时保留最新 144 字（越新越重要）；打字是一整句，
+        # 截尾会吃掉开头、看着像翻译坏了 → 按上限切成多条依次发（受漏桶约束时
+        # Chatbox 会把最终版排队补发，不会丢）。
+        self._events.on_text(text, translated, True)
+        if self._overlay is not None:
+            self._overlay.update(translated, text)
+        if self._chatbox is not None and "chatbox" in self._sinks:
+            limit = int((self._cfg.chatbox or {}).get("max_chars", 144))
+            for chunk in split_for_chatbox(translated, limit):
+                self._chatbox.send(chunk, True)
+        self._events.on_status("info", f"打字已送出（{len(text)} 字 → {d.target_lang}）")
 
     # ---------------------------------------------------------------- 断线自愈
 

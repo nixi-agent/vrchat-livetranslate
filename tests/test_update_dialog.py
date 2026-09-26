@@ -26,6 +26,12 @@ os.environ.setdefault("DASHSCOPE_API_KEY", "sk" + "-ws-" + "updguitest0123456789
 ROOT = Path(__file__).resolve().parents[1]          # 不写死本机路径：CI / 别人克隆后也能跑
 sys.path.insert(0, str(ROOT))
 
+# 这些用例断言的是中文界面文案（「发现新版本」「立即更新」「下次再说」等按钮/标题）。
+# 界面语言会跟随系统语言（CI 与外国机器是英文系统）→ 必须钉死，
+# 否则同一份代码在不同机器上结果不同。产品代码不依赖这个补丁。
+import vlt.i18n as _i18n  # noqa: E402
+_i18n.detect_system_language = lambda: "zh"
+
 import vlt.gui as vlt_gui                            # noqa: E402
 from vlt import __version__                          # noqa: E402
 from vlt import update_check as uc                   # noqa: E402

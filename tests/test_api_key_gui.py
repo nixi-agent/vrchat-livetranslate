@@ -26,6 +26,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+# 这些用例断言的是中文界面文案（如「⚠ 未配置」「还没配置 API key」）。
+# 界面语言会跟随系统语言（CI 与外国机器是英文系统）→ 必须钉死，
+# 否则同一份代码在不同机器上结果不同。产品代码不依赖这个补丁。
+import vlt.i18n as _i18n  # noqa: E402
+_i18n.detect_system_language = lambda: "zh"
+
 # 假 key 刻意用拼接构造：一是别被 pre-commit 的凭据扫描误判（它按 API key 前缀匹配），
 # 二是明确告诉后来者这不是真凭据。
 FAKE_KEY = "sk" + "-ws-" + "testonly0123456789abcdef0123456789"

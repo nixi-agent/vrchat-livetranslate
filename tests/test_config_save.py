@@ -20,6 +20,13 @@ os.environ.setdefault("DASHSCOPE_API_KEY", "sk" + "-ws-" + "cfgtestonly012345678
 
 ROOT = Path(__file__).resolve().parents[1]          # 不写死本机路径：CI / 别人克隆后也能跑
 sys.path.insert(0, str(ROOT))
+
+# 这个用例用中文下拉标签操作控件（`gui._anchor_combo.set("前臂 tracker")`）。
+# 界面语言会跟随系统语言（CI 与外国机器是英文系统）→ 必须钉死，
+# 否则同一份代码在不同机器上结果不同。产品代码不依赖这个补丁。
+import vlt.i18n as _i18n  # noqa: E402
+_i18n.detect_system_language = lambda: "zh"
+
 CONFIG = ROOT / "config.yaml"
 BACKUP = ROOT / "out" / "cfg_backup.yaml"
 

@@ -19,7 +19,7 @@ if "%DASHSCOPE_API_KEY%"=="" (
 )
 
 echo 目标语言在 config.yaml 的 directions.mine.target_lang 里改（默认 en）
-echo 麦克风设备用 --mic-device 指定名称子串，先跑 --list-devices 看列表
+echo Mic device: set capture.mic_device in config.yaml (or use the GUI settings dialog). Use --list-devices to see available devices
 echo.
 .venv\Scripts\python.exe -m vlt.app --direction mine --mic --sink chatbox --list-devices
 echo.

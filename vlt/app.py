@@ -105,14 +105,6 @@ async def run(args: argparse.Namespace) -> int:
         audio_device=args.audio_device or None,
     )
 
-    if args.log_events and engine is not None:
-        orig_on_text = events.on_text
-
-        def _log_text(src, txt, final):
-            orig_on_text(src, txt, final)
-
-        events.on_text = _log_text
-
     engine.start()
 
     try:
@@ -144,14 +136,9 @@ def main() -> int:
     ap.add_argument("--direction", default="mine", help="config.yaml 里 directions 的 key")
     ap.add_argument("--pcm", default=None, help="16kHz 单声道 s16le PCM 文件（测试用）")
     ap.add_argument("--mic", action="store_true", help="用麦克风实时采集")
-    ap.add_argument("--mic-device", default=None,
-                    help="输入设备名称子串（如 'realtek' / 'usb'）；不填用系统默认。用 --list-devices 查")
     ap.add_argument("--list-devices", action="store_true", help="列出音频输入/输出设备后退出")
     ap.add_argument("--loopback", action="store_true",
                     help="采集 VRChat 播放输出（= 听别人说话）；配合 --sink overlay 就是手腕屏那条腿")
-    ap.add_argument("--loopback-device", default=None, nargs="*",
-                    help="loopback 设备名称子串回退链，默认 steam streaming speakers → vive virtual → cable input")
-    ap.add_argument("--seconds", type=float, default=0.0, help="麦克风采集时长；0 = 一直跑到 Ctrl+C（默认）")
     ap.add_argument("--no-realtime", action="store_true", help="尽快灌入 PCM（不做实时节流）")
     ap.add_argument("--settle-s", type=float, default=8.0, help="音频推完后等待响应的秒数")
     ap.add_argument("--dry-run", action="store_true", help="不真发 OSC，只打印与落报文")
@@ -163,7 +150,6 @@ def main() -> int:
                     help="开启译音输出（模型译音 → 虚拟声卡）。覆盖 config.yaml 的 output.audio.enabled")
     ap.add_argument("--audio-device", default=None, nargs="*",
                     help="虚拟声卡设备名称回退链；不填用 config.yaml 里的默认值")
-    ap.add_argument("--log-events", action="store_true", help="把每个服务端事件类型写进埋点（调试用）")
     ap.add_argument("--config", default=None)
     args = ap.parse_args()
     if args.list_devices:

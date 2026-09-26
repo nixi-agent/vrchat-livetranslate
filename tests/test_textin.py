@@ -13,9 +13,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
+import math
+import struct
 import sys
+import wave
 from pathlib import Path
 from urllib.error import HTTPError
 
@@ -23,8 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import vlt.engine as engine_mod
 import vlt.textin as textin
+import vlt.tts as tts_mod
 from vlt.config import AppConfig, Direction
 from vlt.engine import Engine, EngineEvents
+from vlt.output.virtualmic import resample_24k_mono_to_48k_stereo
 
 
 # ---------------------------------------------------------------- 测试替身
@@ -85,13 +91,40 @@ class FakeEngine:
         return self.ok
 
 
-def _mk_engine(direction: str = "mine") -> Engine:
+class FakeVirtualMic:
+    """只记录推进来的音频，不碰真声卡。"""
+
+    def __init__(self) -> None:
+        self.pushed: list[bytes] = []
+        self.sentences = 0
+
+    def push(self, pcm_48k_stereo: bytes) -> None:
+        self.pushed.append(pcm_48k_stereo)
+
+    def end_sentence(self) -> None:
+        self.sentences += 1
+
+
+def _wav24k(seconds: float = 0.5) -> bytes:
+    """造一段 24kHz 单声道 s16le WAV —— TTS 帮我们返回的就是这个形态。"""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        n = int(24000 * seconds)
+        w.writeframes(b"".join(
+            struct.pack("<h", int(3000 * math.sin(2 * math.pi * 440 * i / 24000))) for i in range(n)))
+    return buf.getvalue()
+
+
+def _mk_engine(direction: str = "mine", tts: dict | None = None) -> Engine:
     cfg = AppConfig(
         session_base={"api_key": "sk-test", "model": "qwen3.8-livetranslate-flash-realtime"},
         directions={"mine": Direction(source_lang="zh", target_lang="en")},
         chatbox={"max_chars": 144},
         merger={},
-        text_input={"model": "qwen-mt-flash", "timeout_s": 5},
+        text_input={"model": "qwen-mt-flash", "timeout_s": 5, "tts": tts if tts is not None else {}},
     )
     return Engine(cfg=cfg, direction=direction, source="mic", sinks={"chatbox"},
                   events=EngineEvents(), dry_run=True)
@@ -342,6 +375,178 @@ def test_gui_wiring() -> bool:
     return ok
 
 
+# ---------------------------------------------------------------- 5) 打字也要出声（TTS）
+
+
+class FakeBinResp:
+    def __init__(self, data: bytes) -> None:
+        self._buf = io.BytesIO(data)
+
+    def read(self) -> bytes:
+        return self._buf.read()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class FakeTtsOpener:
+    """按 URL 分流：服务端 JSON 一个响应，音频 URL 另一个（原始字节）。"""
+
+    def __init__(self, json_body: str, audio: bytes) -> None:
+        self.json_body, self.audio, self.calls = json_body, audio, []
+
+    def open(self, req, timeout=None):  # noqa: ANN001
+        url = getattr(req, "full_url", "")
+        self.calls.append(url)
+        return FakeResp(self.json_body) if url == tts_mod.ENDPOINT else FakeBinResp(self.audio)
+
+
+def test_tts_payload_and_decode() -> bool:
+    ok = True
+    wav = _wav24k(0.5)
+
+    # base64（默认路径）：一次请求拿到音频并解成 24k 单声道 s16le
+    body = json.dumps({"output": {"audio": {"data": base64.b64encode(wav).decode()}}})
+    f = FakeOpener(body)
+    tts_mod._opener = f
+    pcm = tts_mod.synthesize("Hello there", api_key="sk-x", language="en")
+    payload = json.loads(f.req.data.decode("utf-8"))
+    want = 12000 * 2                                    # 0.5s @24kHz 单声道 s16
+    cond = (abs(len(pcm) - want) <= 2
+            and payload["model"] == tts_mod.DEFAULT_MODEL
+            and payload["input"]["text"] == "Hello there"
+            and payload["input"]["voice"] == tts_mod.DEFAULT_VOICE
+            and payload["input"]["language_type"] == "English")
+    print(f"  base64 路径：{len(pcm)}B（期望≈{want}）model={payload['model']} "
+          f"voice={payload['input']['voice']} lang={payload['input'].get('language_type')}  "
+          f"{'OK' if cond else '✗'}")
+    ok &= cond
+
+    # 语言码拿不准 → 不传 language_type（别让服务端收到垃圾值）
+    f = FakeOpener(body)
+    tts_mod._opener = f
+    tts_mod.synthesize("hi", api_key="sk-x", language=None)
+    inp = json.loads(f.req.data.decode("utf-8"))["input"]
+    cond = "language_type" not in inp
+    print(f"  未给语言码：input={inp}  {'OK' if cond else '✗'}")
+    ok &= cond
+
+    # url 形态（服务端只给 url 时）→ 二次下载再解码
+    f2 = FakeTtsOpener(json.dumps({"output": {"audio": {"url": "https://example.invalid/a.wav"}}}), wav)
+    tts_mod._opener = f2
+    pcm2 = tts_mod.synthesize("Hello there", api_key="sk-x", language="en")
+    cond = abs(len(pcm2) - want) <= 2 and len(f2.calls) == 2
+    print(f"  url 路径：{len(pcm2)}B，请求 {len(f2.calls)} 次（服务端+下载）  "
+          f"{'OK' if cond else '✗'}")
+    ok &= cond
+    return ok
+
+
+def test_tts_errors() -> bool:
+    ok = True
+    body = json.dumps({"output": {"audio": {"data": base64.b64encode(_wav24k(0.1)).decode()}}})
+
+    textin._opener = textin._opener              # 保持 textin 的桩不变
+    tts_mod._opener = FakeOpener(body)
+    try:
+        tts_mod.synthesize("hi", api_key="")
+        print("  缺 key：没有报错  ✗")
+        ok = False
+    except tts_mod.TtsError as exc:
+        print(f"  缺 key：{exc}  OK")
+
+    err = HTTPError(tts_mod.ENDPOINT, 400, "Bad Request", {},
+                    io.BytesIO(b'{"error":{"message":"InvalidParameter"}}'))
+    tts_mod._opener = FakeOpener(err=err)
+    try:
+        tts_mod.synthesize("hi", api_key="sk-x")
+        print("  HTTP 400：没有报错  ✗")
+        ok = False
+    except tts_mod.TtsError as exc:
+        cond = "400" in str(exc) and "InvalidParameter" in str(exc)
+        print(f"  HTTP 400：{str(exc)[:70]}  {'OK' if cond else '✗'}")
+        ok &= cond
+
+    tts_mod._opener = FakeOpener('{"output": {}}')
+    try:
+        tts_mod.synthesize("hi", api_key="sk-x")
+        print("  无音频字段：没有报错  ✗")
+        ok = False
+    except tts_mod.TtsError as exc:
+        cond = "没返回音频" in str(exc)
+        print(f"  无音频字段：{exc}  {'OK' if cond else '✗'}")
+        ok &= cond
+
+    tts_mod._opener = FakeOpener('{"error":{"message":"boom"}}')
+    try:
+        tts_mod.synthesize("hi", api_key="sk-x")
+        print("  错误外壳：没有报错  ✗")
+        ok = False
+    except tts_mod.TtsError as exc:
+        cond = "boom" in str(exc)
+        print(f"  错误外壳：{exc}  {'OK' if cond else '✗'}")
+        ok &= cond
+    return ok
+
+
+def test_engine_tts() -> bool:
+    """打字音频必须进**同一个**虚拟麦实例，且没开译音时不白花钱。"""
+    ok = True
+    real_t, real_s = engine_mod.translate_text, engine_mod.synthesize
+    pcm24 = b"\x01\x00" * 2400                       # 0.1s @24k 单声道
+    engine_mod.translate_text = lambda text, **kw: "Hello from typing"
+    engine_mod.synthesize = lambda text, **kw: pcm24
+    try:
+        # ① 译音腿在 → 推进虚拟麦（48k 立体声，字节数 = 4×）+ 封句尾
+        eng = _mk_engine()
+        vm, st = FakeVirtualMic(), []
+        eng._virtualmic, eng._chatbox = vm, FakeChatbox()
+        eng._events = EngineEvents(on_status=lambda l, m: st.append((l, m)))
+        asyncio.run(eng._async_send_text("你好"))
+        cond = (len(vm.pushed) == 1 and len(vm.pushed[0]) == len(pcm24) * 4
+                and vm.pushed[0] == resample_24k_mono_to_48k_stereo(pcm24)
+                and vm.sentences == 1 and any("已出声" in m for _l, m in st))
+        print(f"  译音腿在：推入 {len(vm.pushed)} 段（{len(vm.pushed[0]) if vm.pushed else 0}B），"
+              f"封句 {vm.sentences} 次，状态={[m for _l, m in st][-1:] }  {'OK' if cond else '✗'}")
+        ok &= cond
+
+        # ② 译音腿没开 → 不合成（不能白花钱）
+        called: list[str] = []
+        engine_mod.synthesize = lambda text, **kw: (called.append(text), pcm24)[1]
+        eng2 = _mk_engine()
+        eng2._virtualmic, eng2._chatbox = None, FakeChatbox()
+        asyncio.run(eng2._async_send_text("你好"))
+        cond = called == []
+        print(f"  译音腿关：合成调用={len(called)} 次  {'OK' if cond else '✗'}")
+        ok &= cond
+
+        # ③ 配置里显式关掉 tts → 同样不合成
+        eng3 = _mk_engine(tts={"enabled": False})
+        eng3._virtualmic, eng3._chatbox = FakeVirtualMic(), FakeChatbox()
+        asyncio.run(eng3._async_send_text("你好"))
+        cond = called == []
+        print(f"  tts.enabled=false：合成调用={len(called)} 次  {'OK' if cond else '✗'}")
+        ok &= cond
+
+        # ④ 合成失败 → 只 warn，文字照常出去（绝不能因为出声失败把整条打字打死）
+        engine_mod.synthesize = lambda text, **kw: (_ for _ in ()).throw(
+            tts_mod.TtsError("模拟 TTS 失败"))
+        eng4 = _mk_engine()
+        cb4, st4 = FakeChatbox(), []
+        eng4._virtualmic, eng4._chatbox = FakeVirtualMic(), cb4
+        eng4._events = EngineEvents(on_status=lambda l, m: st4.append((l, m)))
+        asyncio.run(eng4._async_send_text("你好"))
+        cond = (bool(cb4.sent) and any(l == "warn" and "打字译音失败" in m for l, m in st4))
+        print(f"  合成失败：chatbox={len(cb4.sent)} 条，状态={st4}  {'OK' if cond else '✗'}")
+        ok &= cond
+    finally:
+        engine_mod.translate_text, engine_mod.synthesize = real_t, real_s
+    return ok
+
+
 def main() -> int:
     print("test_textin:")
     results = [
@@ -350,6 +555,9 @@ def main() -> int:
         ("超长切分", test_split()),
         ("引擎下游", test_engine_downstream()),
         ("界面接线", test_gui_wiring()),
+        ("TTS 请求体/解码", test_tts_payload_and_decode()),
+        ("TTS 错误路径", test_tts_errors()),
+        ("引擎出声路由", test_engine_tts()),
     ]
     bad = [name for name, ok in results if not ok]
     print("ALL PASSED" if not bad else f"FAILED: {', '.join(bad)}")

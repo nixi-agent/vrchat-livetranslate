@@ -119,6 +119,14 @@ text_input:
   # 会原样回吐（中文进、中文出；换个句子又正常），行为不可依赖。
   model: qwen-mt-flash
   timeout_s: 20              # 单次翻译超时（秒）
+  # 打字也要出声（进虚拟声卡 → VRChat 麦克风 → 对方能听到）
+  # 生效条件：上面「输出」里勾了「译音输出」（或 output.audio.enabled=true）且方向含「我说」。
+  # 没开译音时这一步自动跳过，只出文字。
+  tts:
+    enabled: true
+    model: qwen3-tts-flash   # 也可换 qwen3-tts-instruct-flash
+    voice: Cherry            # 多语言音色（中/英/日实测都能读）
+    timeout_s: 30
 
 # 界面（图形界面上次的选择，**启动时自动恢复**；手改也有效）
 ui:

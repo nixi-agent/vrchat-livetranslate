@@ -209,5 +209,12 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
             # （中文进中文出，换个句子又正常），不能依赖；mt 系列稳定且能自动识别源语言。
             "model": str(raw_textin.get("model") or "qwen-mt-flash"),
             "timeout_s": float(raw_textin.get("timeout_s", 20.0)),
+            # 打字也要出声：文本翻译不回音频，这一步单独用 TTS 合成后喂虚拟声卡
+            "tts": {
+                "enabled": bool((raw_textin.get("tts") or {}).get("enabled", True)),
+                "model": str((raw_textin.get("tts") or {}).get("model") or "qwen3-tts-flash"),
+                "voice": str((raw_textin.get("tts") or {}).get("voice") or "Cherry"),
+                "timeout_s": float((raw_textin.get("tts") or {}).get("timeout_s", 30.0)),
+            },
         },
     )

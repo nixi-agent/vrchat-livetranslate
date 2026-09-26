@@ -23,6 +23,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 import yaml
 
 from . import __version__
+from .config_io import _fmt_scalar, _write_config_text, _yaml_set_in_text
 from .paths import is_frozen
 
 RELEASES_LATEST_API = "https://api.github.com/repos/nixi-agent/vrchat-livetranslate/releases/latest"
@@ -154,96 +155,8 @@ def fetch_latest_release(timeout: float = DEFAULT_TIMEOUT_S) -> ReleaseInfo:
 
 # ---------------------------------------------------------------- 忽略列表读写
 #
-# 以下三个 YAML 就地改写函数与 vlt/gui.py 的同名函数**同源复制**。
-# 为什么不 import gui：gui 的 import 链会拉起 tkinter / devices / engine，
-# 本模块必须保持纯逻辑、离线可测；而本轮又不允许改 gui.py —— 把这三个函数抽进
-# 共用模块 config_io 是下一轮 GUI 接线时的前置重构（见实施计划 Task 3）。
-# 唯一有意差异：这里的 _fmt_scalar 多了 list → flow-style 分支（忽略列表要用）；
-# 下一轮抽共用模块时以这份为准。在那之前改动这里请同步 gui.py，别让两份跑偏。
-
-
-def _yaml_set_in_text(text: str, path: list[str], value: str) -> str:
-    """在 YAML 文本里**就地**改一个叶子值，保留注释、空行与键的顺序。
-
-    为什么不用 `yaml.safe_load` + `yaml.dump` 整文件重写：那会抹平所有注释和顺序
-    （实测把一份带完整中文说明的 config.yaml 变成一坨没有注释的键值对，键还被按字母重排）。
-    配置文件是给人读的，程序存个设置不该毁掉它的可读性。
-    找不到路径就返回原文——宁可这次没生效，也不退化成整文件重写。
-    """
-    lines = text.split("\n")
-
-    def _span(key: str, indent: int, lo: int, hi: int):
-        head = re.compile(rf"^(\s*){re.escape(key)}:\s*$")
-        for i in range(lo, hi):
-            m = head.match(lines[i])
-            if m is None or len(m.group(1)) != indent:
-                continue
-            sub_hi = hi
-            for j in range(i + 1, hi):
-                if lines[j].strip() and not lines[j].startswith(" " * (indent + 1)):
-                    sub_hi = j
-                    break
-            return i, sub_hi
-        return None
-
-    lo, hi, indent = 0, len(lines), 0
-    for key in path[:-1]:
-        got = _span(key, indent, lo, hi)
-        if got is None:
-            return text
-        lo, hi = got[0] + 1, got[1]
-        indent += 2
-
-    leaf = path[-1]
-    pat = re.compile(rf"^(\s*){re.escape(leaf)}:(\s*)([^#\n]*)(\s*#.*)?$")
-    for i in range(lo, hi):
-        m = pat.match(lines[i])
-        if m and len(m.group(1)) == indent:
-            comment = (m.group(4) or "").strip()
-            new_line = f"{m.group(1)}{leaf}: {value}" + (f"   {comment}" if comment else "")
-            # ⚠️ 关键：如果这一项的旧值是**多行块**（块序列 / 嵌套映射），必须把子行一并删掉，
-            # 否则会留下孤立的 `- 0.0` 之类 → 整个文件变成非法 YAML。
-            j = i + 1
-            while j < hi and lines[j].strip():
-                stripped = lines[j].lstrip()
-                ind_j = len(lines[j]) - len(stripped)
-                # 更深的缩进 = 属于本键的块；同级但以 "- " 开头 = 块序列（PyYAML 默认就不缩进）
-                if ind_j > indent or (ind_j == indent and stripped.startswith("- ")):
-                    j += 1
-                    continue
-                break
-            del lines[i + 1:j]
-            lines[i] = new_line
-            return "\n".join(lines)
-    lines.insert(hi, f"{' ' * indent}{leaf}: {value}")
-    return "\n".join(lines)
-
-
-def _write_config_text(path: Path, text: str) -> None:
-    """写回配置前先验证仍是合法 YAML。
-
-    宁可这次改动不生效（调用方会 catch 并打印），也**绝不能把用户的配置写坏** ——
-    配置坏了影响的是启动，比一个滑块没生效严重得多。
-    """
-    try:
-        yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise RuntimeError(f"生成的新配置不是合法 YAML，已放弃写入：{exc}") from exc
-    path.write_text(text, encoding="utf-8")
-
-
-def _fmt_scalar(x) -> str:  # noqa: ANN001, ANN202
-    """None → null；float → 紧凑写法（0.24 而不是 0.24000000000000002）；
-    list/tuple → 行内流式 `[a, b]`（较 gui.py 版本新增的分支，写忽略列表要用）。"""
-    if x is None:
-        return "null"
-    if isinstance(x, bool):
-        return "true" if x else "false"
-    if isinstance(x, float):
-        return f"{x:g}"
-    if isinstance(x, (list, tuple)):
-        return "[" + ", ".join(_fmt_scalar(i) for i in x) + "]"
-    return str(x)
+# 就地改写保注释的三个工具函数（_yaml_set_in_text / _write_config_text / _fmt_scalar）
+# 住在 vlt/config_io.py —— gui.py 与本模块的单一真相，别在这儿再抄一份。
 
 
 def load_ignored_versions(config_path: Path) -> list[str]:

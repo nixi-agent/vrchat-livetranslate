@@ -8,9 +8,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import queue
 import re
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -18,13 +20,14 @@ import webbrowser
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
 import yaml
 
+from . import __version__, crashlog, update_check
 from .config import Direction, DEFAULT_CONFIG, load_config
+from .config_io import _fmt_scalar, _write_config_text, _yaml_set_in_text
 from .output.overlay import OverlayConfig, WristOverlay
-from . import crashlog
 from .devices import (
     DeviceInfo,
     enumerate_audio_out_devices,
@@ -137,90 +140,23 @@ class _Bubble:
     items: list = field(default_factory=list)
 
 
-def _yaml_set_in_text(text: str, path: list[str], value: str) -> str:
-    """在 YAML 文本里**就地**改一个叶子值，保留注释、空行与键的顺序。
-
-    为什么不用 `yaml.safe_load` + `yaml.dump` 整文件重写：那会抹平所有注释和顺序
-    （实测把一份带完整中文说明的 config.yaml 变成一坨没有注释的键值对，键还被按字母重排）。
-    配置文件是给人读的，程序存个设置不该毁掉它的可读性。
-    找不到路径就返回原文——宁可这次没生效，也不退化成整文件重写。
-    """
-    lines = text.split("\n")
-
-    def _span(key: str, indent: int, lo: int, hi: int):
-        head = re.compile(rf"^(\s*){re.escape(key)}:\s*$")
-        for i in range(lo, hi):
-            m = head.match(lines[i])
-            if m is None or len(m.group(1)) != indent:
-                continue
-            sub_hi = hi
-            for j in range(i + 1, hi):
-                if lines[j].strip() and not lines[j].startswith(" " * (indent + 1)):
-                    sub_hi = j
-                    break
-            return i, sub_hi
-        return None
-
-    lo, hi, indent = 0, len(lines), 0
-    for key in path[:-1]:
-        got = _span(key, indent, lo, hi)
-        if got is None:
-            return text
-        lo, hi = got[0] + 1, got[1]
-        indent += 2
-
-    leaf = path[-1]
-    pat = re.compile(rf"^(\s*){re.escape(leaf)}:(\s*)([^#\n]*)(\s*#.*)?$")
-    for i in range(lo, hi):
-        m = pat.match(lines[i])
-        if m and len(m.group(1)) == indent:
-            comment = (m.group(4) or "").strip()
-            new_line = f"{m.group(1)}{leaf}: {value}" + (f"   {comment}" if comment else "")
-            # ⚠️ 关键：如果这一项的旧值是**多行块**（块序列 / 嵌套映射），必须把子行一并删掉，
-            # 否则会留下孤立的 `- 0.0` 之类 → 整个文件变成非法 YAML。
-            # 用户实测踩过：旧版整文件 yaml.dump 会把 `pos: [0.0, 0.06, 0.02]` 写成
-            #    pos:
-            #    - 0.0
-            #  而本函数当时只换了 `pos:` 那一行，热重载就报
-            #  `expected <block end>, but found '-'`，界面上拖滑块完全没效果。
-            j = i + 1
-            while j < hi and lines[j].strip():
-                stripped = lines[j].lstrip()
-                ind_j = len(lines[j]) - len(stripped)
-                # 更深的缩进 = 属于本键的块；同级但以 "- " 开头 = 块序列（PyYAML 默认就不缩进）
-                if ind_j > indent or (ind_j == indent and stripped.startswith("- ")):
-                    j += 1
-                    continue
-                break
-            del lines[i + 1:j]
-            lines[i] = new_line
-            return "\n".join(lines)
-    lines.insert(hi, f"{' ' * indent}{leaf}: {value}")
-    return "\n".join(lines)
+class _DownloadCancelled(Exception):
+    """用户关窗取消下载：progress 回调在下载线程里抛出它，download_and_verify
+    会在自己的 except 里清掉残留 .new 再原样上抛 —— 取消路径不需要额外清理。"""
 
 
-def _write_config_text(path: Path, text: str) -> None:
-    """写回配置前先验证仍是合法 YAML。
-
-    宁可这次改动不生效（调用方会 catch 并打印），也**绝不能把用户的配置写坏** ——
-    配置坏了影响的是启动，比一个滑块没生效严重得多。
-    """
+def _dir_writable(d: Path) -> bool:
+    """目录可写性探测：真的建一个临时文件再删掉（光猜权限位在 Windows 上不可靠）。"""
     try:
-        yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise RuntimeError(f"生成的新配置不是合法 YAML，已放弃写入：{exc}") from exc
-    path.write_text(text, encoding="utf-8")
-
-
-def _fmt_scalar(x) -> str:  # noqa: ANN001
-    """None → null；float → 紧凑写法（0.24 而不是 0.24000000000000002）。"""
-    if x is None:
-        return "null"
-    if isinstance(x, bool):
-        return "true" if x else "false"
-    if isinstance(x, float):
-        return f"{x:g}"
-    return str(x)
+        fd, name = tempfile.mkstemp(dir=d, prefix=".upd_write_probe_")
+    except OSError:
+        return False
+    try:
+        os.close(fd)
+        Path(name).unlink()
+    except OSError:
+        pass
+    return True
 
 
 class TranslationGUI:
@@ -249,6 +185,28 @@ class TranslationGUI:
         self._sponsor_win: tk.Toplevel | None = None
         self._sponsor_imgs: list = []          # PhotoImage 必须留引用，否则被 GC 后变空白
         self._sponsor_qr_labels: list = []     # 两张收款码对应的 Label（测试要验证）
+
+        # 更新检查（启动自动查一次 + 设置里手动查；全程守护线程，绝不阻塞翻译主流程）
+        self._update_check_done = False        # 启动自动检查：一次会话只查一次
+        self._update_check_running = False     # 防连点：进行中再点直接忽略
+        self._update_snoozed = False           # 「下次再说」：本会话不再自动弹（不落盘）
+        self._update_win: tk.Toplevel | None = None
+        self._update_check_job: str | None = None
+        # 可注入点：测试换成假检查器/假下载器，全程零网络
+        self._update_checker = update_check.check_for_updates
+        self._update_downloader = update_check.download_and_verify
+        # 下载进度窗（懒建懒销毁；控件引用在窗销毁时一并清空）
+        self._dl_win: tk.Toplevel | None = None
+        self._dl_bar: ttk.Progressbar | None = None
+        self._dl_text: ttk.Label | None = None
+        self._dl_note: ttk.Label | None = None
+        self._dl_btn_frame: ttk.Frame | None = None
+        self._dl_info: update_check.ReleaseInfo | None = None
+        self._dl_new_exe: Path | None = None
+        self._dl_cancel: threading.Event | None = None
+        self._dl_downloading = False
+        self._dl_throttle_s = 0.1              # 进度回调节流：至多每 100ms 塞一条队列
+        self._dl_last_push = 0.0
 
         # 设备选择
         self._mic_names: list[str] = []
@@ -297,6 +255,8 @@ class TranslationGUI:
         self._check_api_key()
         self._poll()
         self._start_device_scan()
+        # 启动 3 秒后在守护线程里查一次更新（结果经 self._q 回主线程，绝不阻塞启动/翻译）
+        self._update_check_job = self._root.after(3000, self._schedule_update_check)
 
     # ================================================================ 主题
 
@@ -811,6 +771,20 @@ class TranslationGUI:
         self._log_info.pack(anchor=tk.W, pady=(6, 0))
         self._refresh_log_info()
 
+        # ---- 软件更新 ----
+        ttk.Separator(body).pack(fill=tk.X, pady=(14, 10))
+        upd_head = ttk.Frame(body)
+        upd_head.pack(fill=tk.X)
+        ttk.Label(upd_head, text="软件更新", style="Section.TLabel").pack(side=tk.LEFT)
+        self._update_check_btn = ttk.Button(
+            upd_head, text="检查更新",
+            command=lambda: self._schedule_update_check(manual=True))
+        self._update_check_btn.pack(side=tk.RIGHT)
+        self._update_info = ttk.Label(
+            body, text=f"当前版本 v{__version__} · 启动时会自动检查一次",
+            style="Muted.TLabel", justify=tk.LEFT)
+        self._update_info.pack(anchor=tk.W, pady=(6, 0))
+
     def _log_dir(self) -> Path:
         from .crashlog import _LOG_PATH      # noqa: SLF001  （跟着实际日志走）
 
@@ -1004,6 +978,375 @@ class TranslationGUI:
                 win.destroy()
             except Exception:  # noqa: BLE001
                 pass
+
+    # ---------------------------------------------------------------- 更新检查（启动自动 + 设置里手动）
+    def _schedule_update_check(self, manual: bool = False) -> None:
+        """后台线程检查更新。manual=False=启动自动检查（一次会话一次）；
+        manual=True=设置弹窗里点的（不受一次限制，但防连点：进行中再点直接返回）。
+        headless 自检模式直接跳过（不起网络线程）。"""
+        if self._headless or self._update_check_running:
+            return
+        if not manual:
+            if self._update_check_done:
+                return
+            self._update_check_done = True
+        self._update_check_running = True
+        if manual and hasattr(self, "_update_check_btn"):
+            self._update_check_btn.state(["disabled"])
+            self._update_check_btn.configure(text="检查中…")
+            self._update_info.configure(text="正在检查更新…")
+        threading.Thread(target=self._run_update_check, args=(manual,), daemon=True).start()
+
+    def _run_update_check(self, manual: bool) -> None:
+        """工作线程体：调 check_for_updates，结果塞 self._q 回主线程。
+        顶层 except 吞掉一切并留 [update] 日志 —— 检查更新绝不允许影响翻译主流程。"""
+        err = None
+        try:
+            status, info = self._update_checker(__version__, DEFAULT_CONFIG)
+        except Exception as exc:  # noqa: BLE001 — 失败只留痕，绝不甩给启动/翻译流程
+            status, info = "error", None
+            err = f"{type(exc).__name__}: {exc}"
+            print(f"[update] 检查失败：{err}", flush=True)
+        self._q.put(("update_check", status, info, manual, err))
+
+    def _on_update_check_result(self, status: str, info, manual: bool, err: str | None) -> None:
+        """主线程（_poll 分支）：有更新 → 弹三按钮窗；其余只留痕/更新设置区标签，不弹窗。"""
+        self._update_check_running = False
+        if hasattr(self, "_update_check_btn"):
+            self._update_check_btn.state(["!disabled"])
+            self._update_check_btn.configure(text="检查更新")
+        if status == "update" and info is not None:
+            # GUI 入口复核忽略列表（双保险：check_for_updates 判过一次，但测试/手动路径
+            # 可能绕过它直接给结果 —— 点过「不再提示这个版本」的，说什么也不再弹）
+            if info.version in update_check.load_ignored_versions(DEFAULT_CONFIG):
+                print(f"[update] v{info.version} 在忽略列表，跳过（不弹窗）", flush=True)
+                if manual:
+                    self._update_info.configure(
+                        text=f"v{info.version} 已设为「不再提示这个版本」")
+                return
+            if self._update_snoozed and not manual:
+                print("[update] 本会话已选「下次再说」，自动提示不再弹（设置里可手动检查）",
+                      flush=True)
+                return
+            self._show_update_dialog(info)
+            print("[update] 已弹出「发现新版本」提示窗", flush=True)
+            if manual:
+                self._update_info.configure(
+                    text=f"发现新版本 v{info.version}（当前 v{__version__}）")
+        elif status == "latest" and info is not None:
+            if manual:
+                self._update_info.configure(text=f"已是最新 v{info.version} ✅")
+        elif status == "ignored" and info is not None:
+            if manual:
+                self._update_info.configure(
+                    text=f"v{info.version} 已设为「不再提示这个版本」")
+        else:  # error：自动检查对用户完全无感（只留日志）；手动检查把原因显示在设置区
+            if manual:
+                reason = err or "原因见日志"
+                self._update_info.configure(
+                    text=f"检查失败：{reason}。可以点「检查更新」重试。")
+
+    # ---------------------------------------------------------------- 三按钮弹窗（发现新版本）
+    def _show_update_dialog(self, info) -> None:
+        """懒建 Toplevel（非模态：transient + lift，不 grab_set —— 翻译不能被卡住）。
+        文案逐字照抄计划「文案 checklist ①」。已存在弹窗时先销毁再建（防重复）。"""
+        self._close_update_dialog()
+        win = tk.Toplevel(self._root)
+        win.title("发现新版本")
+        win.configure(bg=PANEL)
+        win.transient(self._root)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self._on_update_later)   # 右上角 X = 下次再说
+        win.bind("<Escape>", lambda _e: self._on_update_later())
+        self._update_win = win
+
+        body = ttk.Frame(win, padding=(20, 16, 20, 14))
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text="发现新版本",
+                  font=("Microsoft YaHei UI", 12, "bold")).pack(anchor=tk.W)
+        ttk.Label(body,
+                  text="VRChat Live Translate 有新版本了。"
+                       "现在更新只要一两分钟，不影响你正在进行的翻译。",
+                  wraplength=380, justify=tk.LEFT).pack(anchor=tk.W, pady=(10, 0))
+        link = tk.Label(body, text="看看这次更新了什么", fg=ACCENT_HOVER, bg=PANEL,
+                        cursor="hand2", font=FONT_UI)
+        link.pack(anchor=tk.W, pady=(8, 0))
+        link.bind("<Button-1>", lambda _e: self._open_release_page(info.html_url))
+
+        btns = ttk.Frame(body)
+        btns.pack(fill=tk.X, pady=(16, 0))
+        now = ttk.Button(btns, text="立即更新", style="Accent.TButton",
+                         command=lambda: self._on_update_now(info))
+        now.pack(side=tk.LEFT)
+        ttk.Button(btns, text="下次再说",
+                   command=self._on_update_later).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="不再提示这个版本",
+                   command=lambda: self._on_update_ignore(info)).pack(side=tk.LEFT,
+                                                                       padx=(8, 0))
+        now.focus_set()                       # 默认按钮：回车/焦点都落在「立即更新」
+
+        win.update_idletasks()
+        rx, ry = self._root.winfo_x(), self._root.winfo_y()
+        rw = self._root.winfo_width()
+        win.geometry(f"+{rx + max((rw - win.winfo_reqwidth()) // 2, 20)}+{ry + 60}")
+        self._apply_dark_titlebar(win)
+        win.lift()
+
+    def _close_update_dialog(self) -> None:
+        win, self._update_win = self._update_win, None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _open_release_page(self, url: str) -> None:
+        """用默认浏览器打开 Release 页（「看看这次更新了什么」）；失败只留痕 + 状态栏提示。"""
+        try:
+            webbrowser.open(url)
+            print(f"[update] 已打开 Release 页面 {url}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[update] ⚠️ 打不开浏览器：{type(exc).__name__}: {exc}", flush=True)
+            self._set_status("warn", f"打不开浏览器，请手动访问 {url}")
+
+    def _on_update_ignore(self, info) -> None:
+        """「不再提示这个版本」→ 写 config.yaml 的 ui.update_ignored，关窗，该版本永不再提。"""
+        try:
+            update_check.add_ignored_version(DEFAULT_CONFIG, info.version)
+            print(f"[update] v{info.version} 已写入忽略列表（config.yaml ui.update_ignored），"
+                  f"这个版本不再提示", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[update] ⚠️ 写入忽略列表失败：{type(exc).__name__}: {exc}", flush=True)
+            self._set_status("warn", f"「不再提示」没存下来：{exc}")
+        self._close_update_dialog()
+
+    def _on_update_later(self) -> None:
+        """「下次再说」→ 本会话不再自动弹（不落盘），下次启动照常检查。"""
+        self._update_snoozed = True
+        print("[update] 用户选择「下次再说」：本会话不再自动弹（不落盘，下次启动照查）",
+              flush=True)
+        self._close_update_dialog()
+
+    def _on_update_now(self, info) -> None:
+        """「立即更新」：源码运行给指引（不自更新）；打包 exe 走两段式 —— 先开下载进度窗。"""
+        if update_check.update_mode() != "frozen":
+            open_page = messagebox.askokcancel(
+                "如何更新",
+                "你现在运行的是源码版，不能自动更新。\n\n"
+                "· 会用 git：在仓库目录跑 git pull 就是最新版；\n"
+                "· 或者点「确定」打开新版本下载页，下载安装包。\n\n"
+                "点「取消」先不更新。",
+                parent=self._update_win)
+            if open_page:
+                self._open_release_page(info.html_url)
+            print("[update] 源码运行：已给出更新指引（git pull / 下载页），不做自更新",
+                  flush=True)
+            return
+        exe = Path(sys.executable).resolve()
+        if not _dir_writable(exe.parent):
+            open_page = messagebox.askokcancel(
+                "无法自动更新",
+                "程序所在的位置不允许写入（比如放在 Program Files）。\n\n"
+                "点「确定」打开下载页，自己下载新版本；点「取消」先不更新。",
+                parent=self._update_win)
+            if open_page:
+                self._open_release_page(info.html_url)
+            print(f"[update] 安装目录不可写（{exe.parent}），转为手动下载指引", flush=True)
+            return
+        self._close_update_dialog()
+        self._show_download_window(info)
+        self._start_download(info)
+
+    # ---------------------------------------------------------------- 下载进度窗（两段式之一：只下载）
+    def _show_download_window(self, info) -> None:
+        """懒建懒销毁 Toplevel（transient + lift，非模态 —— 下载期间翻译照跑）。
+        文案逐字照抄「文案 checklist ②」；完成后切「完成态」（checklist ③）。
+        总量优先级：Content-Length（回调带）> ReleaseInfo.exe_size > indeterminate 只显示已下载量。"""
+        self._close_download_window()
+        win = tk.Toplevel(self._root)
+        win.title("正在下载新版本")
+        win.configure(bg=PANEL)
+        win.transient(self._root)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self._on_download_window_close)  # 关窗 = 取消下载
+        self._dl_win = win
+        self._dl_info = info
+        self._dl_new_exe = None
+
+        body = ttk.Frame(win, padding=(20, 16, 20, 14))
+        body.pack(fill=tk.BOTH, expand=True)
+        self._dl_bar = ttk.Progressbar(body, mode="determinate", length=380,
+                                       maximum=100.0, value=0.0)
+        self._dl_bar.pack(fill=tk.X)
+        if info.exe_size:
+            text = (f"已下载 0.0 / 约 {info.exe_size / 1048576:.1f} MB，"
+                    f"一般 1–3 分钟就好。下载期间可以正常翻译。")
+        else:
+            self._dl_bar.configure(mode="indeterminate")
+            self._dl_bar.start(14)
+            text = "已下载 0.0 MB，请稍等。"
+        self._dl_text = ttk.Label(body, text=text, wraplength=380, justify=tk.LEFT)
+        self._dl_text.pack(anchor=tk.W, pady=(10, 0))
+        self._dl_note = ttk.Label(body, text="点右上角关闭会取消下载，下次可以再下。",
+                                  style="Muted.TLabel")
+        self._dl_note.pack(anchor=tk.W, pady=(10, 0))
+        self._dl_btn_frame = ttk.Frame(body)   # 完成态才放按钮（checklist ③）
+        self._dl_btn_frame.pack(fill=tk.X, pady=(14, 0))
+
+        win.update_idletasks()
+        rx, ry = self._root.winfo_x(), self._root.winfo_y()
+        rw = self._root.winfo_width()
+        win.geometry(f"+{rx + max((rw - win.winfo_reqwidth()) // 2, 20)}+{ry + 80}")
+        self._apply_dark_titlebar(win)
+        win.lift()
+
+    def _close_download_window(self) -> None:
+        win, self._dl_win = self._dl_win, None
+        self._dl_bar = self._dl_text = self._dl_note = self._dl_btn_frame = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _on_download_window_close(self) -> None:
+        """下载中关窗 = 取消下载并清理残留（下载线程在下一个 chunk 边界自己中断）。"""
+        if self._dl_downloading and self._dl_cancel is not None:
+            self._dl_cancel.set()
+            print("[update] 用户关闭下载窗：取消下载", flush=True)
+        elif self._dl_new_exe is not None:
+            print("[update] 下载窗已关闭：下载好的新版本文件保留，下次可继续用", flush=True)
+        self._close_download_window()
+
+    def _start_download(self, info) -> None:
+        """守护线程跑 download_and_verify。线程纪律（硬约束）：progress 回调绝不直接
+        碰 Tk 控件，只节流后（每 ~100ms 至多一条，允许丢旧留新）塞 self._q，
+        由 _poll() 在主线程更新控件 —— 与设备扫描同一模式。"""
+        self._dl_cancel = threading.Event()
+        self._dl_last_push = 0.0
+        self._dl_downloading = True
+        dest_dir = Path(sys.executable).resolve().parent   # exe 同目录：同卷 move 才近原子
+
+        def _progress(done: int, total: int | None) -> None:
+            if self._dl_cancel is not None and self._dl_cancel.is_set():
+                raise _DownloadCancelled()
+            now = time.monotonic()
+            is_final = bool(total) and done >= total
+            if not is_final and now - self._dl_last_push < self._dl_throttle_s:
+                return
+            self._dl_last_push = now
+            self._q.put(("update_progress", done, total))
+
+        def _work() -> None:
+            try:
+                new_exe = self._update_downloader(info, dest_dir, progress=_progress)
+            except _DownloadCancelled:
+                print("[update] 下载已取消（残留已清理）", flush=True)
+                return
+            except Exception as exc:  # noqa: BLE001 — 失败走统一错误分支，绝不静默
+                self._q.put(("update_download_error", str(exc)))
+                return
+            self._q.put(("update_download_done", new_exe))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_download_progress(self, done: int, total: int | None) -> None:
+        """主线程：更新进度条与文本；total=None 且 exe_size 也没有 → indeterminate。"""
+        if self._dl_win is None or self._dl_bar is None or self._dl_text is None:
+            return
+        try:
+            if not self._dl_win.winfo_exists():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        total = total or (self._dl_info.exe_size if self._dl_info else None)
+        if total:
+            if str(self._dl_bar.cget("mode")) != "determinate":
+                self._dl_bar.stop()
+                self._dl_bar.configure(mode="determinate")
+            self._dl_bar.configure(maximum=float(total), value=float(done))
+            self._dl_text.configure(
+                text=f"已下载 {done / 1048576:.1f} / 约 {total / 1048576:.1f} MB，"
+                     f"一般 1–3 分钟就好。下载期间可以正常翻译。")
+        else:
+            if str(self._dl_bar.cget("mode")) != "indeterminate":
+                self._dl_bar.configure(mode="indeterminate")
+                self._dl_bar.start(14)
+            self._dl_text.configure(text=f"已下载 {done / 1048576:.1f} MB，请稍等。")
+
+    def _on_download_done(self, new_exe) -> None:
+        """主线程：下载+校验完成 → 100%，切「完成态」（文案 checklist ③）。"""
+        self._dl_downloading = False
+        if self._dl_win is None:
+            # 用户在最后一刻关了窗：按取消处理，不留来路不明的下载物
+            try:
+                Path(new_exe).unlink(missing_ok=True)
+            except OSError:
+                pass
+            print("[update] 下载完成时窗口已关闭：按取消处理，下载物已删除", flush=True)
+            return
+        self._dl_new_exe = Path(new_exe)
+        self._dl_bar.stop()
+        self._dl_bar.configure(mode="determinate", maximum=1.0, value=1.0)
+        self._dl_win.title("下载完成")
+        self._dl_text.configure(
+            text="新版本已经准备好了。\n"
+                 "点「立即重启并更新」：关闭当前窗口、自动换上新版本并重新打开。\n"
+                 "点「稍后更新」：继续用现在的版本；等你关闭程序时会自动换好，下次打开就是新版。")
+        self._dl_note.pack_forget()            # 已完成：「关窗会取消」的小字不再适用
+        reload_btn = ttk.Button(self._dl_btn_frame, text="立即重启并更新",
+                                style="Accent.TButton", command=self._on_reload_clicked)
+        reload_btn.pack(side=tk.LEFT)
+        ttk.Button(self._dl_btn_frame, text="稍后更新",
+                   command=self._on_postpone_clicked).pack(side=tk.LEFT, padx=(8, 0))
+        reload_btn.focus_set()
+        print(f"[update] 新版本已下载好（{new_exe}），等待用户选择何时更新", flush=True)
+
+    def _on_download_error(self, msg: str) -> None:
+        """主线程：清理残留 → 留痕 → 错误提示带可点下一步（重试=默认 / 取消=暂时跳过）。"""
+        self._dl_downloading = False
+        print(f"[update] 下载失败：{msg}", flush=True)
+        if self._dl_win is None:
+            return                               # 用户已关窗取消，错误不必再烦他
+        # 残留双保险（download_and_verify 失败时已清过一遍）
+        try:
+            (Path(sys.executable).resolve().parent
+             / (update_check.EXE_ASSET_NAME + ".new")).unlink(missing_ok=True)
+        except OSError:
+            pass
+        retry = messagebox.askretrycancel(
+            "下载没有成功",
+            "下载没有成功（网络可能不太稳定）。\n\n"
+            "点「重试」再下载一次；点「取消」暂时跳过。\n"
+            "（之后也可以到「设置 → 软件更新」再检查）",
+            parent=self._dl_win)
+        if retry and self._dl_win is not None and self._dl_info is not None:
+            self._dl_bar.configure(mode="determinate", maximum=100.0, value=0.0)
+            self._dl_text.configure(text="已下载 0.0 MB，请稍等。")
+            print("[update] 用户选择重试下载", flush=True)
+            self._start_download(self._dl_info)
+        else:
+            print("[update] 用户选择暂时跳过本次下载", flush=True)
+            self._close_download_window()
+
+    def _on_reload_clicked(self) -> None:
+        """「立即重启并更新」按钮：替换+拉起的接线在下一批（计划 Task 11）。
+        本批必须给出明确提示，不许点了没反应。"""
+        print("[update] 「立即重启并更新」尚未接线（下一批实现），已向用户说明", flush=True)
+        messagebox.showinfo(
+            "马上就好",
+            "自动重启更新将在程序的下一个版本开放。\n\n"
+            "这次的新版本已经下载好并保留着，不会重复下载。",
+            parent=self._dl_win)
+
+    def _on_postpone_clicked(self) -> None:
+        """「稍后更新」按钮：退出时替换的接线在下一批（计划 Task 11）。同上，明确提示。"""
+        print("[update] 「稍后更新」尚未接线（下一批实现），已向用户说明", flush=True)
+        messagebox.showinfo(
+            "马上就好",
+            "「稍后更新」（关闭程序时自动换好）将在程序的下一个版本开放。\n\n"
+            "这次的新版本已经下载好并保留着，不会重复下载。",
+            parent=self._dl_win)
 
     def _refresh_key_status(self) -> None:
         """只显示来源 + 打码值，绝不显示明文。
@@ -1687,6 +2030,14 @@ class TranslationGUI:
                 elif kind == "devices_error":
                     self._set_status("warn", f"设备扫描失败：{item[1]}")
                     self._device_scan_pending = False
+                elif kind == "update_check":
+                    self._on_update_check_result(item[1], item[2], item[3], item[4])
+                elif kind == "update_progress":
+                    self._on_download_progress(item[1], item[2])
+                elif kind == "update_download_done":
+                    self._on_download_done(item[1])
+                elif kind == "update_download_error":
+                    self._on_download_error(item[1])
         except queue.Empty:
             pass
         if (self._pending_starts == 0 and self._engines

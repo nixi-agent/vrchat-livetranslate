@@ -109,6 +109,17 @@ output:
     buffer_ms: 300           # 起播前先攒这么多，避免断续
     max_buffer_ms: 2000      # 排队上限：超了就**整句**丢弃最旧的（绝不从句中切断，正在播的那句不丢）
 
+# 打字输入（不想开麦时用键盘代替说话：界面下方输入框 + 回车发送）
+#
+# 打字走的是**文本翻译**接口，不是实时语音那条会话 —— 实测实时模型不接受文本入口
+# （发 response.create 会被回 invalid_value）。所以这里单独配一个文本翻译模型。
+text_input:
+  enabled: true              # false = 界面不显示打字输入行
+  # 默认 qwen-mt-flash。别换成 qwen3-livetranslate-flash：实测它的**文本**接口
+  # 会原样回吐（中文进、中文出；换个句子又正常），行为不可依赖。
+  model: qwen-mt-flash
+  timeout_s: 20              # 单次翻译超时（秒）
+
 # 界面（图形界面上次的选择，**启动时自动恢复**；手改也有效）
 ui:
   direction: mine          # mine=我说的话 | theirs=别人说 | dual=双向同时

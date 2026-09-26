@@ -104,6 +104,7 @@ class AppConfig:
     overlay: dict[str, Any] = field(default_factory=dict)
     output: dict[str, Any] = field(default_factory=dict)
     ui: dict[str, Any] = field(default_factory=dict)      # 界面上次的选择（方向/输出勾选），启动时恢复
+    text_input: dict[str, Any] = field(default_factory=dict)   # 打字输入（替代说话）
 
     def direction(self, name: str) -> Direction:
         if name not in self.directions:
@@ -179,6 +180,7 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
     raw_output = raw.get("output") or {}
     raw_audio = raw_output.get("audio") or {}
     raw_capture = raw.get("capture") or {}
+    raw_textin = raw.get("text_input") or {}
     output = {
         "audio": {
             "enabled": bool(raw_audio.get("enabled", False)),
@@ -201,4 +203,11 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
         overlay=raw.get("overlay") or {},
         output=output,
         ui=raw.get("ui") or {},
+        text_input={
+            "enabled": bool(raw_textin.get("enabled", True)),
+            # 默认 qwen-mt-flash：实测 qwen3-livetranslate-flash 的**文本**接口会原样回吐
+            # （中文进中文出，换个句子又正常），不能依赖；mt 系列稳定且能自动识别源语言。
+            "model": str(raw_textin.get("model") or "qwen-mt-flash"),
+            "timeout_s": float(raw_textin.get("timeout_s", 20.0)),
+        },
     )

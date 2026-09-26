@@ -287,6 +287,7 @@ class TranslationGUI:
         self._divider()
         self._build_chat()
         self._divider()
+        self._build_input_row()      # 打字输入（不想开麦时用键盘替代说话，回车发送）
         self._build_status()
         self._build_settings_dialog()  # 先建好再隐藏：控件属性必须随即可用（测试直接访问）
         self._apply_dark_titlebar()
@@ -1104,6 +1105,58 @@ class TranslationGUI:
         self._canvas.bind("<Configure>", self._on_canvas_configure)
         self._canvas.bind("<MouseWheel>", self._on_mousewheel)
 
+    def _build_input_row(self) -> None:
+        """打字输入行：不想开麦时用键盘替代麦克风，回车即发。
+
+        它替代的是**麦克风**，所以只在方向含「我说」时可用（没会话时置灰，
+        省得用户按了回车却没反应、以为坏了）。
+        """
+        if not (self._cfg.text_input or {}).get("enabled", True):
+            return                       # 配置里关掉了：整行不建（下面各处都有 hasattr 兜底）
+        row = ttk.Frame(self._root, padding=(14, 8, 14, 6))
+        row.pack(fill=tk.X)
+        ttk.Label(row, text="打字:", style="Dim.TLabel").pack(side=tk.LEFT)
+        self._text_var = tk.StringVar()
+        self._text_entry = ttk.Entry(row, textvariable=self._text_var, font=FONT_UI,
+                                     style="Key.TEntry")   # 复用「键输入框」样式：底色=SURFACE，与按钮一致
+        self._text_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
+        self._text_entry.bind("<Return>", self._on_text_enter)
+        self._text_entry.bind("<Escape>", lambda _e: self._text_var.set(""))
+        self._send_btn = ttk.Button(row, text="发送", width=8, command=self._send_typed)
+        self._send_btn.pack(side=tk.LEFT)
+        ttk.Label(row, text="回车发送 · Esc 清空", style="Muted.TLabel").pack(side=tk.LEFT, padx=(8, 0))
+        self._set_text_input_enabled(False)
+
+    def _set_text_input_enabled(self, on: bool) -> None:
+        """没有「我说」方向的会话时置灰：打字替代的是麦克风，没腿就没输出面。"""
+        if not hasattr(self, "_text_entry"):
+            return
+        for w in (self._text_entry, self._send_btn):
+            w.state(["!disabled"] if on else ["disabled"])
+
+    def _on_text_enter(self, _event=None) -> str:
+        self._send_typed()
+        return "break"                  # 吃掉回车：否则 Tk 会再响一声提示音
+
+    def _send_typed(self) -> None:
+        """把输入框里的文字交给「我说」那条腿翻译并送出（下游与说话完全一致）。"""
+        if not hasattr(self, "_text_entry"):
+            return
+        text = self._text_var.get().strip()
+        if not text:
+            return
+        targets = [e for e, dirn in zip(self._engines, self._engine_dirs) if dirn == "mine"]
+        if not targets:
+            self._set_status("warn", "打字替代的是麦克风 —— 先点「开始翻译」，"
+                                     "且方向要含「我说」")
+            return
+        sent = sum(1 for e in targets if e.send_text(text))
+        if sent:
+            self._text_var.set("")      # 清空：肉眼确认已发出
+            self._set_status("info", f"打字已送出（{len(text)} 字），翻译中…")
+        else:
+            self._set_status("warn", "引擎还没就绪，稍后重试")
+
     def _build_status(self) -> None:
         bar = ttk.Frame(self._root, padding=(14, 7))
         bar.pack(fill=tk.X)
@@ -1333,6 +1386,7 @@ class TranslationGUI:
         self._start_engine(0)
         self._start_btn.configure(state=tk.DISABLED)
         self._stop_btn.configure(state=tk.NORMAL)
+        self._set_text_input_enabled(d in ("mine", "dual"))
         if audio_warn:
             self._set_status("warn", audio_warn)
         elif d == "mine":
@@ -1436,6 +1490,7 @@ class TranslationGUI:
         self._engine_dirs = []
         self._start_btn.configure(state=tk.NORMAL)
         self._stop_btn.configure(state=tk.DISABLED)
+        self._set_text_input_enabled(False)
         self._set_status("info", "已停止")
 
     def _on_close(self) -> None:

@@ -73,8 +73,8 @@ SPONSOR_URL = "https://ko-fi.com/kcmnixi"
 SPONSOR_QR_SIZE = 240          # 收款码等比缩放的目标边长（严禁拉伸：拉变形就扫不出来）
 
 # ---- 百炼开通页（未配置 API key 时，状态按钮点击跳转）----
-# 链接逐字符照抄需求简报，不做任何 URL 解码/重组 —— % 编码、@@、~ 都是原样的一部分。
-BAILIAN_SIGNUP_URL = "https://www.aliyun.com/product/bailian?scm=20140722.S_card@@%E4%BA%A7%E5%93%81@@2983180.S_new~UND~card.ID_card@@%E4%BA%A7%E5%93%81@@2983180-RL_%E7%99%BE%E7%82%BC%E5%A4%A7%E6%A8%A1%E5%9E%8B%E6%9C%8D%E5%8A%A1%E5%B9%B3%E5%8F%B0-LOC_2024SPSearchCard-OR_ser-PAR1_0bc0590417903159041562532e6a54-V_4-RE_new12-P0_0-P1_0&source=5176.29345612&userCode=q8nma978"
+# 链接逐字符照抄用户给的那串，不做任何 URL 解码/重组 —— 推广码被改坏就白推广了。
+BAILIAN_SIGNUP_URL = "https://www.aliyun.com/minisite/goods?userCode=q8nma978"
 # 按钮文案档位（按顺序试，取最小宽度 928 下能完整显示的第一档；实测见改动报告）。
 KEY_BTN_TEXT = "⚠ 未配置 API key · 点此开通百炼 ▸"
 

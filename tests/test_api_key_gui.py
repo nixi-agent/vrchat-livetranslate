@@ -217,8 +217,8 @@ def test_gui_starts_without_any_key() -> None:
                 os.environ[k] = v
 
 
-# 期望值原样写死在测试里：防止实现抄错、或被格式化工具改写（% 编码、@@、~ 都必须原样）。
-_EXPECTED_BAILIAN_URL = "https://www.aliyun.com/product/bailian?scm=20140722.S_card@@%E4%BA%A7%E5%93%81@@2983180.S_new~UND~card.ID_card@@%E4%BA%A7%E5%93%81@@2983180-RL_%E7%99%BE%E7%82%BC%E5%A4%A7%E6%A8%A1%E5%9E%8B%E6%9C%8D%E5%8A%A1%E5%B9%B3%E5%8F%B0-LOC_2024SPSearchCard-OR_ser-PAR1_0bc0590417903159041562532e6a54-V_4-RE_new12-P0_0-P1_0&source=5176.29345612&userCode=q8nma978"
+# 期望值原样写死在测试里：防止实现抄错、或被格式化工具顺手「规范化」改写（推广码必须逐字符一致）。
+_EXPECTED_BAILIAN_URL = "https://www.aliyun.com/minisite/goods?userCode=q8nma978"
 
 
 def test_key_chip_button_switching() -> None:

@@ -343,7 +343,7 @@ vlt/
     └── virtualmic.py     译音回灌：24k→48k 重采样 + 抖动缓冲（整句丢弃，绝不切句）
 
 scripts/                  探针与调试工具（probe_* / osc_listen / verify_release）
-tests/                    18 个文件、103 个测试函数（离线可跑，CI 逐文件执行）
+tests/                    21 个文件、140 个测试函数（离线可跑，CI 逐文件执行）
 docs/                     P0.5 / P1 / P2 三份实测结果（协议、延迟、手腕屏）
 testdata/                 自带测试音频（中文 8.56s、英文 7.92s，16kHz 单声道 PCM）
 assets/                   图标、界面截图与赞助收款码

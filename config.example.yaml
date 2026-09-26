@@ -29,6 +29,23 @@ session:
   # RPM 10 预算：每次 WS 连接算一次请求
   max_new_sessions_per_minute: 4
   reconnect_backoff: [2, 5, 10, 30]
+  # ---- 长静音闸门（治服务端「model repeat output happened」掉线）----
+  # 实测：静音块占比经常 60~80%，模型被静音喂久了会进入重复输出状态，服务端报错后掐线。
+  # 连续静音超过 silence_gate_after_s 就暂停上送音频；闸住期间只保留最后
+  # silence_gate_preroll_s 秒，声音恢复时先补发这段 preroll —— 句首不丢。
+  # 取舍：调小 after_s 更护模型，但正常说话中的长停顿（想词、等人）也会被闸，
+  #       恢复时靠 preroll 补句首；preroll 太短可能丢句首低能量部分，太长则多送旧静音。
+  silence_gate_enabled: true
+  silence_gate_after_s: 30
+  silence_gate_preroll_s: 1.0
+  # ---- 本地 repeat 抑制（模型重复吐同一句时的最后防线）----
+  # 连续 repeat_guard_hits 条最终译文相似度 ≥ repeat_guard_ratio → 判为 repeat：
+  # 不再往 chatbox / 手腕屏刷（对方不该看到「对对对对对」），并主动重建会话。
+  # 判定故意保守（短于 4 字的终版不参与，「好」→「好的」不会误判）；误杀的代价
+  # 是一次重连，漏判的代价是对方看你刷屏 —— 默认值偏向后者。
+  repeat_guard_enabled: true
+  repeat_guard_hits: 3
+  repeat_guard_ratio: 0.9
 
 # 音频设备选择（空字符串 = 自动检测，也可在界面下拉里选）
 capture:

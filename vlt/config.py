@@ -164,6 +164,14 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
         "reconnect_backoff": s.get("reconnect_backoff", [2, 5, 10, 30]),
         "max_new_sessions_per_minute": s.get("max_new_sessions_per_minute", 4),
         "final_silence_s": float(s.get("final_silence_s", DEFAULT_FINAL_SILENCE_S)),  # 默认值必须 > 服务端增量间隔（实测最大 2.3s），改小会让最终版在句子中间抢跑
+        # 长静音闸门 + 本地 repeat 抑制：原样透传，取值校验在 engine 里做
+        # （非法值会**留痕**并回落默认值，见 engine.silence_gate_settings / repeat_guard_settings）
+        "silence_gate_enabled": s.get("silence_gate_enabled", True),
+        "silence_gate_after_s": s.get("silence_gate_after_s", 30),
+        "silence_gate_preroll_s": s.get("silence_gate_preroll_s", 1.0),
+        "repeat_guard_enabled": s.get("repeat_guard_enabled", True),
+        "repeat_guard_hits": s.get("repeat_guard_hits", 3),
+        "repeat_guard_ratio": s.get("repeat_guard_ratio", 0.9),
         "api_key": _resolve_api_key(api_key, require_key),
     }
     directions = {}

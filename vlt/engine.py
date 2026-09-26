@@ -10,6 +10,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from math import gcd
 from pathlib import Path
 from typing import Callable
@@ -43,6 +44,148 @@ SILENCE_PEAK = 220
 LOOPBACK_FALLBACK = ["steam streaming speakers", "vive virtual", "cable input", "voicemeeter"]
 
 
+# ================================================================ 配置校验（非法值留痕 + 回落默认）
+
+
+def _warn_default(key: str, val, why: str, default) -> None:
+    print(f"[config] ⚠️ session.{key}={val!r} 非法（{why}）→ 回落默认值 {default!r}", flush=True)
+
+
+def _cfg_bool(base: dict, key: str, default: bool) -> bool:
+    v = base.get(key, default)
+    if isinstance(v, bool):
+        return v
+    _warn_default(key, v, "应为 true/false", default)
+    return default
+
+
+def _cfg_pos_float(base: dict, key: str, default: float) -> float:
+    v = base.get(key, default)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        _warn_default(key, v, "应为正数", default)
+        return default
+    if float(v) <= 0:
+        _warn_default(key, v, "必须 > 0", default)
+        return default
+    return float(v)
+
+
+def silence_gate_settings(base: dict | None) -> tuple[bool, float, float]:
+    """读取并校验静音闸门配置（纯函数，离线可测）：(enabled, after_s, preroll_s)。
+
+    任何一项非法都**明确留痕**并回落默认值（绝不静默带病运行）。
+    """
+    base = base or {}
+    enabled = _cfg_bool(base, "silence_gate_enabled", True)
+    after = _cfg_pos_float(base, "silence_gate_after_s", 30.0)
+    preroll = _cfg_pos_float(base, "silence_gate_preroll_s", 1.0)
+    if preroll > after:
+        # preroll 比闸门阈值还长没有意义（闸还没关缓冲就先满了）
+        print(f"[config] ⚠️ session.silence_gate_preroll_s={preroll} 大于 "
+              f"silence_gate_after_s={after} → 回落默认值 1.0", flush=True)
+        preroll = min(1.0, after)
+    return enabled, after, preroll
+
+
+def repeat_guard_settings(base: dict | None) -> tuple[bool, int, float]:
+    """读取并校验本地 repeat 抑制配置（纯函数）：(enabled, hits, ratio)。"""
+    base = base or {}
+    enabled = _cfg_bool(base, "repeat_guard_enabled", True)
+    hits = base.get("repeat_guard_hits", 3)
+    if isinstance(hits, bool) or not isinstance(hits, (int, float)) or int(hits) < 2:
+        _warn_default("repeat_guard_hits", hits, "应为 ≥2 的整数", 3)
+        hits = 3
+    ratio = base.get("repeat_guard_ratio", 0.9)
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not (0 < float(ratio) <= 1):
+        _warn_default("repeat_guard_ratio", ratio, "应在 (0, 1] 区间", 0.9)
+        ratio = 0.9
+    return enabled, int(hits), float(ratio)
+
+
+def is_repeat_streak(texts: list[str], hits: int = 3, ratio: float = 0.9,
+                     min_len: int = 1) -> bool:
+    """最近 hits 条文本是否高度雷同（模型 repeat 判据；纯函数，离线可测）。
+
+    判定故意保守，三条都满足才算 repeat：
+      ① 条数足够（len(texts) >= hits 且 hits >= 2）；
+      ② 每条都非空、长度 >= min_len（「嗯。」「好。」这类短应答天然会连撞，不配当证据）；
+      ③ 尾部 hits 条与其中第一条的相似度全部 >= ratio。
+    反例（必须不判）：「好」→「好的」（SequenceMatcher 相似度 0.667 < 0.9）。
+    """
+    if hits < 2 or len(texts) < hits:
+        return False
+    tail = [(t or "").strip() for t in texts[-hits:]]
+    if any(len(t) < max(1, min_len) for t in tail):
+        return False
+    first = tail[0]
+    return all(SequenceMatcher(None, first, t).ratio() >= ratio for t in tail[1:])
+
+
+class _SilenceGate:
+    """长静音闸门 + preroll（治服务端 `model repeat output happened` 掉线）。
+
+    用户实测：静音块占比经常 60~80%，模型被静音喂久了会进入 repeat 状态，
+    服务端报 COMMON_ERROR 后 1011 掐线（4 小时日志里两条腿各断 8 次）。
+    这里在连续静音 ≥ after_s 时**暂停上送**；闸住期间只保留最后 preroll_s 秒音频，
+    声音恢复时先补发这段 preroll —— 句首的低能量部分（峰值还没到门限）不会丢。
+
+    与打断/回合检测的关系：只**暂停上送**，不伪造、不改写音频；
+    服务端 turn_detection 看到的仍是「静音 → （preroll）→ 说话」，与真人说话节奏一致。
+    """
+
+    def __init__(self, enabled: bool, after_s: float, preroll_s: float) -> None:
+        self.enabled = enabled
+        self.after_s = after_s
+        self.preroll_s = preroll_s
+        self.closed = False
+        self._silent_since: float | None = None      # 连续静音的起点（None = 最近一块有声）
+        self._preroll: deque[tuple[bytes, float]] = deque()
+        self._preroll_dur = 0.0
+        self.gated_chunks = 0        # 本次闸住累计拦截的块数（关闸时清零）
+        self.replay_count = 0        # 累计补发 preroll 的次数
+
+    def feed(self, chunk: bytes, *, loud: bool, dur_s: float, now: float) -> list[bytes]:
+        """返回本次真正要上送的块序列（0..N 块；N>1 是开闸补发 preroll 的情形）。"""
+        if loud:
+            self._silent_since = None
+            if self.closed:
+                replay = [c for c, _ in self._preroll]
+                dur = self._preroll_dur
+                self._preroll.clear()
+                self._preroll_dur = 0.0
+                self.closed = False
+                self.replay_count += 1
+                print(f"[engine] 静音闸门打开：检测到声音 → 先补发 preroll "
+                      f"{len(replay)} 块（≈{dur:.1f}s，不丢句首），随后恢复正常上送"
+                      f"（本次闸住共拦截 {self.gated_chunks} 块）", flush=True)
+                return replay + [chunk]
+            return [chunk]
+        # —— 静音块 ——
+        if self._silent_since is None:
+            self._silent_since = now
+        if not self.closed:
+            if not self.enabled or (now - self._silent_since) < self.after_s:
+                return [chunk]
+            self.closed = True
+            self.gated_chunks = 0
+            print(f"[engine] 静音闸门关闭：已连续静音 ≥{self.after_s:g}s → 暂停上送音频"
+                  f"（保留最近 {self.preroll_s:g}s 作 preroll；防服务端 repeat 掉线）",
+                  flush=True)
+        self.gated_chunks += 1
+        self._remember(chunk, dur_s)
+        return []
+
+    def _remember(self, chunk: bytes, dur_s: float) -> None:
+        if self.preroll_s <= 0:
+            return
+        self._preroll.append((chunk, dur_s))
+        self._preroll_dur += dur_s
+        # +1μs 容差：0.1+0.1+0.1=0.30000000000000004，没容差会多吃掉一块（实测踩到）
+        while self._preroll and self._preroll_dur > self.preroll_s + 1e-6:
+            _, d = self._preroll.popleft()
+            self._preroll_dur -= d
+
+
 @dataclass
 class EngineEvents:
     on_text: Callable[[str, str, bool], None] = lambda *_a: None     # (原文, 译文, is_final)
@@ -63,9 +206,12 @@ class _SessionProxy:
         self.chunks = 0
         self.silent_chunks = 0
         self.send_fails = 0          # 发送失败的块数（不计入静音统计，只用于留痕/诊断）
+        # 长静音闸门（②）：配置非法时 silence_gate_settings 已留痕并回落默认值
+        en, after_s, preroll_s = silence_gate_settings(
+            getattr(engine._cfg, "session_base", None))          # noqa: SLF001
+        self._gate = _SilenceGate(enabled=en, after_s=after_s, preroll_s=preroll_s)
 
     async def send_audio(self, pcm: bytes) -> None:
-        session = self._engine._session          # noqa: SLF001
         eng = self._engine
         # —— 输入侧埋点（黑匣子用）：这个类能看到**每一个**要发出去的输入块 ——
         eng._audio_in_chunks += 1                    # noqa: SLF001
@@ -77,18 +223,28 @@ class _SessionProxy:
             peak = int(np.abs(arr).max()) if arr.size else 0
         except Exception:  # noqa: BLE001
             peak = 0
-        if peak >= SILENCE_PEAK:
+        loud = peak >= SILENCE_PEAK
+        if loud:
             eng._last_loud_ts = time.monotonic()     # noqa: SLF001
         else:
             self.silent_chunks += 1
             eng._silent_chunks += 1                  # noqa: SLF001
+        # —— 长静音闸门：连续静音超阈值就暂停上送（闸住期间只留 preroll），
+        #    声音恢复时先补发 preroll、再上送当前块 —— 绝不丢句首。
+        #    闸住的块不算 sent_bytes（本来就没发），诊断里有 gate 自己的计数。
+        chunks = self._gate.feed(pcm, loud=loud, dur_s=len(pcm) / 2 / 16000.0,
+                                 now=time.monotonic())
+        for chunk in chunks:
+            await self._send_one(chunk)
+
+    async def _send_one(self, pcm: bytes) -> None:
+        session = self._engine._session             # noqa: SLF001
+        # 发送量按「尝试发送」口径计：出问题时要靠它判断"到底说了多少话"，
+        # 漏计会让诊断把"一直在说话"误读成"几乎没说话"。
+        self.sent_bytes += len(pcm)
         if session is None:
             # 还没连上（或正在重连）也要计入——这是"输入侧"的度量，用于诊断
-            self.sent_bytes += len(pcm)
             return
-        # 发送量按「尝试发送」口径计（与上面 session is None 一致）：出问题时要靠它
-        # 判断"到底说了多少话"，漏计会让诊断把"一直在说话"误读成"几乎没说话"。
-        self.sent_bytes += len(pcm)
         try:
             await session.send_audio(pcm)
         except Exception as exc:  # noqa: BLE001
@@ -171,6 +327,14 @@ class Engine:
         self._pump_task: asyncio.Task | None = None
 
         self._connect_ts: list[float] = []
+
+        # ---- 本地 repeat 抑制（③）：模型连续吐高度雷同的最终译文 →
+        # 不往 chatbox / 手腕屏刷（对方不该看到「对对对对对」），并主动重建会话 ----
+        self._repeat_guard = repeat_guard_settings(getattr(cfg, "session_base", None))
+        self._final_hist: deque[str] = deque(maxlen=self._repeat_guard[1])
+        self._repeat_suppressed = False
+        self._repeat_text = ""
+        self._repeat_dropped = 0
 
     # ---------------------------------------------------------------- 公开接口
 
@@ -456,6 +620,10 @@ class Engine:
             await asyncio.sleep(wait)
 
         self._session = create_session(scfg)
+        # 新会话 = 新的一页：repeat 抑制状态清零（上一段的重复历史不带过来）
+        self._repeat_suppressed = False
+        self._repeat_dropped = 0
+        self._final_hist.clear()
         t0 = time.perf_counter()
         await self._session.start(
             on_text=self._on_text,
@@ -525,6 +693,8 @@ class Engine:
 
     def _on_text(self, d: TextDelta) -> None:
         text = d.display
+        if self._swallow_repeat(d, text):
+            return                       # repeat 垃圾：chatbox / 手腕屏 / 界面气泡全都不刷
         if text:
             self._text_deltas += 1
             self._text_hist.append((time.monotonic(), text))
@@ -536,6 +706,65 @@ class Engine:
             self._overlay.update(text, d.source or "")
         if self._merger is not None and self._chatbox_wanted:
             self._merger.push(d)
+
+    # 终版短于这个长度不参与 repeat 判定：「嗯。」「好。」这类短应答天然会连撞，
+    # 把它们当证据会误杀正常对话（宁可晚一句判出真 repeat，也不可误杀真译文）。
+    _REPEAT_MIN_LEN = 4
+
+    def _swallow_repeat(self, d: TextDelta, text: str) -> bool:
+        """本地 repeat 抑制（③）。返回 True = 本条是重复垃圾，所有输出面都不要刷。
+
+        触发条件：连续 hits 条**最终译文**相似度 ≥ ratio（is_repeat_streak 纯函数判定）。
+        触发后：打一行 [engine] 留痕（绝不静默）、当前及后续重复内容不再刷出、
+        并按「服务端致命 error」的同一条思路主动重建会话（看门狗既有路径）。
+        解除：出现一条明显不同的终版（模型恢复多样），或会话重建（_create_session 清零）。
+        """
+        enabled, hits, ratio = self._repeat_guard
+        if not enabled:
+            return False
+        if self._repeat_suppressed:
+            # 抑制中：只有「和那段重复内容明显不同」的终版出现才解除（模型已恢复多样）
+            if d.is_final and text and \
+                    SequenceMatcher(None, self._repeat_text, text).ratio() < ratio:
+                self._repeat_suppressed = False
+                self._final_hist.clear()
+                print("[engine] 译文恢复多样 → 解除 repeat 抑制", flush=True)
+                return False
+            self._repeat_dropped += 1
+            if self._repeat_dropped == 1 or self._repeat_dropped % 20 == 0:
+                print(f"[engine] repeat 抑制中：已丢弃 {self._repeat_dropped} 条重复输出"
+                      f"（会话重建后自动恢复）", flush=True)
+            return True
+        if not (d.is_final and text):
+            return False
+        if len(text.strip()) < self._REPEAT_MIN_LEN:
+            # 短终版打断连击：模型还在正常出不一样的短内容，不配当 repeat 证据
+            self._final_hist.clear()
+            return False
+        self._final_hist.append(text)
+        if not is_repeat_streak(list(self._final_hist), hits=hits, ratio=ratio,
+                                min_len=self._REPEAT_MIN_LEN):
+            return False
+        self._repeat_suppressed = True
+        self._repeat_text = text
+        self._repeat_dropped = 1
+        print(f"[engine] ⚠️ 连续 {hits} 条最终译文高度雷同（相似度≥{ratio:.2f}），判为模型 repeat"
+              f" → 这段重复不再往 chatbox / 手腕屏刷，并主动重建会话：{text[:60]!r}", flush=True)
+        self._abort_session_for_repeat()
+        return True
+
+    def _abort_session_for_repeat(self) -> None:
+        """按「服务端致命 error → 主动重建」的同一思路：把会话标死，看门狗走既有重连路径。"""
+        s = self._session
+        reason = f"本地 repeat 抑制：连续 {self._repeat_guard[1]} 条最终译文雷同"
+        abort = getattr(s, "_abort_on_fatal", None)
+        if callable(abort):
+            abort(reason)                # is_alive=False → 看门狗 0.3s 内重连
+            return
+        # 会话实现没有主动放弃接口（测试替身 / 未来别的实现）→ 直接走重连调度，
+        # 效果与看门狗路径一致（带退避 + RPM 预算，不会更凶）。
+        if s is not None and (self._reconnect_task is None or self._reconnect_task.done()):
+            self._reconnect_task = asyncio.create_task(self._reconnect_loop(reason))
 
     def _on_audio(self, pcm: bytes) -> None:
         if self._virtualmic is None:
@@ -677,6 +906,13 @@ class Engine:
                          f"（峰值门限 {SILENCE_PEAK}）")
         else:
             lines.append("[diag] 整段会话**从未**检测到有效声音 —— 一直在喂静音/噪声")
+        gate = getattr(self._proxy, "_gate", None)
+        if gate is not None and (gate.closed or gate.gated_chunks or gate.replay_count):
+            lines.append(f"[diag] 静音闸门：当前{'关闭（暂停上送中）' if gate.closed else '打开'} | "
+                         f"本次闸住已拦截 {gate.gated_chunks} 块 | 累计回补 preroll {gate.replay_count} 次")
+        if self._repeat_dropped:
+            lines.append(f"[diag] 本地 repeat 抑制：已丢弃 {self._repeat_dropped} 条重复输出"
+                         f"（重复文本：{self._repeat_text[:40]!r}）")
         lines.append("[diag] 断开前最近 12 条译文本（看是否在重复同一句）：")
         tail = list(self._text_hist)[-12:]
         if not tail:
@@ -792,6 +1028,52 @@ def pick_input_device(pattern: str | None) -> int | None:
     return None
 
 
+# 各语言 Windows 的「默认设备」名前缀（比较小写）：中 / 英 / 日 / 韩 / 俄
+_DEFAULT_DEVICE_PREFIXES = ("默认", "default", "デフォルト", "기본", "по умолчанию")
+
+
+def _strip_loopback_suffix(name: str) -> str:
+    """pyaudiowpatch 的 loopback 设备名 = 输出设备名 + loopback 后缀（实测有 "[Loopback]"/"(loopback)" 两种）。"""
+    n = str(name).strip()
+    low = n.lower()
+    for suffix in ("[loopback]", "(loopback)"):
+        if low.endswith(suffix):
+            return n[: -len(suffix)].strip()
+    return n
+
+
+def pick_default_loopback(loops: list[dict], default_out_index: int | None,
+                          default_out_name: str | None = None) -> dict | None:
+    """从 WASAPI loopback 列表里挑出「系统默认输出设备」对应的 loopback（纯函数，离线可测）。
+
+    优先级：
+      1) `index` 精确命中（最可靠）；
+      2) 名字与**默认输出设备名**一致（去掉 loopback 后缀、忽略大小写）；
+      3) 多语言「默认」前缀兜底：默认 / Default / デフォルト / 기본 / По умолчанию
+         —— 旧代码写死 `startswith("默认")`，英/日/俄 Windows 永不命中，
+         会退化成「拿枚举到的第一个 loopback」，译音回灌可能写到错声卡、对方听不到；
+      4) 都不中 → None（由调用方回落到「第一个 loopback」并留痕）。
+    """
+    loops = list(loops or [])
+    if not loops:
+        return None
+    if default_out_index is not None and int(default_out_index) >= 0:
+        for d in loops:
+            if d.get("index") == default_out_index:
+                return d
+    if default_out_name:
+        want = _strip_loopback_suffix(default_out_name).lower()
+        if want:
+            for d in loops:
+                if _strip_loopback_suffix(str(d.get("name") or "")).lower() == want:
+                    return d
+    for d in loops:
+        name = str(d.get("name") or "").strip().lower()
+        if any(name.startswith(p) for p in _DEFAULT_DEVICE_PREFIXES):
+            return d
+    return None
+
+
 def pick_loopback_device(patterns: list[str] | None = None):
     """返回 (index, name, rate, channels)。找不到返回 None。"""
     import pyaudiowpatch as pyaudio
@@ -809,10 +1091,17 @@ def pick_loopback_device(patterns: list[str] | None = None):
                             int(d["maxInputChannels"])), p
         try:
             default_out = p.get_host_api_info_by_type(pyaudio.paWASAPI).get("defaultOutputDevice", -1)
-            for d in loops:
-                if d.get("index") == default_out or str(d["name"]).startswith("默认"):
-                    return (d["index"], d["name"], int(d["defaultSampleRate"]),
-                            int(d["maxInputChannels"])), p
+            try:
+                default_name = str(p.get_device_info_by_index(default_out).get("name") or "")
+            except Exception:  # noqa: BLE001
+                default_name = ""
+            d = pick_default_loopback(loops, default_out, default_name)
+            if d is not None:
+                return (d["index"], d["name"], int(d["defaultSampleRate"]),
+                        int(d["maxInputChannels"])), p
+            print(f"[loopback] ⚠️ 默认输出设备「{default_name or f'#{default_out}'}」在 loopback "
+                  f"列表里匹配不上（index / 设备名 / 多语言「默认」前缀都不中）"
+                  f"→ 回退到第一个 loopback 设备：{loops[0]['name']}", flush=True)
         except Exception:
             pass
         d = loops[0]

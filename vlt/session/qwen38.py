@@ -24,6 +24,26 @@ import websockets
 from .base import AudioHandler, LiveTranslateSession, SessionConfig, TextDelta, TextHandler, UsageHandler
 
 
+def is_fatal_server_error(payload: dict) -> bool:
+    """服务端 `error` 事件是否属于**已判定的致命类**（纯函数，离线可测）。
+
+    用户实测日志（4 小时）：`{"code": "COMMON_ERROR", "message": "model repeat
+    output happened"}` 出现后服务端**必定**紧跟着 1011 掐断连接 —— 中间那几秒
+    干等没有意义，应主动重建。判定宁保守：只有这两类明确信号才算致命，
+    其余 error（限流、参数等）维持「只打印、不断线」的既有行为。
+    """
+    if not isinstance(payload, dict):
+        return False
+    err = payload.get("error") or payload
+    if not isinstance(err, dict):
+        return False
+    msg = str(err.get("message") or "").lower()
+    code = str(err.get("code") or "").upper()
+    if "model repeat output happened" in msg or "repeat output" in msg:
+        return True
+    return code == "COMMON_ERROR"
+
+
 class ConnectionBudget:
     """RPM 预算：滑动窗口内限制新建连接数（实测 RPM 10 会被快速重连撞掉）。"""
 
@@ -56,6 +76,9 @@ class QwenLiveTranslateSession(LiveTranslateSession):
         self._evt_hist: deque[tuple[str, float]] = deque(maxlen=80)
         self._evt_counts: dict[str, int] = {}
         self._closing = False
+        # 服务端判定致命错误的原因（如 model repeat output happened）。
+        # 一旦设置，说明本会话已被我们主动放弃，看门狗会直接走重连路径。
+        self.fatal_reason = ""
         self._buf: list[str] = []          # 本段已确认文本的增量累加
         self._src_buf: list[str] = []
         self._last_text_at: float = 0.0    # 最近一次文本增量时间（静默兜底用）
@@ -143,6 +166,8 @@ class QwenLiveTranslateSession(LiveTranslateSession):
     @property
     def fail_reason(self) -> str:
         """接收循环异常退出时的原因（用于日志与重连提示）。"""
+        if self.fatal_reason:
+            return self.fatal_reason
         if self._recv_task is None or not self._recv_task.done():
             return ""
         try:
@@ -167,6 +192,31 @@ class QwenLiveTranslateSession(LiveTranslateSession):
                 pass
         if self._recv_task is not None:
             self._recv_task.cancel()
+
+    def _abort_on_fatal(self, reason: str) -> None:
+        """服务端判定致命错误 → 主动放弃本会话（不许静默：必须留痕）。
+
+        只做三件幂等的事：记原因 → 置 _closing（is_alive=False）→ 关 ws。
+        不发 session.finish（服务端已经坏了，发了也是白等超时）；
+        重连交给引擎看门狗的既有路径（带退避 + RPM 预算，不会更凶）。
+        """
+        if not self.fatal_reason:
+            self.fatal_reason = reason
+            print(f"[session] ⚠️ 服务端判定致命错误 → 主动重建会话（不再干等 1011）：{reason}",
+                  flush=True)
+        self._closing = True
+        if self._ws is None:
+            return
+        try:
+            asyncio.get_running_loop().create_task(self._close_ws(self._ws))
+        except RuntimeError:
+            pass            # 不在事件循环里（离线单测直接调）：标志位已足够让看门狗接手
+
+    async def _close_ws(self, ws: Any) -> None:
+        try:
+            await ws.close()
+        except Exception:   # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------ 事件循环
     async def _recv_loop(self) -> None:
@@ -201,6 +251,11 @@ class QwenLiveTranslateSession(LiveTranslateSession):
         # --- 生命周期 ---
         if etype == "error":
             print(f"[session] ⚠️ 服务端 error: {json.dumps(ev.get('error') or ev, ensure_ascii=False)[:300]}")
+            if is_fatal_server_error(ev):
+                # 实测：这类 error 之后服务端必跟 1011 掐线。与其干等几秒，
+                # 不如立刻主动断连 —— is_alive=False → 看门狗 0.3s 内走既有重连路径。
+                self._abort_on_fatal(
+                    f"服务端致命错误：{json.dumps(ev.get('error') or ev, ensure_ascii=False)[:200]}")
             return
         if etype == "input_audio_buffer.speech_started":
             self._t_speech_start = time.perf_counter()

@@ -250,6 +250,115 @@ def test_send_failure_does_not_kill_leg() -> None:
     assert got == 100, f"重连后音频没发到新会话，新会话只收到 {got} 字节"
     print("  发送失败不打死采集循环 + 重连后音频转到新会话 OK")
 
+# ================================================================ ① 服务端致命 error → 主动重建
+# （实现在 vlt/session/qwen38.py：is_fatal_server_error / _abort_on_fatal / fail_reason）
+
+
+def test_is_fatal_server_error_classification() -> None:
+    """判定宁保守：只有明确信号才算致命，其余 error 维持「只打印、不断线」。"""
+    from vlt.session.qwen38 import is_fatal_server_error
+
+    fatal = [
+        {"type": "error", "error": {"code": "COMMON_ERROR",
+                                    "message": "model repeat output happened"}},  # 用户实测那一条
+        {"error": {"code": "COMMON_ERROR"}},                                      # 只有 code 也算
+        {"error": {"code": "OTHER", "message": "... repeat output ..."}},         # message 信号
+        {"code": "COMMON_ERROR", "message": "x"},                                 # 扁平 payload
+    ]
+    for p in fatal:
+        assert is_fatal_server_error(p), f"致命信号没判出来：{p}"
+    non_fatal = [
+        {"error": {"code": "RATE_LIMIT", "message": "slow down"}},
+        {"error": {"code": "INVALID_VALUE", "message": "参数错误"}},
+        {"error": {"message": "some transient glitch"}},
+        "not a dict", None, [],                                    # 非字典
+        {"error": "not a dict"},                                   # error 字段不是字典
+        {"type": "response.done"},                                 # 不是 error 也没有 code
+    ]
+    for p in non_fatal:
+        assert not is_fatal_server_error(p), f"非致命被误判：{p}"
+    print("  is_fatal_server_error 分类矩阵 OK（致命 4 例 / 非致命 7 例）")
+
+
+def test_fatal_server_error_aborts_session() -> None:
+    """★ 收到致命 error → 立刻主动放弃会话（不等 1011）：is_alive=False + fail_reason 留因。"""
+    import contextlib
+    import io
+
+    from vlt.session.base import SessionConfig
+    from vlt.session.qwen38 import QwenLiveTranslateSession
+
+    class _FakeWS:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    async def run() -> QwenLiveTranslateSession:
+        s = QwenLiveTranslateSession(SessionConfig())   # 默认 model=qwen3.8 → gen 38
+        s._ws = _FakeWS()
+        s._recv_task = asyncio.create_task(asyncio.sleep(60))
+        assert s.is_alive, "前提：会话本来是活的"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            # 非致命 error：维持「只打印、不断线」的既有行为
+            s._handle_event({"type": "error",
+                             "error": {"code": "INVALID_VALUE", "message": "bad param"}})
+            assert s.is_alive and not s.fatal_reason, "非致命 error 不该断线"
+            # 致命 error：主动放弃
+            s._handle_event({"type": "error",
+                             "error": {"code": "COMMON_ERROR",
+                                       "message": "model repeat output happened"}})
+        out = buf.getvalue()
+        assert "主动重建会话" in out, f"主动放弃必须留痕：{out!r}"
+        assert s.fatal_reason, "fatal_reason 没记下来"
+        assert not s.is_alive, "致命 error 后会话必须标记为不健康（看门狗才能接手）"
+        assert s.fail_reason == s.fatal_reason, "fail_reason 必须优先返回 fatal_reason"
+        # 幂等：第二次 abort 不覆盖第一次的原因
+        first = s.fatal_reason
+        s._abort_on_fatal("别的原因")
+        assert s.fatal_reason == first, "fatal_reason 被后一次覆盖"
+        s._recv_task.cancel()
+        await asyncio.sleep(0.05)                       # 让 _close_ws 任务跑完
+        assert s._ws.closed, "ws 没被关掉"
+        return s
+
+    asyncio.run(run())
+    print("  致命 error → 主动放弃 + 幂等 + 关 ws OK")
+
+
+def test_abort_on_fatal_works_outside_event_loop() -> None:
+    """不在事件循环里调 _abort_on_fatal 也不能抛（标志位已足够让看门狗接手）。"""
+    import contextlib
+    import io
+
+    from vlt.session.base import SessionConfig
+    from vlt.session.qwen38 import QwenLiveTranslateSession
+
+    s = QwenLiveTranslateSession(SessionConfig())
+    s._ws = object()                                    # 没有 close() 也无所谓
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        s._abort_on_fatal("离线直调")                   # 同步上下文：get_running_loop 会抛 RuntimeError
+    assert s.fatal_reason == "离线直调" and s._closing
+    assert "主动重建会话" in buf.getvalue()
+    # fail_reason 优先级：即便接收循环带异常结束，也先报 fatal_reason
+    async def _boom() -> None:
+        raise ConnectionResetError("1011")
+
+    async def run() -> None:
+        t = asyncio.create_task(_boom())
+        try:
+            await t
+        except ConnectionResetError:
+            pass
+        s._recv_task = t
+        assert s.fail_reason == "离线直调", f"fail_reason 没优先报 fatal：{s.fail_reason}"
+
+    asyncio.run(run())
+    print("  事件循环外 abort 不抛 + fail_reason 优先级 OK")
+
 
 if __name__ == "__main__":
     print("test_reconnect:")
@@ -258,4 +367,7 @@ if __name__ == "__main__":
     test_watchdog_ignores_healthy_session()
     test_black_box_dump_on_disconnect()
     test_send_failure_does_not_kill_leg()
+    test_is_fatal_server_error_classification()
+    test_fatal_server_error_aborts_session()
+    test_abort_on_fatal_works_outside_event_loop()
     print("ALL PASSED")

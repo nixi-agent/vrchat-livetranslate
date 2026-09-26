@@ -215,6 +215,11 @@ class Engine:
     def session(self):
         return self._session
 
+    @property
+    def _chatbox_wanted(self) -> bool:
+        """chatbox 只对「我说的话」方向有意义——对方的译文进手腕屏 / 聊天区，不进气泡。"""
+        return "chatbox" in self._sinks and self._direction == "mine"
+
     def set_languages(self, source_lang: str | None, target_lang: str) -> bool:
         """运行时切换语言：重建会话。预算不足时返回 False 并通过 on_status 告知。"""
         d = self._cfg.directions.get(self._direction)
@@ -325,7 +330,14 @@ class Engine:
     async def _build_and_run(self) -> None:
         scfg = self._cfg.directions[self._direction].to_session_config(self._cfg.session_base)
 
-        if "chatbox" in self._sinks:
+        if "chatbox" in self._sinks and not self._chatbox_wanted:
+            msg = ("chatbox 只发『我说的话』的译文"
+                   "（当前方向不含『我说』→ 本次 chatbox 不会输出；"
+                   "对方的译文照常进手腕屏 / 聊天区）")
+            self._events.on_status("warn", msg)
+            print(f"[engine] ⚠️ {msg}", flush=True)
+
+        if self._chatbox_wanted:
             cb = self._cfg.chatbox or {}
             self._chatbox = Chatbox(
                 host=cb.get("host", "127.0.0.1"),
@@ -518,7 +530,7 @@ class Engine:
             self._pending_seal = True
         if self._overlay is not None:
             self._overlay.update(text, d.source or "")
-        if self._merger is not None and "chatbox" in self._sinks:
+        if self._merger is not None and self._chatbox_wanted:
             self._merger.push(d)
 
     def _on_audio(self, pcm: bytes) -> None:
@@ -585,7 +597,7 @@ class Engine:
         self._events.on_text(text, translated, True)
         if self._overlay is not None:
             self._overlay.update(translated, text)
-        if self._chatbox is not None and "chatbox" in self._sinks:
+        if self._chatbox is not None and self._chatbox_wanted:
             limit = int((self._cfg.chatbox or {}).get("max_chars", 144))
             for chunk in split_for_chatbox(translated, limit):
                 self._chatbox.send(chunk, True)

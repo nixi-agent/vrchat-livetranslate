@@ -1342,6 +1342,15 @@ class TranslationGUI:
         if d in ("theirs", "dual"):
             specs.append(("theirs", "theirs", "loopback", b, a or "zh"))
 
+        # chatbox 只承载「我说的话」的译文（气泡在别人眼里代表我发言）。
+        # 若本次方向不含「我说」，用户勾了 chatbox 也一条都发不出去 —— 必须像
+        # 译音输出那样明说，别让人对着"没反应的 chatbox"排查（禁静默降级）。
+        chatbox_warn = ""
+        if "chatbox" in sinks and not any(s[1] == "mine" for s in specs):
+            chatbox_warn = ("chatbox 只发「我说的话」的译文（当前方向不含它）→ 本次 chatbox 不会输出；"
+                            "对方的译文看手腕屏／聊天区")
+            print(f"[gui] ⚠️ {chatbox_warn}", flush=True)
+
         # 启动时把「方向 + 每条腿的来源/语言 + 输出面」写进日志。
         # 没有这行的话，事后只能从有没有 [loopback] 打印去反推方向——
         # 用户报「英文没翻译」时就是这样，明明是没起 loopback 腿，却看着像翻译坏了。
@@ -1387,8 +1396,9 @@ class TranslationGUI:
         self._start_btn.configure(state=tk.DISABLED)
         self._stop_btn.configure(state=tk.NORMAL)
         self._set_text_input_enabled(d in ("mine", "dual"))
-        if audio_warn:
-            self._set_status("warn", audio_warn)
+        warns = [w for w in (audio_warn, chatbox_warn) if w]
+        if warns:
+            self._set_status("warn", "；".join(warns))
         elif d == "mine":
             # 只翻自己的话时明确提示一句：用户放英文视频却没选对方向，
             # 表现就是「翻译坏了」，而实际是根本没采集对方/视频的声音。
@@ -1403,7 +1413,10 @@ class TranslationGUI:
         who, direction, source, src_lang, tgt_lang = specs[index]
         # 引擎不碰手腕屏：它由界面持有（一块屏显示两个方向的对话）。
         # 若交给两个引擎各自创建，会撞 `OverlayError_KeyInUse`（用户实测）。
+        # chatbox 只发「我说的话」的译文——theirs 腿不需要它（与 engine._chatbox_wanted 同义，双保险）。
         own_sinks = {s for s in self._sinks if s != "overlay"}
+        if direction == "theirs":
+            own_sinks.discard("chatbox")
         events = EngineEvents(
             on_text=lambda src, txt, final, who=who: self._q.put(("text", who, src, txt, final)),
             on_status=lambda lvl, msg, who=who: self._on_engine_status(lvl, msg, who),

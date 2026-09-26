@@ -25,9 +25,10 @@ from tkinter import messagebox, ttk
 
 import yaml
 
-from . import __version__, crashlog, update_check
+from . import __version__, crashlog, i18n, update_check
 from .config import Direction, DEFAULT_CONFIG, load_config
 from .config_io import _fmt_scalar, _write_config_text, _yaml_set_in_text
+from .i18n import t
 from .output.overlay import OverlayConfig, WristOverlay
 from .devices import (
     DeviceInfo,
@@ -79,15 +80,13 @@ SPONSOR_QR_SIZE = 240          # 收款码等比缩放的目标边长（严禁�
 # ---- 百炼开通页（未配置 API key 时，状态按钮点击跳转）----
 # 链接逐字符照抄用户给的那串，不做任何 URL 解码/重组 —— 推广码被改坏就白推广了。
 BAILIAN_SIGNUP_URL = "https://www.aliyun.com/minisite/goods?userCode=q8nma978"
-# 按钮文案档位（按顺序试，取最小宽度 928 下能完整显示的第一档；实测见改动报告）。
-KEY_BTN_TEXT = "⚠ 未配置 API key · 点此开通百炼 ▸"
 
 
 def _sponsor_qr_specs() -> list[tuple[str, Path]]:
     """赞助弹窗的两张收款码：(标签, 图片路径)。只读资源一律走 bundle_dir()。"""
     assets = BUNDLE_DIR / "assets"
-    return [("微信", assets / "sponsor-wechat.png"),
-            ("支付宝", assets / "sponsor-alipay.png")]
+    return [(t("微信"), assets / "sponsor-wechat.png"),
+            (t("支付宝"), assets / "sponsor-alipay.png")]
 
 SOURCE_LANGS = {
     "自动检测": None,
@@ -227,6 +226,10 @@ class TranslationGUI:
         self._device_scan_pending = False
 
         self._cfg = load_config(require_key=False)   # 没填 key 也要能起界面（否则没法填 key）
+        # 界面语言解析顺序：用户选过（ui.lang）→ 系统语言 → zh。
+        # 必须在 _build_ui 之前定下来：之后所有 t() 都按它取词。
+        _saved_lang = (self._cfg.ui or {}).get("lang")
+        i18n.set_language(_saved_lang if _saved_lang else i18n.detect_system_language())
         mine = self._cfg.directions.get("mine")
         # 语言对：我的语言 A ↔ 对方语言 B。别人说方向自动镜像（B → A）。
         self._lang_pair = {
@@ -241,7 +244,7 @@ class TranslationGUI:
 
     def _build_ui(self) -> None:
         self._root = tk.Tk()
-        self._root.title("VRChat 实时同传")
+        self._root.title(t("VRChat 实时同传"))
         self._root.geometry("940x600")
         # 下限按第一行实测需求定（含「☕ 赞助」后整行 req=920px）：小于这个宽度
         # Tk 会从最后打包的控件开始裁（实测 860 时目标语言下拉被裁到 40px）。
@@ -424,24 +427,25 @@ class TranslationGUI:
 
         # 「⚙ 设置」先打包（side=RIGHT）：窗口变窄时 Tk 先挤压后打包的控件，
         # 先占住右侧入口，压缩只会发生在左侧分组之间的留白上。
-        self._settings_btn = ttk.Button(ctrl, text="⚙ 设置", width=8,
+        # 不写死宽度：英文文案比中文长，定宽会被裁（i18n 实测）。
+        self._settings_btn = ttk.Button(ctrl, text=t("⚙ 设置"),
                                         command=self._open_settings)
         self._settings_btn.pack(side=tk.RIGHT)
         # 「☕ 赞助」紧跟其后打包（也在右侧，排在「⚙ 设置」左边）：右侧控件必须
         # 全部先于左侧控件打包，否则空间不足时会被 Tk 从最后打包的开始裁掉。
-        self._sponsor_btn = ttk.Button(ctrl, text="☕ 赞助", width=8,
+        self._sponsor_btn = ttk.Button(ctrl, text=t("☕ 赞助"),
                                        command=self._open_sponsor)
         self._sponsor_btn.pack(side=tk.RIGHT, padx=(0, 8))
 
-        self._start_btn = ttk.Button(ctrl, text="开始翻译", style="Accent.TButton",
+        self._start_btn = ttk.Button(ctrl, text=t("开始翻译"), style="Accent.TButton",
                                      command=self._start)
         self._start_btn.pack(side=tk.LEFT, padx=(0, 8))
-        self._stop_btn = ttk.Button(ctrl, text="停止翻译", command=self._stop,
+        self._stop_btn = ttk.Button(ctrl, text=t("停止翻译"), command=self._stop,
                                     state=tk.DISABLED)
         self._stop_btn.pack(side=tk.LEFT)
 
         self._vsep(ctrl)
-        ttk.Label(ctrl, text="方向:").pack(side=tk.LEFT)
+        ttk.Label(ctrl, text=t("方向:")).pack(side=tk.LEFT)
         dir_frame = ttk.Frame(ctrl)
         dir_frame.pack(side=tk.LEFT)
         self._direction_var = tk.StringVar(value=str((self._cfg.ui or {}).get("direction", "mine")))
@@ -451,11 +455,11 @@ class TranslationGUI:
         # 经典控件的 bg/fg/selectcolor 一定可控，扁平且与面板融为一体。
         radio_kw = dict(variable=self._direction_var, command=self._on_direction_change,
                         **self._indicator_kw())
-        tk.Radiobutton(dir_frame, text="我说", value="mine",
+        tk.Radiobutton(dir_frame, text=t("我说"), value="mine",
                        **radio_kw).pack(side=tk.LEFT, padx=(8, 0))
-        tk.Radiobutton(dir_frame, text="别人说", value="theirs",
+        tk.Radiobutton(dir_frame, text=t("别人说"), value="theirs",
                        **radio_kw).pack(side=tk.LEFT, padx=(10, 0))
-        tk.Radiobutton(dir_frame, text="双向同时", value="dual",
+        tk.Radiobutton(dir_frame, text=t("双向同时"), value="dual",
                        **radio_kw).pack(side=tk.LEFT, padx=(10, 0))
 
         self._vsep(ctrl)
@@ -491,7 +495,7 @@ class TranslationGUI:
         # 初始先放标签；随后 _build_settings_dialog() 里的 _refresh_key_status() 会按真实状态切换。
         self._key_chip.pack()
 
-        ttk.Label(out_frame, text="输出:", style="Dim.TLabel").pack(side=tk.LEFT)
+        ttk.Label(out_frame, text=t("输出:"), style="Dim.TLabel").pack(side=tk.LEFT)
         self._chatbox_var = tk.BooleanVar(value=bool((self._cfg.ui or {}).get("chatbox", True)))
         self._overlay_var = tk.BooleanVar(value=bool((self._cfg.ui or {}).get("overlay", False)))
         # 译音输出：把「我说的话」的译音回灌进虚拟声卡，VRChat 里的对方就能听见外语 TTS。
@@ -501,14 +505,14 @@ class TranslationGUI:
         tk.Checkbutton(out_frame, text="chatbox", variable=self._chatbox_var,
                        command=self._save_ui_state,
                        **self._indicator_kw()).pack(side=tk.LEFT, padx=(6, 0))
-        tk.Checkbutton(out_frame, text="手腕屏", variable=self._overlay_var,
+        tk.Checkbutton(out_frame, text=t("手腕屏"), variable=self._overlay_var,
                        command=self._save_ui_state,
                        **self._indicator_kw()).pack(side=tk.LEFT, padx=(10, 0))
         # 微调按钮紧跟「手腕屏」勾选：它是手腕屏的从属工具，放远了看不出归属
-        self._tune_btn = ttk.Button(out_frame, text="微调 ▸", width=7,
+        self._tune_btn = ttk.Button(out_frame, text=t("微调 ▸"), width=7,
                                     command=self._toggle_tune_panel)
         self._tune_btn.pack(side=tk.LEFT, padx=(4, 0))
-        tk.Checkbutton(out_frame, text="译音输出", variable=self._vmic_var,
+        tk.Checkbutton(out_frame, text=t("译音输出"), variable=self._vmic_var,
                        command=self._save_audio_flag,
                        **self._indicator_kw()).pack(side=tk.LEFT, padx=(10, 0))
 
@@ -541,12 +545,12 @@ class TranslationGUI:
             # 那 106px 会一直占着把聊天区压扁。必须显式关掉传播并把高度压到 0。
             self._tune_frame.pack_propagate(False)
             self._tune_frame.configure(height=1)
-            self._tune_btn.configure(text="微调 ▸")
+            self._tune_btn.configure(text=t("微调 ▸"))
             new_h = max(self._root.minsize()[1], win_h - getattr(self, "_tune_added_h", 0))
         else:
             self._tune_frame.pack_propagate(True)
             self._tune_body.pack(fill=tk.X)
-            self._tune_btn.configure(text="微调 ▾")
+            self._tune_btn.configure(text=t("微调 ▾"))
             self._root.update_idletasks()
             self._tune_added_h = self._tune_body.winfo_reqheight() + 8
             new_h = win_h + self._tune_added_h
@@ -576,41 +580,41 @@ class TranslationGUI:
             "panel_h": float(_sz[1]),
         }
         self._ov_save_job: str | None = None
-        self._anchor_label_to_key = {"右手": "right_hand", "左手": "left_hand",
-                                     "前臂 tracker": "tracker", "头显前固定": "hmd"}
+        self._anchor_label_to_key = {t("右手"): "right_hand", t("左手"): "left_hand",
+                                     t("前臂 tracker"): "tracker", t("头显前固定"): "hmd"}
         _key_to_label = {v: k for k, v in self._anchor_label_to_key.items()}
 
         row = ttk.Frame(self._tune_body)
         row.pack(fill=tk.X, pady=(2, 2))
-        ttk.Label(row, text="锚点:", font=FONT_UI).pack(side=tk.LEFT)
+        ttk.Label(row, text=t("锚点:"), font=FONT_UI).pack(side=tk.LEFT)
         self._anchor_combo = ttk.Combobox(row, values=list(self._anchor_label_to_key),
                                           state="readonly", width=12, font=FONT_UI)
-        self._anchor_combo.set(_key_to_label.get(str(ov.get("anchor", "right_hand")), "右手"))
+        self._anchor_combo.set(_key_to_label.get(str(ov.get("anchor", "right_hand")), t("右手")))
         self._anchor_combo.pack(side=tk.LEFT, padx=(4, 14))
         self._anchor_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_anchor_change())
-        ttk.Label(row, text="tracker 序号:", font=FONT_UI).pack(side=tk.LEFT)
+        ttk.Label(row, text=t("tracker 序号:"), font=FONT_UI).pack(side=tk.LEFT)
         self._tracker_var = tk.StringVar(value=str(ov.get("tracker_index", 0)))
         ttk.Spinbox(row, from_=0, to=3, width=3, font=FONT_UI, textvariable=self._tracker_var,
                     command=self._save_overlay_cfg).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(row, text="（仅锚点=前臂 tracker 时有效）", font=FONT_STATUS,
+        ttk.Label(row, text=t("（仅锚点=前臂 tracker 时有效）"), font=FONT_STATUS,
                   foreground=TEXT_MUTED).pack(side=tk.LEFT, padx=(10, 0))
 
         grid = ttk.Frame(self._tune_body)
         grid.pack(fill=tk.X, pady=(2, 2))
         specs = [
-            ("pos_x", "位置X", -0.30, 0.30, 0.005, "m"),
-            ("pos_y", "位置Y", -0.30, 0.30, 0.005, "m"),
-            ("pos_z", "位置Z", -0.30, 0.30, 0.005, "m"),
-            ("rot_x", "俯仰X", -90.0, 90.0, 1.0, "°"),
-            ("rot_y", "偏航Y", -90.0, 90.0, 1.0, "°"),
-            ("rot_z", "翻滚Z", -90.0, 90.0, 1.0, "°"),
-            ("width_m", "大小", 0.05, 0.80, 0.01, "m"),
-            ("curvature", "弯曲", 0.0, 0.50, 0.01, ""),
-            ("alpha", "透明度", 0.10, 1.00, 0.05, ""),
+            ("pos_x", t("位置X"), -0.30, 0.30, 0.005, "m"),
+            ("pos_y", t("位置Y"), -0.30, 0.30, 0.005, "m"),
+            ("pos_z", t("位置Z"), -0.30, 0.30, 0.005, "m"),
+            ("rot_x", t("俯仰X"), -90.0, 90.0, 1.0, "°"),
+            ("rot_y", t("偏航Y"), -90.0, 90.0, 1.0, "°"),
+            ("rot_z", t("翻滚Z"), -90.0, 90.0, 1.0, "°"),
+            ("width_m", t("大小"), 0.05, 0.80, 0.01, "m"),
+            ("curvature", t("弯曲"), 0.0, 0.50, 0.01, ""),
+            ("alpha", t("透明度"), 0.10, 1.00, 0.05, ""),
             # 显示多少字由这三个决定：字号调小 → 同样高度塞更多字；面板调高 → 多一轮对话
-            ("font_size", "译文字号", 20, 64, 1, ""),
-            ("source_font_size", "原文字号", 14, 48, 1, ""),
-            ("panel_h", "面板高", 240, 560, 10, "px"),
+            ("font_size", t("译文字号"), 20, 64, 1, ""),
+            ("source_font_size", t("原文字号"), 14, 48, 1, ""),
+            ("panel_h", t("面板高"), 240, 560, 10, "px"),
         ]
         for i, (key, label, lo, hi, res, unit) in enumerate(specs):
             row_i, col_i = divmod(i, 3)
@@ -701,7 +705,7 @@ class TranslationGUI:
         设备扫描和自动化测试都直接访问它们。
         """
         win = tk.Toplevel(self._root)
-        win.title("设置")
+        win.title(t("设置"))
         win.configure(bg=PANEL)
         win.transient(self._root)
         win.resizable(False, False)
@@ -714,6 +718,26 @@ class TranslationGUI:
         body = ttk.Frame(win, padding=(18, 16, 18, 14))
         body.pack(fill=tk.BOTH, expand=True)
 
+        # ---- 界面语言 ----
+        # 本批只做到「重启后生效」：控件文案全在建窗时按当前语言取词，
+        # 运行中换语言不重建树（正在进行的翻译/设备列表状态绝不受影响）。
+        ttk.Label(body, text=t("界面语言"), style="Section.TLabel").pack(anchor=tk.W)
+        lang_row = ttk.Frame(body)
+        lang_row.pack(fill=tk.X, pady=(8, 4))
+        self._ui_lang_names = dict(i18n.available_languages())   # code → 母语名称
+        self._ui_lang_var = tk.StringVar(
+            value=self._ui_lang_names.get(i18n.current_language(), "简体中文"))
+        self._ui_lang_combo = ttk.Combobox(
+            lang_row, values=list(self._ui_lang_names.values()),
+            state="readonly", width=14, textvariable=self._ui_lang_var)
+        self._ui_lang_combo.pack(side=tk.LEFT)
+        self._ui_lang_combo.bind("<<ComboboxSelected>>", self._on_ui_lang_change)
+        self._ui_lang_note = ttk.Label(body, text=t("界面语言在重启程序后生效"),
+                                       style="Muted.TLabel")
+        self._ui_lang_note.pack(anchor=tk.W)
+
+        ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=14)
+
         # ---- API Key ----
         # 安全约束（与 vlt/credentials.py 一致）：
         # - 输入框用 ● 掩码；保存成功后**立刻清空输入框**，明文不留在界面上；
@@ -722,10 +746,11 @@ class TranslationGUI:
         key_row = ttk.Frame(body)
         key_row.pack(fill=tk.X, pady=(8, 4))
         # 先占右侧，空间不足时才不会把按钮挤没
-        self._key_clear_btn = ttk.Button(key_row, text="清除", width=5,
+        # 不写死宽度：英文文案比中文长，定宽会被裁（i18n 实测）
+        self._key_clear_btn = ttk.Button(key_row, text=t("清除"),
                                          command=self._on_clear_key)
         self._key_clear_btn.pack(side=tk.RIGHT, padx=(6, 0))
-        self._key_save_btn = ttk.Button(key_row, text="保存", width=6,
+        self._key_save_btn = ttk.Button(key_row, text=t("保存"),
                                         command=self._on_save_key)
         self._key_save_btn.pack(side=tk.RIGHT)
         self._key_var = tk.StringVar()
@@ -742,23 +767,23 @@ class TranslationGUI:
         # ---- 音频设备 ----
         dev_head = ttk.Frame(body)
         dev_head.pack(fill=tk.X)
-        ttk.Label(dev_head, text="音频设备", style="Section.TLabel").pack(side=tk.LEFT)
-        self._refresh_btn = ttk.Button(dev_head, text="刷新", width=5,
+        ttk.Label(dev_head, text=t("音频设备"), style="Section.TLabel").pack(side=tk.LEFT)
+        self._refresh_btn = ttk.Button(dev_head, text=t("刷新"),
                                        command=self._on_refresh_devices)
         self._refresh_btn.pack(side=tk.RIGHT)
 
         grid = ttk.Frame(body)
         grid.pack(fill=tk.X, pady=(8, 2))
         grid.columnconfigure(1, weight=1)
-        auto = "自动检测"
+        auto = t("自动检测")
         # ⚠️ 控件名不能改：设备扫描结果直接往这三个下拉里写值
         self._mic_combo = ttk.Combobox(grid, values=[auto], state="readonly")
         self._loopback_combo = ttk.Combobox(grid, values=[auto], state="readonly")
         self._audio_out_combo = ttk.Combobox(grid, values=[auto], state="readonly")
         for i, (label, combo) in enumerate((
-                ("麦克风:", self._mic_combo),
-                ("VRChat 音频:", self._loopback_combo),
-                ("译音输出:", self._audio_out_combo))):
+                (t("麦克风:"), self._mic_combo),
+                (t("VRChat 音频:"), self._loopback_combo),
+                (t("译音输出:"), self._audio_out_combo))):
             ttk.Label(grid, text=label, style="Dim.TLabel").grid(
                 row=i, column=0, sticky="w", pady=3)
             combo.grid(row=i, column=1, sticky="ew", padx=(8, 0), pady=3)
@@ -772,17 +797,21 @@ class TranslationGUI:
         self._loopback_combo.set(capture_cfg.get("loopback_device") or auto)
         self._audio_out_combo.set(audio_cfg.get("device_name") or auto)
 
-        ttk.Label(body, text="设备选择自动保存到 config.yaml",
+        ttk.Label(body, text=t("设备选择自动保存到 config.yaml"),
                   style="Muted.TLabel").pack(anchor=tk.W, pady=(6, 0))
 
         # ---- 日志 ----
         ttk.Separator(body).pack(fill=tk.X, pady=(14, 10))
         log_head = ttk.Frame(body)
         log_head.pack(fill=tk.X)
-        ttk.Label(log_head, text="日志", style="Section.TLabel").pack(side=tk.LEFT)
-        self._log_export_btn = ttk.Button(log_head, text="导出日志压缩包…",
+        ttk.Label(log_head, text=t("日志"), style="Section.TLabel").pack(side=tk.LEFT)
+        self._log_export_btn = ttk.Button(log_head, text=t("导出日志压缩包…"),
                                           command=self._on_export_logs)
         self._log_export_btn.pack(side=tk.RIGHT)
+        # side=RIGHT 后打包的排在已有按钮左边：[打开日志文件夹] [导出日志压缩包…]
+        self._log_open_btn = ttk.Button(log_head, text=t("打开日志文件夹"),
+                                        command=self._on_open_log_folder)
+        self._log_open_btn.pack(side=tk.RIGHT, padx=(0, 6))
         self._log_info = ttk.Label(body, text="", style="Muted.TLabel", justify=tk.LEFT)
         self._log_info.pack(anchor=tk.W, pady=(6, 0))
         self._refresh_log_info()
@@ -791,13 +820,13 @@ class TranslationGUI:
         ttk.Separator(body).pack(fill=tk.X, pady=(14, 10))
         upd_head = ttk.Frame(body)
         upd_head.pack(fill=tk.X)
-        ttk.Label(upd_head, text="软件更新", style="Section.TLabel").pack(side=tk.LEFT)
+        ttk.Label(upd_head, text=t("软件更新"), style="Section.TLabel").pack(side=tk.LEFT)
         self._update_check_btn = ttk.Button(
-            upd_head, text="检查更新",
+            upd_head, text=t("检查更新"),
             command=lambda: self._schedule_update_check(manual=True))
         self._update_check_btn.pack(side=tk.RIGHT)
         self._update_info = ttk.Label(
-            body, text=f"当前版本 v{__version__} · 启动时会自动检查一次",
+            body, text=t("当前版本 v{ver} · 启动时会自动检查一次", ver=__version__),
             style="Muted.TLabel", justify=tk.LEFT)
         self._update_info.pack(anchor=tk.W, pady=(6, 0))
 
@@ -820,9 +849,8 @@ class TranslationGUI:
             files, total = [], 0
         cap_mb = MAX_LOG_TOTAL_BYTES // 1024 // 1024
         self._log_info.config(
-            text=(f"共 {len(files)} 个文件，{total / 1024 / 1024:.1f} MB"
-                  f"（超过 {cap_mb} MB 自动删最旧的）\n{d}\n"
-                  f"出问题时导出压缩包发给维护者即可（自动脱敏，不含密钥）"))
+            text=t("共 {n} 个文件，{size} MB（超过 {cap} MB 自动删最旧的）\n{path}\n出问题时导出压缩包发给维护者即可（自动脱敏，不含密钥）",
+                   n=len(files), size=f"{total / 1024 / 1024:.1f}", cap=cap_mb, path=d))
 
     def _on_export_logs(self) -> None:
         """把日志打成 zip 到用户指定位置 —— 给朋友用来自证问题的入口。"""
@@ -834,12 +862,12 @@ class TranslationGUI:
         stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         try:
             dest = filedialog.asksaveasfilename(
-                parent=self._settings_win, title="导出日志压缩包",
+                parent=self._settings_win, title=t("导出日志压缩包"),
                 initialfile=f"vrchat-livetranslate-logs-{stamp}.zip",
                 defaultextension=".zip",
-                filetypes=[("ZIP 压缩包", "*.zip"), ("所有文件", "*.*")])
+                filetypes=[(t("ZIP 压缩包"), "*.zip"), (t("所有文件"), "*.*")])
         except Exception as exc:  # noqa: BLE001
-            self._set_status("error", f"打不开保存对话框：{exc}")
+            self._set_status("error", t("打不开保存对话框：{msg}", msg=exc))
             return
         if not dest:
             print("[gui] 导出日志：用户取消", flush=True)
@@ -847,20 +875,41 @@ class TranslationGUI:
         try:
             path, n, size, redacted = export_logs(Path(dest), log_dir=self._log_dir())
         except Exception as exc:  # noqa: BLE001
-            self._set_status("error", f"导出日志失败：{exc}")
+            self._set_status("error", t("导出日志失败：{msg}", msg=exc))
             print(f"[gui] ❌ 导出日志失败：{type(exc).__name__}: {exc}", flush=True)
             return
-        msg = f"日志已导出：{path}（{n} 个文件，{size / 1024:.0f} KB）"
+        # 同一条内容两份：日志保持中文（诊断用），界面走 i18n
+        msg_log = f"日志已导出：{path}（{n} 个文件，{size / 1024:.0f} KB）"
+        msg_ui = t("日志已导出：{path}（{n} 个文件，{size} KB）",
+                   path=path, n=n, size=f"{size / 1024:.0f}")
         if redacted:
-            msg += f"｜已脱敏 {len(redacted)} 个文件"
-        self._set_status("ok", msg)
-        print(f"[gui] ✅ {msg}", flush=True)
+            msg_log += f"｜已脱敏 {len(redacted)} 个文件"
+            msg_ui += t("｜已脱敏 {n} 个文件", n=len(redacted))
+        self._set_status("ok", msg_ui)
+        print(f"[gui] ✅ {msg_log}", flush=True)
         self._refresh_log_info()
         try:
-            messagebox.showinfo("导出完成", f"{msg}\n\n把这个压缩包发给维护者即可。",
+            messagebox.showinfo(t("导出完成"),
+                                f"{msg_ui}\n\n{t('把这个压缩包发给维护者即可。')}",
                                 parent=self._settings_win)
         except Exception:
             pass
+
+    def _on_open_log_folder(self) -> None:
+        """打开日志文件夹 —— 与「导出日志压缩包」看到的是同一个目录（_log_dir 单一真相，
+        源码运行 = 仓库 logs/，打包后 = %APPDATA%\\vrchat-livetranslate\\logs，绿色版 = exe 旁）。
+
+        本软件只发 Windows 版，直接 os.startfile；打不开**不许静默**：状态栏 + 日志都留痕。
+        """
+        d = self._log_dir()
+        try:
+            d.mkdir(parents=True, exist_ok=True)   # 还没写过日志时也能打开（空目录）
+            os.startfile(str(d))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[gui] ⚠️ 打不开日志文件夹（{d}）：{type(exc).__name__}: {exc}", flush=True)
+            self._set_status("error", t("打不开日志文件夹：{msg}", msg=exc))
+            return
+        print(f"[gui] 已打开日志文件夹：{d}", flush=True)
 
     def _open_settings(self) -> None:
         """打开设置弹窗（已建好，只是显示出来），定位到主窗口附近。"""
@@ -881,6 +930,36 @@ class TranslationGUI:
     def _close_settings(self) -> None:
         self._settings_win.withdraw()
 
+    # ---------------------------------------------------------------- 界面语言
+    def _on_ui_lang_change(self, _event=None) -> None:
+        """选完立即写 ui.lang；本批不重建树 —— 明确提示重启后生效（不许静默）。"""
+        name = self._ui_lang_var.get()
+        code = next((c for c, n in self._ui_lang_names.items() if n == name), "zh")
+        self._save_ui_language(code)
+        lang_name = self._ui_lang_names.get(code, name)
+        self._ui_lang_note.configure(
+            text=t("已保存：重启程序后界面将切换为 {lang}", lang=lang_name))
+        self._set_status("info",
+                         t("界面语言已保存：{lang}（重启程序后生效）", lang=lang_name))
+        print(f"[gui] 界面语言已选择：{code}（{lang_name}），已写入 ui.lang，重启后生效",
+              flush=True)
+
+    def _save_ui_language(self, code: str) -> None:
+        """把界面语言写进 config.yaml 的 ui.lang（就地改文本，保住注释与键顺序）。"""
+        p = DEFAULT_CONFIG
+        if not p.exists():
+            return
+        try:
+            text = p.read_text(encoding="utf-8")
+            if not re.search(r"^ui:", text, re.M):
+                text = text.rstrip("\n") + "\n\n# 界面上次的选择（启动时自动恢复，不用手改）\nui:\n"
+            text = _yaml_set_in_text(text, ["ui", "lang"], code)
+            _write_config_text(p, text)
+            if isinstance(self._cfg.ui, dict):
+                self._cfg.ui["lang"] = code
+        except Exception as exc:  # noqa: BLE001
+            print(f"[gui] 保存界面语言失败：{exc}", flush=True)
+
     # ---------------------------------------------------------------- 赞助弹窗
     def _open_kofi(self) -> None:
         """打开 Ko-fi 赞助页面（独立成小方法：测试打桩它，绝不真开浏览器）。"""
@@ -889,7 +968,7 @@ class TranslationGUI:
             print(f"[gui] 已打开赞助页面 {SPONSOR_URL}", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[gui] ⚠️ 打不开浏览器：{type(exc).__name__}: {exc}", flush=True)
-            self._set_status("warn", f"打不开浏览器，请手动访问 {SPONSOR_URL}")
+            self._set_status("warn", t("打不开浏览器，请手动访问 {url}", url=SPONSOR_URL))
 
     def _open_sponsor(self) -> None:
         """打开赞助弹窗；已经开着时只聚焦/置顶已有窗口，绝不 new 第二个。"""
@@ -910,7 +989,7 @@ class TranslationGUI:
             self._sponsor_win = None
             print(f"[gui] ⚠️ 赞助弹窗创建失败（不影响主功能）："
                   f"{type(exc).__name__}: {exc}", flush=True)
-            self._set_status("warn", f"赞助弹窗打不开：{exc}")
+            self._set_status("warn", t("赞助弹窗打不开：{msg}", msg=exc))
 
     def _build_sponsor_dialog(self) -> None:
         """赞助弹窗：Ko-fi 按钮 + 可复制地址 + 两张收款码（微信/支付宝）。
@@ -919,7 +998,7 @@ class TranslationGUI:
         收款码必须**等比**缩放（LANCZOS，目标边长 240px）——拉变形就扫不出来。
         """
         win = tk.Toplevel(self._root)
-        win.title("赞助")
+        win.title(t("赞助"))
         win.configure(bg=PANEL)
         win.transient(self._root)
         win.resizable(False, False)
@@ -932,10 +1011,10 @@ class TranslationGUI:
         body = ttk.Frame(win, padding=(20, 16, 20, 14))
         body.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(body, text="☕ 请我喝一杯",
+        ttk.Label(body, text=t("☕ 请我喝一杯"),
                   font=("Microsoft YaHei UI", 13, "bold")).pack(anchor=tk.CENTER)
 
-        ttk.Button(body, text="打开 Ko-fi 赞助页面", style="Accent.TButton",
+        ttk.Button(body, text=t("打开 Ko-fi 赞助页面"), style="Accent.TButton",
                    command=self._open_kofi).pack(anchor=tk.CENTER, pady=(12, 14))
 
         # 弹窗里**不放** Ko-fi 地址：蓝按钮点一下就直接开浏览器了，再摆一行地址纯属多余
@@ -951,9 +1030,9 @@ class TranslationGUI:
             ttk.Label(cell, text=label, style="Dim.TLabel").pack(anchor=tk.CENTER,
                                                                  pady=(6, 0))
 
-        ttk.Label(body, text="扫码支持 · 你给的钱会变成 API token，然后被我烧掉",
+        ttk.Label(body, text=t("扫码支持 · 你给的钱会变成 API token，然后被我烧掉"),
                   style="Dim.TLabel").pack(anchor=tk.CENTER, pady=(14, 4))
-        ttk.Button(body, text="关闭", width=8,
+        ttk.Button(body, text=t("关闭"), width=8,
                    command=self._close_sponsor).pack(anchor=tk.CENTER, pady=(8, 0))
 
         # 定位到主窗口附近 + 深色标题栏（与设置弹窗同一套做法）
@@ -983,7 +1062,7 @@ class TranslationGUI:
         except Exception as exc:  # noqa: BLE001
             print(f"[gui] ⚠️ 收款码加载失败（已降级为文字提示）：{path} "
                   f"→ {type(exc).__name__}: {exc}", flush=True)
-            return ttk.Label(parent, text="二维码图片缺失", style="Dim.TLabel")
+            return ttk.Label(parent, text=t("二维码图片缺失"), style="Dim.TLabel")
 
     def _close_sponsor(self) -> None:
         win, self._sponsor_win = self._sponsor_win, None
@@ -1009,8 +1088,8 @@ class TranslationGUI:
         self._update_check_running = True
         if manual and hasattr(self, "_update_check_btn"):
             self._update_check_btn.state(["disabled"])
-            self._update_check_btn.configure(text="检查中…")
-            self._update_info.configure(text="正在检查更新…")
+            self._update_check_btn.configure(text=t("检查中…"))
+            self._update_info.configure(text=t("正在检查更新…"))
         threading.Thread(target=self._run_update_check, args=(manual,), daemon=True).start()
 
     def _run_update_check(self, manual: bool) -> None:
@@ -1030,7 +1109,7 @@ class TranslationGUI:
         self._update_check_running = False
         if hasattr(self, "_update_check_btn"):
             self._update_check_btn.state(["!disabled"])
-            self._update_check_btn.configure(text="检查更新")
+            self._update_check_btn.configure(text=t("检查更新"))
         if status == "update" and info is not None:
             # GUI 入口复核忽略列表（双保险：check_for_updates 判过一次，但测试/手动路径
             # 可能绕过它直接给结果 —— 点过「不再提示这个版本」的，说什么也不再弹）
@@ -1038,7 +1117,7 @@ class TranslationGUI:
                 print(f"[update] v{info.version} 在忽略列表，跳过（不弹窗）", flush=True)
                 if manual:
                     self._update_info.configure(
-                        text=f"v{info.version} 已设为「不再提示这个版本」")
+                        text=t("v{ver} 已设为「不再提示这个版本」", ver=info.version))
                 return
             if self._update_snoozed and not manual:
                 print("[update] 本会话已选「下次再说」，自动提示不再弹（设置里可手动检查）",
@@ -1048,19 +1127,20 @@ class TranslationGUI:
             print("[update] 已弹出「发现新版本」提示窗", flush=True)
             if manual:
                 self._update_info.configure(
-                    text=f"发现新版本 v{info.version}（当前 v{__version__}）")
+                    text=t("发现新版本 v{new}（当前 v{cur}）",
+                           new=info.version, cur=__version__))
         elif status == "latest" and info is not None:
             if manual:
-                self._update_info.configure(text=f"已是最新 v{info.version} ✅")
+                self._update_info.configure(text=t("已是最新 v{ver} ✅", ver=info.version))
         elif status == "ignored" and info is not None:
             if manual:
                 self._update_info.configure(
-                    text=f"v{info.version} 已设为「不再提示这个版本」")
+                    text=t("v{ver} 已设为「不再提示这个版本」", ver=info.version))
         else:  # error：自动检查对用户完全无感（只留日志）；手动检查把原因显示在设置区
             if manual:
-                reason = err or "原因见日志"
+                reason = err or t("原因见日志")
                 self._update_info.configure(
-                    text=f"检查失败：{reason}。可以点「检查更新」重试。")
+                    text=t("检查失败：{reason}。可以点「检查更新」重试。", reason=reason))
 
     # ---------------------------------------------------------------- 三按钮弹窗（发现新版本）
     def _show_update_dialog(self, info) -> None:
@@ -1068,7 +1148,7 @@ class TranslationGUI:
         文案逐字照抄计划「文案 checklist ①」。已存在弹窗时先销毁再建（防重复）。"""
         self._close_update_dialog()
         win = tk.Toplevel(self._root)
-        win.title("发现新版本")
+        win.title(t("发现新版本"))
         win.configure(bg=PANEL)
         win.transient(self._root)
         win.resizable(False, False)
@@ -1078,25 +1158,25 @@ class TranslationGUI:
 
         body = ttk.Frame(win, padding=(20, 16, 20, 14))
         body.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(body, text="发现新版本",
+        ttk.Label(body, text=t("发现新版本"),
                   font=("Microsoft YaHei UI", 12, "bold")).pack(anchor=tk.W)
         ttk.Label(body,
-                  text="VRChat Live Translate 有新版本了。"
-                       "现在更新只要一两分钟，不影响你正在进行的翻译。",
+                  text=t("VRChat Live Translate 有新版本了。"
+                         "现在更新只要一两分钟，不影响你正在进行的翻译。"),
                   wraplength=380, justify=tk.LEFT).pack(anchor=tk.W, pady=(10, 0))
-        link = tk.Label(body, text="看看这次更新了什么", fg=ACCENT_HOVER, bg=PANEL,
+        link = tk.Label(body, text=t("看看这次更新了什么"), fg=ACCENT_HOVER, bg=PANEL,
                         cursor="hand2", font=FONT_UI)
         link.pack(anchor=tk.W, pady=(8, 0))
         link.bind("<Button-1>", lambda _e: self._open_release_page(info.html_url))
 
         btns = ttk.Frame(body)
         btns.pack(fill=tk.X, pady=(16, 0))
-        now = ttk.Button(btns, text="立即更新", style="Accent.TButton",
+        now = ttk.Button(btns, text=t("立即更新"), style="Accent.TButton",
                          command=lambda: self._on_update_now(info))
         now.pack(side=tk.LEFT)
-        ttk.Button(btns, text="下次再说",
+        ttk.Button(btns, text=t("下次再说"),
                    command=self._on_update_later).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(btns, text="不再提示这个版本",
+        ttk.Button(btns, text=t("不再提示这个版本"),
                    command=lambda: self._on_update_ignore(info)).pack(side=tk.LEFT,
                                                                        padx=(8, 0))
         now.focus_set()                       # 默认按钮：回车/焦点都落在「立即更新」
@@ -1123,7 +1203,7 @@ class TranslationGUI:
             print(f"[update] 已打开 Release 页面 {url}", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[update] ⚠️ 打不开浏览器：{type(exc).__name__}: {exc}", flush=True)
-            self._set_status("warn", f"打不开浏览器，请手动访问 {url}")
+            self._set_status("warn", t("打不开浏览器，请手动访问 {url}", url=url))
 
     def _on_update_ignore(self, info) -> None:
         """「不再提示这个版本」→ 写 config.yaml 的 ui.update_ignored，关窗，该版本永不再提。"""
@@ -1133,7 +1213,7 @@ class TranslationGUI:
                   f"这个版本不再提示", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[update] ⚠️ 写入忽略列表失败：{type(exc).__name__}: {exc}", flush=True)
-            self._set_status("warn", f"「不再提示」没存下来：{exc}")
+            self._set_status("warn", t("「不再提示」没存下来：{msg}", msg=exc))
         self._close_update_dialog()
 
     def _on_update_later(self) -> None:
@@ -1147,11 +1227,11 @@ class TranslationGUI:
         """「立即更新」：源码运行给指引（不自更新）；打包 exe 走两段式 —— 先开下载进度窗。"""
         if update_check.update_mode() != "frozen":
             open_page = messagebox.askokcancel(
-                "如何更新",
-                "你现在运行的是源码版，不能自动更新。\n\n"
-                "· 会用 git：在仓库目录跑 git pull 就是最新版；\n"
-                "· 或者点「确定」打开新版本下载页，下载安装包。\n\n"
-                "点「取消」先不更新。",
+                t("如何更新"),
+                t("你现在运行的是源码版，不能自动更新。\n\n"
+                  "· 会用 git：在仓库目录跑 git pull 就是最新版；\n"
+                  "· 或者点「确定」打开新版本下载页，下载安装包。\n\n"
+                  "点「取消」先不更新。"),
                 parent=self._update_win)
             if open_page:
                 self._open_release_page(info.html_url)
@@ -1161,9 +1241,9 @@ class TranslationGUI:
         exe = Path(sys.executable).resolve()
         if not _dir_writable(exe.parent):
             open_page = messagebox.askokcancel(
-                "无法自动更新",
-                "程序所在的位置不允许写入（比如放在 Program Files）。\n\n"
-                "点「确定」打开下载页，自己下载新版本；点「取消」先不更新。",
+                t("无法自动更新"),
+                t("程序所在的位置不允许写入（比如放在 Program Files）。\n\n"
+                  "点「确定」打开下载页，自己下载新版本；点「取消」先不更新。"),
                 parent=self._update_win)
             if open_page:
                 self._open_release_page(info.html_url)
@@ -1193,7 +1273,7 @@ class TranslationGUI:
         总量优先级：Content-Length（回调带）> ReleaseInfo.exe_size > indeterminate 只显示已下载量。"""
         self._close_download_window()
         win = tk.Toplevel(self._root)
-        win.title("正在下载新版本")
+        win.title(t("正在下载新版本"))
         win.configure(bg=PANEL)
         win.transient(self._root)
         win.resizable(False, False)
@@ -1208,19 +1288,19 @@ class TranslationGUI:
                                        maximum=100.0, value=0.0)
         self._dl_bar.pack(fill=tk.X)
         if info.exe_size:
-            text = (f"已下载 0.0 / 约 {info.exe_size / 1048576:.1f} MB，"
-                    f"一般 1–3 分钟就好。下载期间可以正常翻译。")
+            text = t("已下载 {done} / 约 {total} MB，一般 1–3 分钟就好。下载期间可以正常翻译。",
+                     done="0.0", total=f"{info.exe_size / 1048576:.1f}")
         else:
             self._dl_bar.configure(mode="indeterminate")
             self._dl_bar.start(14)
-            text = "已下载 0.0 MB，请稍等。"
+            text = t("已下载 {done} MB，请稍等。", done="0.0")
         self._dl_text = ttk.Label(body, text=text, wraplength=380, justify=tk.LEFT)
         self._dl_text.pack(anchor=tk.W, pady=(10, 0))
-        self._dl_note = ttk.Label(body, text="点右上角关闭会取消下载，下次可以再下。",
+        self._dl_note = ttk.Label(body, text=t("点右上角关闭会取消下载，下次可以再下。"),
                                   style="Muted.TLabel")
         self._dl_note.pack(anchor=tk.W, pady=(10, 0))
         # 「打开下载页自己下」：下载失败/完成态都能点到的第三条出路（网络实在不稳时自己下）
-        self._dl_link = tk.Label(body, text="打开下载页自己下", fg=ACCENT_HOVER, bg=PANEL,
+        self._dl_link = tk.Label(body, text=t("打开下载页自己下"), fg=ACCENT_HOVER, bg=PANEL,
                                  cursor="hand2", font=FONT_UI)
         self._dl_link.pack(anchor=tk.W, pady=(6, 0))
         self._dl_link.bind("<Button-1>", lambda _e: self._open_download_page())
@@ -1307,13 +1387,14 @@ class TranslationGUI:
                 self._dl_bar.configure(mode="determinate")
             self._dl_bar.configure(maximum=float(total), value=float(done))
             self._dl_text.configure(
-                text=f"已下载 {done / 1048576:.1f} / 约 {total / 1048576:.1f} MB，"
-                     f"一般 1–3 分钟就好。下载期间可以正常翻译。")
+                text=t("已下载 {done} / 约 {total} MB，一般 1–3 分钟就好。下载期间可以正常翻译。",
+                       done=f"{done / 1048576:.1f}", total=f"{total / 1048576:.1f}"))
         else:
             if str(self._dl_bar.cget("mode")) != "indeterminate":
                 self._dl_bar.configure(mode="indeterminate")
                 self._dl_bar.start(14)
-            self._dl_text.configure(text=f"已下载 {done / 1048576:.1f} MB，请稍等。")
+            self._dl_text.configure(
+                text=t("已下载 {done} MB，请稍等。", done=f"{done / 1048576:.1f}"))
 
     def _on_download_done(self, new_exe) -> None:
         """主线程：下载+校验完成 → 切「完成态」（文案 checklist ③）。"""
@@ -1335,19 +1416,19 @@ class TranslationGUI:
         self._dl_new_exe = Path(new_exe)
         self._dl_bar.stop()
         self._dl_bar.configure(mode="determinate", maximum=1.0, value=1.0)
-        self._dl_win.title("下载完成")
+        self._dl_win.title(t("下载完成"))
         self._dl_text.configure(
-            text="新版本已经准备好了。\n"
-                 "点「立即重启并更新」：关闭当前窗口、自动换上新版本并重新打开。\n"
-                 "点「稍后更新」：继续用现在的版本；等你关闭程序时会自动换好，下次打开就是新版。")
+            text=t("新版本已经准备好了。\n"
+                   "点「立即重启并更新」：关闭当前窗口、自动换上新版本并重新打开。\n"
+                   "点「稍后更新」：继续用现在的版本；等你关闭程序时会自动换好，下次打开就是新版。"))
         self._dl_note.pack_forget()            # 已完成：「关窗会取消」的小字不再适用
         for child in self._dl_btn_frame.winfo_children():   # 防重复进完成态时叠按钮
             child.destroy()
-        self._dl_reload_btn = ttk.Button(self._dl_btn_frame, text="立即重启并更新",
+        self._dl_reload_btn = ttk.Button(self._dl_btn_frame, text=t("立即重启并更新"),
                                          style="Accent.TButton",
                                          command=self._on_reload_clicked)
         self._dl_reload_btn.pack(side=tk.LEFT)
-        self._dl_postpone_btn = ttk.Button(self._dl_btn_frame, text="稍后更新",
+        self._dl_postpone_btn = ttk.Button(self._dl_btn_frame, text=t("稍后更新"),
                                            command=self._on_postpone_clicked)
         self._dl_postpone_btn.pack(side=tk.LEFT, padx=(8, 0))
         self._dl_reload_btn.focus_set()
@@ -1366,14 +1447,14 @@ class TranslationGUI:
         except OSError:
             pass
         retry = messagebox.askretrycancel(
-            "下载没有成功",
-            "下载没有成功（网络可能不太稳定）。\n\n"
-            "点「重试」再下载一次；点「取消」暂时跳过。\n"
-            "（之后也可以到「设置 → 软件更新」再检查）",
+            t("下载没有成功"),
+            t("下载没有成功（网络可能不太稳定）。\n\n"
+              "点「重试」再下载一次；点「取消」暂时跳过。\n"
+              "（之后也可以到「设置 → 软件更新」再检查）"),
             parent=self._dl_win)
         if retry and self._dl_win is not None and self._dl_info is not None:
             self._dl_bar.configure(mode="determinate", maximum=100.0, value=0.0)
-            self._dl_text.configure(text="已下载 0.0 MB，请稍等。")
+            self._dl_text.configure(text=t("已下载 {done} MB，请稍等。", done="0.0"))
             print("[update] 用户选择重试下载", flush=True)
             self._start_download(self._dl_info)
         else:
@@ -1405,7 +1486,7 @@ class TranslationGUI:
                 except Exception:  # noqa: BLE001
                     pass
         if self._dl_reload_btn is not None:
-            self._dl_reload_btn.configure(text="正在重启…")
+            self._dl_reload_btn.configure(text=t("正在重启…"))
         try:
             exe = Path(sys.executable).resolve()
             bat = update_check.build_updater_bat(pid=os.getpid(), current_exe=exe,
@@ -1422,12 +1503,12 @@ class TranslationGUI:
                     except Exception:  # noqa: BLE001
                         pass
             if self._dl_reload_btn is not None:
-                self._dl_reload_btn.configure(text="立即重启并更新")
+                self._dl_reload_btn.configure(text=t("立即重启并更新"))
             retry = messagebox.askretrycancel(
-                "更新没有成功",
-                "更新没有成功，现在的版本不受影响，可以继续用。\n\n"
-                "点「重试」再试一次；点「取消」先继续用现在的版本"
-                "（窗口里也可以「打开下载页自己下」）。",
+                t("更新没有成功"),
+                t("更新没有成功，现在的版本不受影响，可以继续用。\n\n"
+                  "点「重试」再试一次；点「取消」先继续用现在的版本"
+                  "（窗口里也可以「打开下载页自己下」）。"),
                 parent=self._dl_win)
             if retry:
                 print("[update] 用户选择重试「立即重启并更新」", flush=True)
@@ -1500,9 +1581,9 @@ class TranslationGUI:
                   f"（新版本已下载好并保留，下次启动会再给更新入口）", flush=True)
             info = self._update_pending_info
             open_page = messagebox.askokcancel(
-                "更新没有成功",
-                "更新没有成功，现在的版本不受影响，下次打开还是它。\n\n"
-                "点「确定」打开下载页自己下；点「取消」直接退出。",
+                t("更新没有成功"),
+                t("更新没有成功，现在的版本不受影响，下次打开还是它。\n\n"
+                  "点「确定」打开下载页自己下；点「取消」直接退出。"),
                 parent=self._root)
             if open_page and info is not None and info.html_url:
                 self._open_release_page(info.html_url)
@@ -1564,7 +1645,7 @@ class TranslationGUI:
         except Exception:  # noqa: BLE001
             return
         win = tk.Toplevel(self._root)
-        win.title("已更新到最新版本")
+        win.title(t("已更新到最新版本"))
         win.configure(bg=PANEL)
         win.transient(self._root)
         win.resizable(False, False)
@@ -1574,16 +1655,16 @@ class TranslationGUI:
 
         body = ttk.Frame(win, padding=(20, 16, 20, 14))
         body.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(body, text="已更新到最新版本",
+        ttk.Label(body, text=t("已更新到最新版本"),
                   font=("Microsoft YaHei UI", 12, "bold")).pack(anchor=tk.W)
-        ttk.Label(body, text="VRChat Live Translate 已更新到最新版本，一切照常使用。",
+        ttk.Label(body, text=t("VRChat Live Translate 已更新到最新版本，一切照常使用。"),
                   wraplength=360, justify=tk.LEFT).pack(anchor=tk.W, pady=(10, 0))
-        link = tk.Label(body, text="看看这次更新了什么", fg=ACCENT_HOVER, bg=PANEL,
+        link = tk.Label(body, text=t("看看这次更新了什么"), fg=ACCENT_HOVER, bg=PANEL,
                         cursor="hand2", font=FONT_UI)
         link.pack(anchor=tk.W, pady=(8, 0))
         link.bind("<Button-1>", lambda _e: self._open_release_page(
             f"{update_check.RELEASES_HTML}/tag/v{__version__}"))
-        ok = ttk.Button(body, text="知道了", style="Accent.TButton",
+        ok = ttk.Button(body, text=t("知道了"), style="Accent.TButton",
                         command=self._close_updated_hint)
         ok.pack(anchor=tk.E, pady=(16, 0))
         ok.focus_set()
@@ -1619,23 +1700,24 @@ class TranslationGUI:
 
             src, masked = key_source()
         except Exception as exc:  # noqa: BLE001
-            self._key_status.config(text=f"⚠️ 读取 key 状态失败：{exc}")
+            self._key_status.config(text=t("⚠️ 读取 key 状态失败：{msg}", msg=exc))
             return
         if masked:
-            self._key_status.config(text=f"当前：{src} {masked}")
+            self._key_status.config(text=t("当前：{src} {masked}", src=src, masked=masked))
         else:
-            self._key_status.config(text="⚠️ 未配置 API key —— 在上面粘贴后点「保存」")
+            self._key_status.config(text=t("⚠️ 未配置 API key —— 在上面粘贴后点「保存」"))
         if hasattr(self, "_key_chip"):
             if masked:
                 # 已配置：恢复纯展示标签（按钮收起，不残留）
-                self._key_chip.configure(text="API key 已配置", style="Chip.TLabel")
+                self._key_chip.configure(text=t("API key 已配置"), style="Chip.TLabel")
                 if self._key_btn.winfo_manager():
                     self._key_btn.pack_forget()
                 if not self._key_chip.winfo_manager():
                     self._key_chip.pack()
             else:
                 # 未配置：换成可点按钮（跳转百炼开通页）
-                self._key_btn.configure(text=KEY_BTN_TEXT)
+                # 文案档位：最小宽度 928 下能完整显示（实测见改动报告）
+                self._key_btn.configure(text=t("⚠ 未配置 API key · 点此开通百炼 ▸"))
                 if self._key_chip.winfo_manager():
                     self._key_chip.pack_forget()
                 if not self._key_btn.winfo_manager():
@@ -1660,7 +1742,8 @@ class TranslationGUI:
                 print(f"[gui] ⚠ webbrowser.open 返回 False，请手动访问：{BAILIAN_SIGNUP_URL}",
                       flush=True)
         if not ok:
-            self._set_status("warn", f"打不开浏览器，请手动复制访问：{BAILIAN_SIGNUP_URL}")
+            self._set_status("warn", t("打不开浏览器，请手动复制访问：{url}",
+                                       url=BAILIAN_SIGNUP_URL))
 
     def _refresh_api_key_in_cfg(self) -> None:
         """按既有优先级链重新解析 API key 并写回 self._cfg.session_base["api_key"]。
@@ -1693,15 +1776,15 @@ class TranslationGUI:
             path = save_api_key(raw)
         except ValueError as exc:
             self._key_var.set("")                      # 明文不留在界面上
-            self._key_status.config(text=f"❌ 没保存：{exc}")
-            self._set_status("error", f"API key 保存失败：{exc}")
+            self._key_status.config(text=t("❌ 没保存：{msg}", msg=exc))
+            self._set_status("error", t("API key 保存失败：{msg}", msg=exc))
             print(f"[gui] ❌ API key 保存失败：{exc}", flush=True)
             return
         self._key_var.set("")
         shown = mask_key(load_saved_key() or "")
         self._refresh_key_status()
         self._refresh_api_key_in_cfg()      # 关键：写回内存快照，否则开始翻译还读启动时的旧值
-        self._set_status("ok", f"API key 已保存（{shown}）")
+        self._set_status("ok", t("API key 已保存（{shown}）", shown=shown))
         print(f"[gui] ✅ API key 已保存（{shown}）→ {path}", flush=True)
         self._check_api_key()
 
@@ -1711,9 +1794,11 @@ class TranslationGUI:
         removed = clear_saved_key()
         self._refresh_key_status()
         self._refresh_api_key_in_cfg()      # 清除后可能回退到别的来源、也可能变空 —— 内存同步
-        msg = "已清除保存的 API key" if removed else "本来就没有保存过 API key"
+        msg = t("已清除保存的 API key") if removed else t("本来就没有保存过 API key")
         self._set_status("info", msg)
-        print(f"[gui] {msg}", flush=True)
+        # 日志保持中文（诊断用），界面已走 i18n
+        print(f"[gui] {'已清除保存的 API key' if removed else '本来就没有保存过 API key'}",
+              flush=True)
         self._check_api_key()
 
     def _build_chat(self) -> None:
@@ -1742,16 +1827,16 @@ class TranslationGUI:
             return                       # 配置里关掉了：整行不建（下面各处都有 hasattr 兜底）
         row = ttk.Frame(self._root, padding=(14, 8, 14, 6))
         row.pack(fill=tk.X)
-        ttk.Label(row, text="打字:", style="Dim.TLabel").pack(side=tk.LEFT)
+        ttk.Label(row, text=t("打字:"), style="Dim.TLabel").pack(side=tk.LEFT)
         self._text_var = tk.StringVar()
         self._text_entry = ttk.Entry(row, textvariable=self._text_var, font=FONT_UI,
                                      style="Key.TEntry")   # 复用「键输入框」样式：底色=SURFACE，与按钮一致
         self._text_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
         self._text_entry.bind("<Return>", self._on_text_enter)
         self._text_entry.bind("<Escape>", lambda _e: self._text_var.set(""))
-        self._send_btn = ttk.Button(row, text="发送", width=8, command=self._send_typed)
+        self._send_btn = ttk.Button(row, text=t("发送"), width=8, command=self._send_typed)
         self._send_btn.pack(side=tk.LEFT)
-        ttk.Label(row, text="回车发送 · Esc 清空", style="Muted.TLabel").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(row, text=t("回车发送 · Esc 清空"), style="Muted.TLabel").pack(side=tk.LEFT, padx=(8, 0))
         self._set_text_input_enabled(False)
 
     def _set_text_input_enabled(self, on: bool) -> None:
@@ -1774,15 +1859,15 @@ class TranslationGUI:
             return
         targets = [e for e, dirn in zip(self._engines, self._engine_dirs) if dirn == "mine"]
         if not targets:
-            self._set_status("warn", "打字替代的是麦克风 —— 先点「开始翻译」，"
-                                     "且方向要含「我说」")
+            self._set_status("warn", t("打字替代的是麦克风 —— 先点「开始翻译」，"
+                                       "且方向要含「我说」"))
             return
         sent = sum(1 for e in targets if e.send_text(text))
         if sent:
             self._text_var.set("")      # 清空：肉眼确认已发出
-            self._set_status("info", f"打字已送出（{len(text)} 字），翻译中…")
+            self._set_status("info", t("打字已送出（{n} 字），翻译中…", n=len(text)))
         else:
-            self._set_status("warn", "引擎还没就绪，稍后重试")
+            self._set_status("warn", t("引擎还没就绪，稍后重试"))
 
     def _build_status(self) -> None:
         bar = ttk.Frame(self._root, padding=(14, 7))
@@ -1792,7 +1877,7 @@ class TranslationGUI:
         self._status_dot = tk.Label(bar, text="●", bg=PANEL, fg=TEXT_MUTED,
                                     font=FONT_STATUS, bd=0)
         self._status_dot.pack(side=tk.LEFT, padx=(0, 6))
-        self._status_label = ttk.Label(bar, text="就绪", style="Status.TLabel")
+        self._status_label = ttk.Label(bar, text=t("就绪"), style="Status.TLabel")
         self._status_label.pack(side=tk.LEFT)
         self._stats_label = ttk.Label(bar, text="", style="Muted.TLabel")
         self._stats_label.pack(side=tk.RIGHT)
@@ -1859,7 +1944,9 @@ class TranslationGUI:
                                                          self._lang_pair["target"])
         if self._lang_pair["source"] is None:
             # 自动检测没有对应目标：别人说方向的目标回落到中文
-            self._set_status("info", f"已切换为{_target_name(self._lang_pair['target'])} → 中文")
+            self._set_status("info",
+                             t("已切换为{target} → 中文",
+                               target=_target_name(self._lang_pair["target"])))
         self._save_lang_config()
         self._push_lang_to_engines()
         self._update_direction_langs()
@@ -1949,7 +2036,7 @@ class TranslationGUI:
         self._refresh_api_key_in_cfg()   # 防呆：key 可能在运行期被保存/清除/改环境，先重解再检查
         if not (self._cfg.session_base.get("api_key") or "").strip():
             # 没 key 就别白连一次（会撞 401），直接把用户送到填 key 的地方
-            self._set_status("error", "还没配置 API key —— 点右上角「API key ›」填一个再开始")
+            self._set_status("error", t("还没配置 API key —— 点右上角「API key ›」填一个再开始"))
             self._open_settings()
             return
         d = self._direction_var.get()
@@ -1960,7 +2047,7 @@ class TranslationGUI:
         if self._overlay_var.get():
             sinks.add("overlay")
         if not sinks:
-            self._set_status("warn", "请至少选择一个输出")
+            self._set_status("warn", t("请至少选择一个输出"))
             return
 
         a, b = self._lang_pair["source"], self._lang_pair["target"] or "en"
@@ -1975,9 +2062,10 @@ class TranslationGUI:
         # 译音输出那样明说，别让人对着"没反应的 chatbox"排查（禁静默降级）。
         chatbox_warn = ""
         if "chatbox" in sinks and not any(s[1] == "mine" for s in specs):
-            chatbox_warn = ("chatbox 只发「我说的话」的译文（当前方向不含它）→ 本次 chatbox 不会输出；"
-                            "对方的译文看手腕屏／聊天区")
-            print(f"[gui] ⚠️ {chatbox_warn}", flush=True)
+            _zh = ("chatbox 只发「我说的话」的译文（当前方向不含它）→ 本次 chatbox 不会输出；"
+                   "对方的译文看手腕屏／聊天区")
+            chatbox_warn = t(_zh)
+            print(f"[gui] ⚠️ {_zh}", flush=True)   # 日志保持中文（诊断用），界面走 i18n
 
         # 启动时把「方向 + 每条腿的来源/语言 + 输出面」写进日志。
         # 没有这行的话，事后只能从有没有 [loopback] 打印去反推方向——
@@ -1995,8 +2083,9 @@ class TranslationGUI:
         want_audio = bool(self._vmic_var.get())
         audio_warn = ""
         if want_audio and not any(s[1] == "mine" for s in specs):
-            audio_warn = "译音输出只对「我说的话」方向有效（当前方向不含它）→ 本次已忽略"
-            print(f"[gui] ⚠️ {audio_warn}", flush=True)
+            _zh = "译音输出只对「我说的话」方向有效（当前方向不含它）→ 本次已忽略"
+            audio_warn = t(_zh)
+            print(f"[gui] ⚠️ {_zh}", flush=True)   # 日志保持中文（诊断用），界面走 i18n
             want_audio = False
         if isinstance(self._cfg.output, dict):
             self._cfg.output.setdefault("audio", {})["enabled"] = want_audio
@@ -2030,9 +2119,9 @@ class TranslationGUI:
         elif d == "mine":
             # 只翻自己的话时明确提示一句：用户放英文视频却没选对方向，
             # 表现就是「翻译坏了」，而实际是根本没采集对方/视频的声音。
-            self._set_status("info", "正在启动…（只翻译你说的话；要翻译对方/视频请选「双向同时」）")
+            self._set_status("info", t("正在启动…（只翻译你说的话；要翻译对方/视频请选「双向同时」）"))
         else:
-            self._set_status("info", "正在启动（双向）…" if len(specs) == 2 else "正在启动…")
+            self._set_status("info", t("正在启动（双向）…") if len(specs) == 2 else t("正在启动…"))
 
     def _start_engine(self, index: int) -> None:
         specs = self._specs
@@ -2132,7 +2221,7 @@ class TranslationGUI:
         self._start_btn.configure(state=tk.NORMAL)
         self._stop_btn.configure(state=tk.DISABLED)
         self._set_text_input_enabled(False)
-        self._set_status("info", "已停止")
+        self._set_status("info", t("已停止"))
 
     def _on_close(self) -> None:
         """关窗口：先停引擎（会在超时内等采集线程真正退出），再销毁窗口。
@@ -2179,16 +2268,16 @@ class TranslationGUI:
             self._on_device_scan_result(mics, loops, outs)
         except Exception as exc:
             self._device_scan_pending = False
-            self._set_status("warn", f"设备扫描失败：{exc}")
+            self._set_status("warn", t("设备扫描失败：{msg}", msg=exc))
 
     def _on_refresh_devices(self) -> None:
         if any(e.running for e in self._engines):
-            self._set_status("warn", "建议停止翻译后再刷新设备列表")
+            self._set_status("warn", t("建议停止翻译后再刷新设备列表"))
         self._start_device_scan()
-        self._set_status("info", "正在扫描设备…")
+        self._set_status("info", t("正在扫描设备…"))
 
     def _on_device_scan_result(self, mics, loops, outs) -> None:
-        auto = "自动检测"
+        auto = t("自动检测")
         self._mic_names = []
         mic_display = [auto]
         for info in mics:
@@ -2234,14 +2323,15 @@ class TranslationGUI:
             self._audio_out_combo.set(auto)
 
         if not mics and not loops and not outs:
-            self._set_status("warn", "未扫描到设备（远程会话下枚举为空是正常的）")
+            self._set_status("warn", t("未扫描到设备（远程会话下枚举为空是正常的）"))
         else:
             self._set_status("info",
-                f"已扫描到 {len(mics)} 个麦克风 / {len(loops)} 个 loopback / {len(outs)} 个输出")
+                t("已扫描到 {m} 个麦克风 / {l} 个 loopback / {o} 个输出",
+                  m=len(mics), l=len(loops), o=len(outs)))
         self._device_scan_pending = False
 
     def _on_device_change(self, _event=None) -> None:
-        auto = "自动检测"
+        auto = t("自动检测")
         mic_text = self._mic_combo.get()
         loop_text = self._loopback_combo.get()
         out_text = self._audio_out_combo.get()
@@ -2272,9 +2362,9 @@ class TranslationGUI:
         # 状态栏给一次完整确认，免得用户不知道自己到底选了哪个。
         picked = [t for t in (mic_name, loop_name, out_name) if t]
         if picked:
-            self._set_status("info", "已选设备：" + " | ".join(picked))
+            self._set_status("info", t("已选设备：{names}", names=" | ".join(picked)))
         else:
-            self._set_status("info", "设备：全部自动检测")
+            self._set_status("info", t("设备：全部自动检测"))
 
     def _save_device_config(self, mic_name: str, loop_name: str, out_name: str) -> None:
         p = DEFAULT_CONFIG
@@ -2319,7 +2409,7 @@ class TranslationGUI:
                 elif kind == "devices":
                     self._on_device_scan_result(item[1], item[2], item[3])
                 elif kind == "devices_error":
-                    self._set_status("warn", f"设备扫描失败：{item[1]}")
+                    self._set_status("warn", t("设备扫描失败：{msg}", msg=item[1]))
                     self._device_scan_pending = False
                 elif kind == "update_check":
                     self._on_update_check_result(item[1], item[2], item[3], item[4])
@@ -2337,7 +2427,7 @@ class TranslationGUI:
             self._stop_btn.configure(state=tk.DISABLED)
             # 引擎失败时状态栏已有 error 消息，别用"已停止"盖掉
             if self._last_status_level != "error":
-                self._set_status("info", "已停止")
+                self._set_status("info", t("已停止"))
             self._engines = []
             self._engine_dirs = []
         if self._overlay_out is not None:
@@ -2501,24 +2591,24 @@ class TranslationGUI:
         # 状态色走圆点，文字保持中性色——更现代，也不会整行刺眼
         colors = {"info": COLOR_OK, "warn": COLOR_WARN, "error": COLOR_ERROR}
         self._status_dot.configure(fg=colors.get(level, TEXT_MUTED))
-        self._status_label.configure(text=f"状态：{msg}")
+        self._status_label.configure(text=t("状态：{msg}", msg=msg))
 
     def _refresh_status(self) -> None:
         if not hasattr(self, "_stats_label"):
             return
         parts: list[str] = []
         if any(e.running for e in self._engines):
-            parts.append("运行中")
+            parts.append(t("运行中"))
             # 常驻提示：状态栏正文会被引擎消息覆盖，这里不会。
             # 用户放英文视频却没选对方向时，症状看着就是「翻译坏了」。
             if self._direction_var.get() == "mine":
-                parts.append("仅翻译你说的话")
+                parts.append(t("仅翻译你说的话"))
         if any(e.chatbox is not None for e in self._engines):
             sent = sum(e.chatbox.sent_ok for e in self._engines if e.chatbox is not None)
-            parts.append(f"已翻译 {sent} 条")
+            parts.append(t("已翻译 {n} 条", n=sent))
         ms = self._stats.get("first_delta_ms") or self._stats.get("connect_ms")
         if ms is not None:
-            parts.append(f"首增量 {ms:.0f}ms")
+            parts.append(t("首增量 {ms}ms", ms=f"{ms:.0f}"))
         self._stats_label.configure(text=" · ".join(parts))
 
     # ================================================================ 自检

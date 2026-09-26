@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 from typing import Callable
 
+from .i18n import t
+
 
 def _storage_dir() -> Path:
     """密钥存储目录：用户主目录下。可被 _storage_dir_override 替换（测试用）。"""
@@ -34,11 +36,11 @@ def _validate_key(key: str) -> str:
     """校验密钥格式。通过返回 strip 后的值，不通过抛 ValueError。"""
     stripped = key.strip()
     if not stripped:
-        raise ValueError("密钥不能为空")
+        raise ValueError(t("密钥不能为空"))
     if any(c.isspace() for c in stripped):
-        raise ValueError("密钥不能包含空白字符")
+        raise ValueError(t("密钥不能包含空白字符"))
     if len(stripped) < 16:
-        raise ValueError(f"密钥长度不足（{len(stripped)} < 16）")
+        raise ValueError(t("密钥长度不足（{n} < 16）", n=len(stripped)))
     return stripped
 
 
@@ -82,10 +84,10 @@ def mask_key(key: str) -> str:
     """
     n = len(key)
     if n <= 3:
-        return f"{key[:1]}****（{n} 字符）"
+        return t("{head}****（{n} 字符）", head=key[:1], n=n)
     if n <= 7:
-        return f"{key[:2]}****{key[-1]}（{n} 字符）"
-    return f"{key[:3]}****{key[-4:]}（{n} 字符）"
+        return t("{head}****{tail}（{n} 字符）", head=key[:2], tail=key[-1], n=n)
+    return t("{head}****{tail}（{n} 字符）", head=key[:3], tail=key[-4:], n=n)
 
 
 def key_source() -> tuple[str, str | None]:
@@ -95,11 +97,11 @@ def key_source() -> tuple[str, str | None]:
     """
     saved = load_saved_key()
     if saved:
-        return ("界面设置", mask_key(saved))
+        return (t("界面设置"), mask_key(saved))
 
     env = os.environ.get("DASHSCOPE_API_KEY", "").strip()
     if env:
-        return ("环境变量 DASHSCOPE_API_KEY", mask_key(env))
+        return (t("环境变量 DASHSCOPE_API_KEY"), mask_key(env))
 
     cfg = Path(os.path.expanduser("~/.bailian/config.json"))
     if cfg.exists():
@@ -108,8 +110,8 @@ def key_source() -> tuple[str, str | None]:
             for k in ("api_key", "apiKey", "DASHSCOPE_API_KEY"):
                 v = str(data.get(k) or "").strip()
                 if v:
-                    return ("百炼 CLI 配置", mask_key(v))
+                    return (t("百炼 CLI 配置"), mask_key(v))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             pass
 
-    return ("未配置", None)
+    return (t("未配置"), None)

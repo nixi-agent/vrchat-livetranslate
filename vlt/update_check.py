@@ -24,6 +24,7 @@ import yaml
 
 from . import __version__
 from .config_io import _fmt_scalar, _write_config_text, _yaml_set_in_text
+from .i18n import t
 from .paths import is_frozen
 
 RELEASES_LATEST_API = "https://api.github.com/repos/nixi-agent/vrchat-livetranslate/releases/latest"
@@ -110,12 +111,12 @@ def _mapped_errors():
     except HTTPError as exc:
         if exc.code in (403, 429):
             # 未认证限流 60 次/小时/IP；手动按钮被连点时最容易撞
-            raise UpdateCheckError("GitHub 限流（未认证 60 次/小时），稍后再试") from exc
+            raise UpdateCheckError(t("GitHub 限流（未认证 60 次/小时），稍后再试")) from exc
         raise UpdateCheckError(f"HTTP {exc.code}") from exc
     except URLError as exc:
-        raise UpdateCheckError(f"网络不可达：{exc.reason}") from exc
+        raise UpdateCheckError(t("网络不可达：{msg}", msg=exc.reason)) from exc
     except TimeoutError as exc:
-        raise UpdateCheckError("网络不可达：连接超时") from exc
+        raise UpdateCheckError(t("网络不可达：连接超时")) from exc
     except Exception as exc:  # noqa: BLE001
         raise UpdateCheckError(f"{type(exc).__name__}: {exc}") from exc
 
@@ -137,12 +138,12 @@ def fetch_latest_release(timeout: float = DEFAULT_TIMEOUT_S) -> ReleaseInfo:
     try:
         data = json.loads(body)
     except json.JSONDecodeError as exc:
-        raise UpdateCheckError(f"响应不是合法 JSON：{exc}") from exc
+        raise UpdateCheckError(t("响应不是合法 JSON：{msg}", msg=exc)) from exc
     tag = str(data.get("tag_name") or "")
     ver = parse_version(tag)
     if ver is None:
         # tag 与 __version__ 的一致性由 release.yml 对账保证；走到这说明 Release 本身异常
-        raise UpdateCheckError(f"最新 Release 的 tag 不是版本号：{tag!r}")
+        raise UpdateCheckError(t("最新 Release 的 tag 不是版本号：{tag}", tag=f"{tag!r}"))
     exe_url = sums_url = ""
     exe_size: int | None = None
     for a in data.get("assets") or []:
@@ -153,7 +154,8 @@ def fetch_latest_release(timeout: float = DEFAULT_TIMEOUT_S) -> ReleaseInfo:
         elif a.get("name") == SUMS_ASSET_NAME:
             sums_url = str(a.get("browser_download_url") or "")
     if not exe_url or not sums_url:
-        raise UpdateCheckError(f"Release 附件不全：需要 {EXE_ASSET_NAME} 和 {SUMS_ASSET_NAME}")
+        raise UpdateCheckError(t("Release 附件不全：需要 {exe} 和 {sums}",
+                                 exe=EXE_ASSET_NAME, sums=SUMS_ASSET_NAME))
     return ReleaseInfo(tag=tag, version=f"{ver[0]}.{ver[1]}.{ver[2]}",
                        html_url=str(data.get("html_url") or ""),
                        exe_url=exe_url, sums_url=sums_url, exe_size=exe_size)
@@ -188,7 +190,8 @@ def add_ignored_version(config_path: Path, version: str) -> None:
     """
     ver = parse_version(version)
     if ver is None:
-        raise UpdateCheckError(f"不是合法版本号，无法写入忽略列表：{version!r}")
+        raise UpdateCheckError(t("不是合法版本号，无法写入忽略列表：{version}",
+                                 version=f"{version!r}"))
     version = f"{ver[0]}.{ver[1]}.{ver[2]}"
     ignored = load_ignored_versions(config_path)
     if version in ignored:
@@ -202,7 +205,8 @@ def add_ignored_version(config_path: Path, version: str) -> None:
             yaml.safe_load(text)
         except yaml.YAMLError as exc:
             # 原文件已经坏了就别再往上写：写一半好不了，还可能把坏文件「合法化」成更怪的形态
-            raise UpdateCheckError(f"config.yaml 不是合法 YAML，已放弃写入：{exc}") from exc
+            raise UpdateCheckError(t("config.yaml 不是合法 YAML，已放弃写入：{msg}",
+                                     msg=exc)) from exc
     if not re.search(r"(?m)^ui:", text):
         block = "# 点过「不再提示这个版本」的记录（不用手改）\nui:\n"
         text = text.rstrip("\n") + ("\n\n" + block if text.strip() else block)
@@ -252,9 +256,9 @@ def _check_url(url: str) -> None:
     """https + 白名单 host 才放行；其余一律 UpdateCheckError（重定向守卫与落地复检共用）。"""
     parts = urlsplit(url or "")
     if parts.scheme != "https":
-        raise UpdateCheckError(f"拒绝非 https 地址：{url}")
+        raise UpdateCheckError(t("拒绝非 https 地址：{url}", url=url))
     if parts.hostname not in ALLOWED_HOSTS:
-        raise UpdateCheckError(f"拒绝白名单外的地址：{url}")
+        raise UpdateCheckError(t("拒绝白名单外的地址：{url}", url=url))
 
 
 class _GuardedRedirectHandler(HTTPRedirectHandler):
@@ -301,8 +305,10 @@ def _download_expected_sha256(sums_url: str, timeout: float) -> str:
             h = parts[0].lower()
             if len(h) == 64 and all(c in "0123456789abcdef" for c in h):
                 return h
-            raise UpdateCheckError(f"{SUMS_ASSET_NAME} 里 {EXE_ASSET_NAME} 的校验值格式不对")
-    raise UpdateCheckError(f"{SUMS_ASSET_NAME} 里没有 {EXE_ASSET_NAME} 的校验值")
+            raise UpdateCheckError(t("{sums} 里 {exe} 的校验值格式不对",
+                                     sums=SUMS_ASSET_NAME, exe=EXE_ASSET_NAME))
+    raise UpdateCheckError(t("{sums} 里没有 {exe} 的校验值",
+                             sums=SUMS_ASSET_NAME, exe=EXE_ASSET_NAME))
 
 
 def _stream_to_file(url: str, dest: Path, timeout: float,
@@ -350,7 +356,7 @@ def download_and_verify(info: ReleaseInfo, dest_dir: Path,
     if actual != expected:
         dest.unlink(missing_ok=True)
         print("[update] 校验失败已删除", flush=True)
-        raise UpdateCheckError("下载的文件与发布页的摘要对不上，已删除（请重试）")
+        raise UpdateCheckError(t("下载的文件与发布页的摘要对不上，已删除（请重试）"))
     print(f"[update] 下载完成 sha256 校验通过（v{info.version}）", flush=True)
     try:
         write_pending(Path(dest_dir), info.version, actual)

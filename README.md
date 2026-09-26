@@ -371,7 +371,7 @@ build_exe.bat                                              :: 打包 + 打完自
   （SHA256、真跑 `--self-test`、版本行、字节码里搜新功能字符串、图标像素比对）：
 
   ```bat
-  .venv\Scripts\python.exe scripts\verify_release.py v0.0.4 "打字"
+  .venv\Scripts\python.exe scripts\verify_release.py v0.1.0 "打字"
   ```
 
 ---

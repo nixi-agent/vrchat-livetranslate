@@ -33,6 +33,12 @@ class TextDelta:
         return (self.confirmed + self.pending).strip()
 
 
+# 静默兜底默认值（全仓库唯一真相）：
+# 必须大于服务端「增量间隔」（实测连续说话时相邻 delta 最大 2.3s），
+# 阈值太小会在句子中间抢跑，把半句当成最终版。
+DEFAULT_FINAL_SILENCE_S = 3.0
+
+
 @dataclass
 class SessionConfig:
     """一条会话的全部可配置项。模型与目标语言都在这里，故都可插拔。"""
@@ -54,7 +60,7 @@ class SessionConfig:
     # 超过这个静默时长就把累计文本当最终版发出，保证「句末刷最终版」必达。
     # ⚠️ 必须大于服务端的「增量间隔」：实测连续说话时相邻 delta 可间隔 2.3s，
     #    阈值太小会在句子中间抢跑，把半句当成最终版。
-    final_silence_s: float = 3.0
+    final_silence_s: float = DEFAULT_FINAL_SILENCE_S
 
     @property
     def url(self) -> str:

@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from .session.base import SessionConfig
+from .session.base import SessionConfig, DEFAULT_FINAL_SILENCE_S
 
 from .paths import APP_DIR, BUNDLE_DIR
 
@@ -91,7 +91,7 @@ class Direction:
             api_key=base["api_key"],
             reconnect_backoff=tuple(base.get("reconnect_backoff", (2, 5, 10, 30))),
             max_new_sessions_per_minute=int(base.get("max_new_sessions_per_minute", 4)),
-            final_silence_s=float(base.get("final_silence_s", 1.2)),
+            final_silence_s=float(base.get("final_silence_s", DEFAULT_FINAL_SILENCE_S)),  # 默认值必须 > 服务端增量间隔（实测最大 2.3s），改小会让最终版在句子中间抢跑
         )
 
 
@@ -162,7 +162,7 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
         "workspace_id": s.get("workspace_id") or "",
         "reconnect_backoff": s.get("reconnect_backoff", [2, 5, 10, 30]),
         "max_new_sessions_per_minute": s.get("max_new_sessions_per_minute", 4),
-        "final_silence_s": float(s.get("final_silence_s", 1.2)),
+        "final_silence_s": float(s.get("final_silence_s", DEFAULT_FINAL_SILENCE_S)),  # 默认值必须 > 服务端增量间隔（实测最大 2.3s），改小会让最终版在句子中间抢跑
         "api_key": _resolve_api_key(api_key, require_key),
     }
     directions = {}

@@ -21,6 +21,11 @@ session:
   voice: Tina
   # 断句：留空 = 用服务端默认（3.8 为 speaker_detection）；也可填 server_vad
   turn_detection: null
+  # 静默兜底：服务端在持续音频下可能长时间不发 response.done，
+  # 超过这个静默时长就把累计文本当最终版发出（保证「句末刷最终版」必达）。
+  # ⚠️ 必须大于服务端的增量间隔（实测连续说话时相邻 delta 最大 2.3s）——
+  #    调小会在句子中间抢跑，把半句话当成最终版。
+  final_silence_s: 3.0
   # RPM 10 预算：每次 WS 连接算一次请求
   max_new_sessions_per_minute: 4
   reconnect_backoff: [2, 5, 10, 30]

@@ -1662,6 +1662,29 @@ class TranslationGUI:
         if not ok:
             self._set_status("warn", f"打不开浏览器，请手动复制访问：{BAILIAN_SIGNUP_URL}")
 
+    def _refresh_api_key_in_cfg(self) -> None:
+        """按既有优先级链重新解析 API key 并写回 self._cfg.session_base["api_key"]。
+
+        启动时 load_config() 解析出的 key 只是那一刻的快照；界面上保存/清除之后
+        必须重解，否则「开始翻译」读的还是启动时那份（干净机器：保存了却报"还没配置"；
+        有旧来源的机器：贴了新 key 却继续用旧的）。解析只走 config.load_api_key()，
+        不自写第二套优先级；一个来源都没有时它会抛 SystemExit —— 这里置空串，
+        绝不让异常冒到界面/主循环。留痕：来源 + 打码值，绝不打明文。
+        """
+        from .config import load_api_key
+        from .credentials import key_source, mask_key
+
+        try:
+            key = load_api_key()
+        except SystemExit:
+            key = ""
+        self._cfg.session_base["api_key"] = key
+        if key:
+            source, _ = key_source()
+            print(f"[gui] API key 已刷新：来源={source}（{mask_key(key)}）", flush=True)
+        else:
+            print("[gui] API key 已刷新：没有任何来源（尚未配置）", flush=True)
+
     def _on_save_key(self) -> None:
         from .credentials import load_saved_key, mask_key, save_api_key
 
@@ -1677,6 +1700,7 @@ class TranslationGUI:
         self._key_var.set("")
         shown = mask_key(load_saved_key() or "")
         self._refresh_key_status()
+        self._refresh_api_key_in_cfg()      # 关键：写回内存快照，否则开始翻译还读启动时的旧值
         self._set_status("ok", f"API key 已保存（{shown}）")
         print(f"[gui] ✅ API key 已保存（{shown}）→ {path}", flush=True)
         self._check_api_key()
@@ -1686,6 +1710,7 @@ class TranslationGUI:
 
         removed = clear_saved_key()
         self._refresh_key_status()
+        self._refresh_api_key_in_cfg()      # 清除后可能回退到别的来源、也可能变空 —— 内存同步
         msg = "已清除保存的 API key" if removed else "本来就没有保存过 API key"
         self._set_status("info", msg)
         print(f"[gui] {msg}", flush=True)
@@ -1921,6 +1946,7 @@ class TranslationGUI:
     def _start(self) -> None:
         if any(e.running for e in self._engines):
             return
+        self._refresh_api_key_in_cfg()   # 防呆：key 可能在运行期被保存/清除/改环境，先重解再检查
         if not (self._cfg.session_base.get("api_key") or "").strip():
             # 没 key 就别白连一次（会撞 401），直接把用户送到填 key 的地方
             self._set_status("error", "还没配置 API key —— 点右上角「API key ›」填一个再开始")

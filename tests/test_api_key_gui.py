@@ -297,6 +297,175 @@ def test_key_chip_button_switching() -> None:
                 os.environ[k] = v
 
 
+def _isolate_env(tmp: Path) -> dict:
+    """把 HOME/USERPROFILE 指到临时目录并摘掉环境变量 key：隔绝本机可能存在的其它来源。"""
+    saved = {k: os.environ.get(k) for k in ("USERPROFILE", "HOME", "DASHSCOPE_API_KEY")}
+    os.environ["USERPROFILE"] = str(tmp)
+    os.environ["HOME"] = str(tmp)
+    os.environ.pop("DASHSCOPE_API_KEY", None)
+    return saved
+
+
+def _restore_env(saved: dict) -> None:
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
+def _destroy(gui) -> None:
+    if gui is not None:
+        try:
+            gui._root.destroy()
+        except Exception:
+            pass
+
+
+def test_save_key_refreshes_cfg_immediately() -> None:
+    """★ 修复钉住①：无任何其它来源时，保存后 cfg 里的 api_key 必须立刻是新 key。
+
+    旧行为：_on_save_key 只落盘 + 刷标签，self._cfg.session_base["api_key"]
+    还是启动时的空串 → 点「开始翻译」被第一段拦下，用户看到「保存了没生效」。
+    """
+    _use_temp_storage()
+    saved_env = _isolate_env(Path(tempfile.mkdtemp(prefix="vlt-nokey-env-")))
+    buf = io.StringIO()
+    gui = None
+    try:
+        from vlt.gui import TranslationGUI
+
+        with contextlib.redirect_stdout(buf):
+            gui = TranslationGUI()
+        assert gui._cfg.session_base["api_key"] == "", "预置：此时不该有任何 key 来源"
+
+        with contextlib.redirect_stdout(buf):
+            gui._key_var.set(FAKE_KEY)
+            gui._on_save_key()
+        assert gui._cfg.session_base["api_key"] == FAKE_KEY, \
+            "★ 保存后内存里的 api_key 没刷新（界面显示已配置、开始翻译却仍被拦）"
+
+        out = buf.getvalue()
+        assert "[gui] API key 已刷新" in out and "来源=" in out, \
+            f"刷新必须留痕（来源 + 打码值），实际日志：{out!r}"
+        assert FAKE_KEY not in out, f"★ 日志里出现了完整 key！\n{out}"
+        print("  保存后 cfg 立刻生效 OK（无其它来源；日志只打码）")
+    finally:
+        _destroy(gui)
+        _restore_env(saved_env)
+        _reset_storage()
+
+
+def test_save_key_not_shadowed_by_old_source() -> None:
+    """★ 修复钉住②：机器上已有旧来源（环境变量）时，保存新 key 后 cfg 必须是新 key。
+
+    旧行为更隐蔽：界面显示新 key 的打码值，程序却继续用启动时冻结的旧 key。
+    """
+    _use_temp_storage()
+    saved_env = _isolate_env(Path(tempfile.mkdtemp(prefix="vlt-oldsrc-env-")))
+    os.environ["DASHSCOPE_API_KEY"] = ENV_KEY      # 预置旧来源
+    buf = io.StringIO()
+    gui = None
+    try:
+        from vlt.gui import TranslationGUI
+
+        with contextlib.redirect_stdout(buf):
+            gui = TranslationGUI()
+        assert gui._cfg.session_base["api_key"] == ENV_KEY, "预置：旧来源应先生效"
+
+        with contextlib.redirect_stdout(buf):
+            gui._key_var.set(FAKE_KEY)
+            gui._on_save_key()
+        assert gui._cfg.session_base["api_key"] == FAKE_KEY, \
+            "★ 保存的新 key 被旧来源盖住了（界面保存的优先级最高，必须立刻换用新 key）"
+
+        out = buf.getvalue()
+        assert FAKE_KEY not in out and ENV_KEY not in out, f"★ 日志里出现了明文 key！\n{out}"
+        print("  有旧来源时保存新 key 不被盖 OK（界面保存优先）")
+    finally:
+        _destroy(gui)
+        _restore_env(saved_env)
+        _reset_storage()
+
+
+def test_start_uses_refreshed_key() -> None:
+    """★ 修复钉住③：_start() 第一段前置检查必须读刷新后的值，不是启动时快照。
+
+    绝不真启动引擎/联网：_start_engine / _start_overlay / _open_settings 全部打桩。
+    """
+    _use_temp_storage()
+    saved_env = _isolate_env(Path(tempfile.mkdtemp(prefix="vlt-start-env-")))
+    buf = io.StringIO()
+    gui = None
+    try:
+        from vlt.gui import TranslationGUI
+
+        with contextlib.redirect_stdout(buf):
+            gui = TranslationGUI()
+        assert gui._cfg.session_base["api_key"] == "", "预置：此时不该有任何 key 来源"
+
+        settings_calls = []
+        gui._open_settings = lambda: settings_calls.append(1)   # 打桩：绝不真弹窗
+
+        with contextlib.redirect_stdout(buf):
+            gui._start()
+        assert settings_calls, "无 key 时 _start 应被第一段拦下并引导去填 key"
+        assert "还没配置 API key" in gui._status_label.cget("text")
+
+        with contextlib.redirect_stdout(buf):
+            gui._key_var.set(FAKE_KEY)
+            gui._on_save_key()
+
+        started = []
+        gui._start_engine = lambda index: started.append(index)  # 打桩：绝不真起引擎
+        gui._start_overlay = lambda: None                        # 打桩：绝不碰 SteamVR
+        settings_calls.clear()
+        with contextlib.redirect_stdout(buf):
+            gui._start()
+        assert not settings_calls, \
+            "★ 保存 key 后 _start 仍被「还没配置 API key」拦下 —— 读的是启动时的旧快照"
+        assert started == [0], "保存 key 后应进入启动分支（引擎启动已打桩）"
+        assert gui._cfg.session_base["api_key"] == FAKE_KEY
+        assert "还没配置 API key" not in gui._status_label.cget("text")
+
+        out = buf.getvalue()
+        assert FAKE_KEY not in out, f"★ 日志里出现了完整 key！\n{out}"
+        print("  _start() 用刷新后的 key OK（引擎/手腕屏/弹窗均已打桩）")
+    finally:
+        _destroy(gui)
+        _restore_env(saved_env)
+        _reset_storage()
+
+
+def test_clear_key_leaves_no_residue() -> None:
+    """★ 修复钉住④：清除后若没有任何其它来源，cfg 里的 key 必须变空（不能留残值）。"""
+    _use_temp_storage()
+    saved_env = _isolate_env(Path(tempfile.mkdtemp(prefix="vlt-clear-env-")))
+    buf = io.StringIO()
+    gui = None
+    try:
+        from vlt.gui import TranslationGUI
+
+        with contextlib.redirect_stdout(buf):
+            gui = TranslationGUI()
+            gui._key_var.set(FAKE_KEY)
+            gui._on_save_key()
+        assert gui._cfg.session_base["api_key"] == FAKE_KEY, "预置：保存应已生效"
+
+        with contextlib.redirect_stdout(buf):
+            gui._on_clear_key()
+        assert gui._cfg.session_base["api_key"] == "", \
+            f"★ 清除后内存里还留着旧 key：{gui._cfg.session_base['api_key'][:8]}…"
+
+        out = buf.getvalue()
+        assert FAKE_KEY not in out, f"★ 日志里出现了完整 key！\n{out}"
+        print("  清除后 cfg 不残留 OK")
+    finally:
+        _destroy(gui)
+        _restore_env(saved_env)
+        _reset_storage()
+
+
 if __name__ == "__main__":
     print("test_api_key_gui:")
     test_roundtrip_and_mask()
@@ -305,4 +474,8 @@ if __name__ == "__main__":
     test_gui_key_row_saves_without_leaking()
     test_gui_starts_without_any_key()
     test_key_chip_button_switching()
+    test_save_key_refreshes_cfg_immediately()
+    test_save_key_not_shadowed_by_old_source()
+    test_start_uses_refreshed_key()
+    test_clear_key_leaves_no_residue()
     print("ALL PASSED")

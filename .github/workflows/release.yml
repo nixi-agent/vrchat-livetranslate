@@ -100,7 +100,7 @@ jobs:
             - 未配置 API key 时，主界面右上角会变成「一键开通百炼」的入口
 
             ### 已知限制
-            - 译音回灌（让对方听见译音）已实现，但默认关闭：需要 `output.audio.enabled` 与 `directions.<方向>.output_audio` 同时为真（或加 `--audio-out`），并且要自备虚拟声卡（VoiceMeeter / VB-Cable 等，按设备名自动匹配）。目前只有离线单测覆盖，**尚无真机出声的端到端验证**
+            - 译音回灌（让对方听见译音）已实现，但默认关闭：需要 `output.audio.enabled` 与 `directions.<方向>.output_audio` 同时为真（或加 `--audio-out`），并且要自备虚拟声卡（VoiceMeeter / VB-Cable 等，按设备名自动匹配）
             - 采集 VRChat 音频必须在**物理控制台会话**里跑（远程桌面会话里采不到声音）
             - 16px 图标档看不清五官（源图细节量决定，属正常）
 

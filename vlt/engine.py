@@ -28,6 +28,10 @@ from .session.base import SessionConfig, TextDelta, create_session
 from .textin import DEFAULT_MODEL as DEFAULT_TEXT_MODEL
 from .textin import DEFAULT_TIMEOUT_S as DEFAULT_TEXT_TIMEOUT_S
 from .textin import TextTranslateError, split_for_chatbox, translate_text
+from .tts import DEFAULT_MODEL as DEFAULT_TTS_MODEL
+from .tts import DEFAULT_TIMEOUT_S as DEFAULT_TTS_TIMEOUT_S
+from .tts import DEFAULT_VOICE as DEFAULT_TTS_VOICE
+from .tts import TtsError, synthesize
 
 ROOT = Path(__file__).resolve().parent.parent
 CHUNK_BYTES = 3200          # 100ms @16kHz s16le mono
@@ -601,7 +605,33 @@ class Engine:
             limit = int((self._cfg.chatbox or {}).get("max_chars", 144))
             for chunk in split_for_chatbox(translated, limit):
                 self._chatbox.send(chunk, True)
-        self._events.on_status("info", f"打字已送出（{len(text)} 字 → {d.target_lang}）")
+
+        # 打字也要出声：文本翻译接口**不回音频**，所以补一步 TTS 再喂虚拟声卡。
+        # 用的是**同一个** VirtualMic 实例（与语音共用一条流，句尾标记交给它管），
+        # 所以「说话 + 打字」交替时不会互相打断、缓冲超限也照旧整句丢弃。
+        spoke_s = 0.0
+        tts_cfg = tcfg.get("tts") or {}
+        if self._virtualmic is not None and tts_cfg.get("enabled", True):
+            try:
+                pcm24 = await asyncio.to_thread(
+                    synthesize, translated,
+                    voice=str(tts_cfg.get("voice") or DEFAULT_TTS_VOICE),
+                    model=str(tts_cfg.get("model") or DEFAULT_TTS_MODEL),
+                    api_key=str(self._cfg.session_base.get("api_key") or ""),
+                    language=d.target_lang,
+                    timeout=float(tts_cfg.get("timeout_s", DEFAULT_TTS_TIMEOUT_S)),
+                )
+                self._virtualmic.push(resample_24k_mono_to_48k_stereo(pcm24))
+                self._virtualmic.end_sentence()
+                spoke_s = len(pcm24) / 2 / 24000
+            except TtsError as exc:
+                self._events.on_status("warn", f"打字译音失败：{exc}（文字输出不受影响）")
+            except Exception as exc:  # noqa: BLE001
+                self._events.on_status("warn",
+                    f"打字译音异常：{type(exc).__name__}: {exc}（文字输出不受影响）")
+
+        tail = f"，已出声 {spoke_s:.1f}s" if spoke_s else ""
+        self._events.on_status("info", f"打字已送出（{len(text)} 字 → {d.target_lang}{tail}）")
 
     # ---------------------------------------------------------------- 断线自愈
 

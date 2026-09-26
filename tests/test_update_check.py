@@ -312,6 +312,9 @@ def test_download_and_verify() -> None:
         assert out == dest and out.read_bytes() == exe_bytes
         assert calls and calls[-1] == (len(exe_bytes), len(exe_bytes)), f"progress 不对：{calls[-1:]}"
         assert all(t == len(exe_bytes) for _, t in calls)
+        # 校验通过 → 写下 update_pending.json（【稍后】退出时替换 / 残留恢复的复验凭据）
+        meta = json.loads((tmp / uc.PENDING_JSON).read_text(encoding="utf-8"))
+        assert meta == {"version": "9.9.9", "sha256": good}, f"pending json 不对：{meta}"
         out.unlink()
 
         # 没有 Content-Length → total=None（进度条降级显示，绝不除零）
@@ -432,6 +435,120 @@ def test_build_updater_bat() -> None:
     print("  build_updater_bat OK")
 
 
+# ---------------------------------------------------------------- Task 11：阶段二纯逻辑
+
+
+def test_build_updater_bat_relaunch() -> None:
+    cur = Path(r"C:\Users\A B\Desktop\VRChatLiveTranslate.exe")
+    new = Path(r"C:\Users\A B\Desktop\VRChatLiveTranslate.exe.new")
+    bat_on = uc.build_updater_bat(pid=4321, current_exe=cur, new_exe=new, relaunch=True)
+    bat_off = uc.build_updater_bat(pid=4321, current_exe=cur, new_exe=new, relaunch=False)
+
+    # 【重载】形态：替换后 start "" 拉起新版；【稍后】退出时替换：只换不拉
+    assert f'start "" "{cur}"' in bat_on, "relaunch=True 缺拉起行"
+    assert 'start ""' not in bat_off, "relaunch=False 不该拉起新进程"
+    # 两形态除了那一行其余逐字节相同（等 PID / 备份 / move / 自删 / :fail 全保留）
+    assert bat_off == bat_on.replace(f'start "" "{cur}"\r\n', ""), "两形态差异不止拉起行"
+    for needle in ("tasklist", "move /y", 'del "%~f0"', ".bak", ":fail"):
+        assert needle in bat_off, f"relaunch=False 缺 {needle}"
+    # 默认参数必须保持 True（既有行为不变）
+    assert uc.build_updater_bat(pid=1, current_exe=cur, new_exe=new) == bat_on.replace(
+        "4321", "1"), "默认值不是 relaunch=True"
+    print("  build_updater_bat relaunch 两形态 OK")
+
+
+def test_pending_download() -> None:
+    tmp = OUT / "pending"
+    tmp.mkdir(parents=True, exist_ok=True)
+    exe = tmp / EXE_NAME
+    exe.write_bytes(b"old")                          # 当前 exe（内容无所谓）
+    new_exe = tmp / (EXE_NAME + ".new")
+    pending = tmp / uc.PENDING_JSON
+    new_exe.unlink(missing_ok=True)
+    pending.unlink(missing_ok=True)
+
+    # 什么都没有 → None，且一行日志都不打（每次启动都走的正常路）
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert uc.check_pending_download(exe) is None
+    assert buf.getvalue() == "", f"无残留不该刷日志：{buf.getvalue()!r}"
+
+    # 完好：写真 bytes + write_pending → 复核通过，返回 (version, sha256)
+    body = b"new-exe-" * 1000
+    new_exe.write_bytes(body)
+    sha = hashlib.sha256(body).hexdigest()
+    p = uc.write_pending(tmp, "9.9.9", sha)
+    assert p == pending and json.loads(p.read_text(encoding="utf-8")) == {
+        "version": "9.9.9", "sha256": sha}
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        hit = uc.check_pending_download(exe, current_version="0.1.1")
+    assert hit == ("9.9.9", sha), f"完好残留没命中：{hit}"
+    assert "复核通过" in buf.getvalue() and "9.9.9" in buf.getvalue(), "命中没留痕"
+    assert new_exe.exists() and pending.exists(), "命中后文件不该被动"
+
+    # 损坏：改一个字节 → None，两个文件都被清理，留痕
+    new_exe.write_bytes(body + b"x")
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert uc.check_pending_download(exe, current_version="0.1.1") is None
+    assert not new_exe.exists() and not pending.exists(), "损坏残留没被清理"
+    assert "复核不通过" in buf.getvalue(), "损坏分支没留痕"
+
+    # json 损坏 / 缺字段 → None + 清理 + 留痕
+    for bad_json in ("{not json", json.dumps({"version": "9.9.9"}),  # 缺 sha256
+                     json.dumps({"version": "not-a-version", "sha256": sha}),
+                     json.dumps({"version": "9.9.9", "sha256": "abc"})):
+        new_exe.write_bytes(body)
+        pending.write_text(bad_json, encoding="utf-8")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            assert uc.check_pending_download(exe) is None, f"坏 json 居然放行：{bad_json!r}"
+        assert not new_exe.exists() and not pending.exists()
+        assert "记录文件损坏" in buf.getvalue(), f"坏 json 分支没留痕：{bad_json!r}"
+
+    # 只剩 json / 只剩 .new → None + 清理 + 留痕（两种残缺都不能放行）
+    pending.write_text(json.dumps({"version": "9.9.9", "sha256": sha}), encoding="utf-8")
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert uc.check_pending_download(exe) is None
+    assert not pending.exists() and "下载物缺失" in buf.getvalue()
+
+    new_exe.write_bytes(body)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert uc.check_pending_download(exe) is None
+    assert not new_exe.exists() and "缺少记录文件" in buf.getvalue()
+
+    # 待替换版本不比当前新（上次其实换成功了，只是残留没清）→ 清理 + 留痕
+    new_exe.write_bytes(body)
+    uc.write_pending(tmp, "9.9.9", sha)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        assert uc.check_pending_download(exe, current_version="9.9.9") is None
+    assert not new_exe.exists() and not pending.exists()
+    assert "不比当前" in buf.getvalue(), "换完残留分支没留痕"
+    print("  write_pending / check_pending_download OK")
+
+
+def test_last_seen_version() -> None:
+    tmp = OUT / "state"
+    tmp.mkdir(parents=True, exist_ok=True)
+    state = tmp / uc.STATE_JSON
+    state.unlink(missing_ok=True)
+
+    assert uc.load_last_seen_version(tmp) is None, "缺失文件应视为首次"
+    uc.save_last_seen_version(tmp, "0.1.1")
+    assert uc.load_last_seen_version(tmp) == "0.1.1"
+    uc.save_last_seen_version(tmp, "0.1.2")            # 覆盖写（提示后写回当前版本）
+    assert uc.load_last_seen_version(tmp) == "0.1.2"
+    state.write_text("{broken", encoding="utf-8")
+    assert uc.load_last_seen_version(tmp) is None, "损坏文件应视为首次"
+    state.write_text(json.dumps({"other": 1}), encoding="utf-8")
+    assert uc.load_last_seen_version(tmp) is None, "缺字段应视为首次"
+    print("  load/save_last_seen_version OK")
+
+
 def main() -> int:
     print("test_update_check:")
     tests = [
@@ -445,6 +562,9 @@ def main() -> int:
         test_redirect_guard,
         test_update_mode,
         test_build_updater_bat,
+        test_build_updater_bat_relaunch,
+        test_pending_download,
+        test_last_seen_version,
     ]
     bad = []
     for fn in tests:

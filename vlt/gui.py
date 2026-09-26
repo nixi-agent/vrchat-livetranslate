@@ -11,6 +11,7 @@ import argparse
 import os
 import queue
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -207,6 +208,17 @@ class TranslationGUI:
         self._dl_downloading = False
         self._dl_throttle_s = 0.1              # 进度回调节流：至多每 100ms 塞一条队列
         self._dl_last_push = 0.0
+        self._dl_reload_btn: ttk.Button | None = None
+        self._dl_postpone_btn: ttk.Button | None = None
+        self._dl_link: tk.Label | None = None
+        # 「稍后更新」/ 启动残留命中：正常退出时替换（绝不自动拉起新版）
+        self._update_pending_exit = False
+        self._update_pending_info: update_check.ReleaseInfo | None = None
+        # 【重载】已安排带拉起的替换：_on_close 别再重复安排退出时替换
+        self._reload_started = False
+        # 「已更新到最新版本」一次性提示（版本变化那一次才弹；版本号只进日志）
+        self._updated_hint_win: tk.Toplevel | None = None
+        self._updated_hint_job: str | None = None
 
         # 设备选择
         self._mic_names: list[str] = []
@@ -257,6 +269,10 @@ class TranslationGUI:
         self._start_device_scan()
         # 启动 3 秒后在守护线程里查一次更新（结果经 self._q 回主线程，绝不阻塞启动/翻译）
         self._update_check_job = self._root.after(3000, self._schedule_update_check)
+        # 启动兜底：上次下载好了但没来得及换（强杀/关机）→ 复核通过直接给更新入口（不重复下载）
+        self._check_pending_update_at_startup()
+        # 刚完成过替换/升级 → 一次性「已更新」小提示（同一版本只弹一次）
+        self._schedule_version_changed_hint()
 
     # ================================================================ 主题
 
@@ -1153,6 +1169,19 @@ class TranslationGUI:
                 self._open_release_page(info.html_url)
             print(f"[update] 安装目录不可写（{exe.parent}），转为手动下载指引", flush=True)
             return
+        # 这个版本之前已经下载好（点过「稍后更新」/上次没换完就被关掉）→
+        # 复验通过直接给更新入口，30MB+ 不白下（硬要求：用残留前必须重新校验）
+        try:
+            hit = update_check.check_pending_download(exe, __version__)
+        except Exception as exc:  # noqa: BLE001
+            hit = None
+            print(f"[update] ⚠️ 待更新文件复核失败：{type(exc).__name__}: {exc}"
+                  f"（按重新下载处理）", flush=True)
+        if hit is not None and hit[0] == info.version:
+            self._close_update_dialog()
+            self._show_download_window(info)
+            self._enter_download_done_state(update_check.pending_new_exe(exe))
+            return
         self._close_update_dialog()
         self._show_download_window(info)
         self._start_download(info)
@@ -1190,6 +1219,11 @@ class TranslationGUI:
         self._dl_note = ttk.Label(body, text="点右上角关闭会取消下载，下次可以再下。",
                                   style="Muted.TLabel")
         self._dl_note.pack(anchor=tk.W, pady=(10, 0))
+        # 「打开下载页自己下」：下载失败/完成态都能点到的第三条出路（网络实在不稳时自己下）
+        self._dl_link = tk.Label(body, text="打开下载页自己下", fg=ACCENT_HOVER, bg=PANEL,
+                                 cursor="hand2", font=FONT_UI)
+        self._dl_link.pack(anchor=tk.W, pady=(6, 0))
+        self._dl_link.bind("<Button-1>", lambda _e: self._open_download_page())
         self._dl_btn_frame = ttk.Frame(body)   # 完成态才放按钮（checklist ③）
         self._dl_btn_frame.pack(fill=tk.X, pady=(14, 0))
 
@@ -1203,11 +1237,18 @@ class TranslationGUI:
     def _close_download_window(self) -> None:
         win, self._dl_win = self._dl_win, None
         self._dl_bar = self._dl_text = self._dl_note = self._dl_btn_frame = None
+        self._dl_reload_btn = self._dl_postpone_btn = self._dl_link = None
         if win is not None:
             try:
                 win.destroy()
             except Exception:  # noqa: BLE001
                 pass
+
+    def _open_download_page(self) -> None:
+        """下载窗里的「打开下载页自己下」（与三按钮弹窗的链接同一写法）。"""
+        url = self._dl_info.html_url if self._dl_info else ""
+        if url:
+            self._open_release_page(url)
 
     def _on_download_window_close(self) -> None:
         """下载中关窗 = 取消下载并清理残留（下载线程在下一个 chunk 边界自己中断）。"""
@@ -1275,16 +1316,22 @@ class TranslationGUI:
             self._dl_text.configure(text=f"已下载 {done / 1048576:.1f} MB，请稍等。")
 
     def _on_download_done(self, new_exe) -> None:
-        """主线程：下载+校验完成 → 100%，切「完成态」（文案 checklist ③）。"""
+        """主线程：下载+校验完成 → 切「完成态」（文案 checklist ③）。"""
         self._dl_downloading = False
         if self._dl_win is None:
-            # 用户在最后一刻关了窗：按取消处理，不留来路不明的下载物
+            # 用户在最后一刻关了窗：按取消处理，不留来路不明的下载物（json 一并清）
             try:
                 Path(new_exe).unlink(missing_ok=True)
+                (Path(new_exe).parent / update_check.PENDING_JSON).unlink(missing_ok=True)
             except OSError:
                 pass
             print("[update] 下载完成时窗口已关闭：按取消处理，下载物已删除", flush=True)
             return
+        self._enter_download_done_state(Path(new_exe))
+
+    def _enter_download_done_state(self, new_exe: Path) -> None:
+        """下载窗切「完成态」（文案 checklist ③）：进度条 100%，按钮区出
+        [立即重启并更新] [稍后更新]。下载完成与残留恢复（不重复下载）共用。"""
         self._dl_new_exe = Path(new_exe)
         self._dl_bar.stop()
         self._dl_bar.configure(mode="determinate", maximum=1.0, value=1.0)
@@ -1294,12 +1341,16 @@ class TranslationGUI:
                  "点「立即重启并更新」：关闭当前窗口、自动换上新版本并重新打开。\n"
                  "点「稍后更新」：继续用现在的版本；等你关闭程序时会自动换好，下次打开就是新版。")
         self._dl_note.pack_forget()            # 已完成：「关窗会取消」的小字不再适用
-        reload_btn = ttk.Button(self._dl_btn_frame, text="立即重启并更新",
-                                style="Accent.TButton", command=self._on_reload_clicked)
-        reload_btn.pack(side=tk.LEFT)
-        ttk.Button(self._dl_btn_frame, text="稍后更新",
-                   command=self._on_postpone_clicked).pack(side=tk.LEFT, padx=(8, 0))
-        reload_btn.focus_set()
+        for child in self._dl_btn_frame.winfo_children():   # 防重复进完成态时叠按钮
+            child.destroy()
+        self._dl_reload_btn = ttk.Button(self._dl_btn_frame, text="立即重启并更新",
+                                         style="Accent.TButton",
+                                         command=self._on_reload_clicked)
+        self._dl_reload_btn.pack(side=tk.LEFT)
+        self._dl_postpone_btn = ttk.Button(self._dl_btn_frame, text="稍后更新",
+                                           command=self._on_postpone_clicked)
+        self._dl_postpone_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self._dl_reload_btn.focus_set()
         print(f"[update] 新版本已下载好（{new_exe}），等待用户选择何时更新", flush=True)
 
     def _on_download_error(self, msg: str) -> None:
@@ -1329,24 +1380,232 @@ class TranslationGUI:
             print("[update] 用户选择暂时跳过本次下载", flush=True)
             self._close_download_window()
 
+    # ---------------------------------------------------------------- 阶段二：重载 / 稍后 / 退出时替换
+    #
+    # 三条出口分工（防互相打架，改这里前先想清楚是哪一条）：
+    #   【立即重启并更新】= 立刻替换 + 自动拉起新版（当前会话结束）
+    #   【稍后更新】      = 退出时替换 + 不拉起（下次用户自己开，开起来就是新版 + 一次性提示）
+    #   【不再提示这个版本】= 只对这个版本号不再提示，与上面两条无关
+
     def _on_reload_clicked(self) -> None:
-        """「立即重启并更新」按钮：替换+拉起的接线在下一批（计划 Task 11）。
-        本批必须给出明确提示，不许点了没反应。"""
-        print("[update] 「立即重启并更新」尚未接线（下一批实现），已向用户说明", flush=True)
-        messagebox.showinfo(
-            "马上就好",
-            "自动重启更新将在程序的下一个版本开放。\n\n"
-            "这次的新版本已经下载好并保留着，不会重复下载。",
-            parent=self._dl_win)
+        """「立即重启并更新」= 立刻替换 + 自动拉起新版（当前会话结束）：
+        按钮置灰「正在重启…」→ 生成 bat（relaunch=True）→ 分离启动 → 走正常退出流程。
+        任一步失败：留痕 + 恢复按钮 + 错误提示带可点下一步，绝不静默。"""
+        if self._reload_started:
+            return                              # 防连点：已经安排上了
+        new_exe, info = self._dl_new_exe, self._dl_info
+        if new_exe is None or info is None:
+            print("[update] ⚠️ 「立即重启并更新」在非完成态被触发，已忽略", flush=True)
+            return
+        self._reload_started = True
+        for btn in (self._dl_reload_btn, self._dl_postpone_btn):
+            if btn is not None:
+                try:
+                    btn.state(["disabled"])
+                except Exception:  # noqa: BLE001
+                    pass
+        if self._dl_reload_btn is not None:
+            self._dl_reload_btn.configure(text="正在重启…")
+        try:
+            exe = Path(sys.executable).resolve()
+            bat = update_check.build_updater_bat(pid=os.getpid(), current_exe=exe,
+                                                 new_exe=new_exe, relaunch=True)
+            self._launch_updater_bat(bat)
+        except Exception as exc:  # noqa: BLE001 — 失败必须被用户看到，不许静默
+            print(f"[update] ⚠️ 启动更新器失败：{type(exc).__name__}: {exc}"
+                  f"（下载好的新版本保留着，可以再点）", flush=True)
+            self._reload_started = False
+            for btn in (self._dl_reload_btn, self._dl_postpone_btn):
+                if btn is not None:
+                    try:
+                        btn.state(["!disabled"])
+                    except Exception:  # noqa: BLE001
+                        pass
+            if self._dl_reload_btn is not None:
+                self._dl_reload_btn.configure(text="立即重启并更新")
+            retry = messagebox.askretrycancel(
+                "更新没有成功",
+                "更新没有成功，现在的版本不受影响，可以继续用。\n\n"
+                "点「重试」再试一次；点「取消」先继续用现在的版本"
+                "（窗口里也可以「打开下载页自己下」）。",
+                parent=self._dl_win)
+            if retry:
+                print("[update] 用户选择重试「立即重启并更新」", flush=True)
+                self._on_reload_clicked()
+            else:
+                print("[update] 用户选择先继续用现在的版本（新版本已下载好，保留着）",
+                      flush=True)
+            return
+        print(f"[update] 已启动更新器，程序即将退出（重载路径，v{__version__} → "
+              f"v{info.version}）", flush=True)
+        self._on_close()
 
     def _on_postpone_clicked(self) -> None:
-        """「稍后更新」按钮：退出时替换的接线在下一批（计划 Task 11）。同上，明确提示。"""
-        print("[update] 「稍后更新」尚未接线（下一批实现），已向用户说明", flush=True)
-        messagebox.showinfo(
-            "马上就好",
-            "「稍后更新」（关闭程序时自动换好）将在程序的下一个版本开放。\n\n"
-            "这次的新版本已经下载好并保留着，不会重复下载。",
-            parent=self._dl_win)
+        """「稍后更新」= 继续用旧版、关下载窗；已下载且校验通过的新版本保留着（不删），
+        正常退出时自动换好（绝不自动拉起）、下次打开就是新版。"""
+        info = self._dl_info
+        if info is None:
+            return
+        self._mark_update_pending(info)
+        print(f"[update] 已下载 v{info.version}，将在退出时完成更新（不自动打开）", flush=True)
+        self._close_download_window()
+
+    def _mark_update_pending(self, info) -> None:
+        """记下「正常退出时要换成新版本」（稍后更新 / 启动残留命中共用）。"""
+        self._update_pending_exit = True
+        self._update_pending_info = info
+
+    def _launch_updater_bat(self, bat_text: str) -> Path:
+        """把更新器脚本写到程序同目录并分离启动（不等它跑完；它自己会等本程序退出再动手）。
+        失败（权限/磁盘/没有 cmd）抛异常给调用方 —— 由调用方负责让用户看见。"""
+        exe = Path(sys.executable).resolve()
+        bat_path = exe.parent / "_update.bat"
+        # bat 正文已是 CRLF：newline="" 关掉写入时的换行翻译，否则 \r\n 会变 \r\r\n
+        bat_path.write_text(bat_text, encoding="ascii", newline="")
+        flags = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                 | getattr(subprocess, "DETACHED_PROCESS", 0))
+        subprocess.Popen(["cmd", "/c", "start", "", "/min", str(bat_path)],
+                         creationflags=flags)
+        return bat_path
+
+    def _maybe_replace_on_exit(self) -> None:
+        """正常退出时替换（【稍后】路径的另一半）：复验 → bat（relaunch=False）→
+        分离启动 → 退出。本路径绝不自动拉起新进程 —— 下次用户自己打开就是新版。"""
+        if self._reload_started:
+            return                    # 重载路径已安排了带拉起的替换，别重复安排
+        if not self._update_pending_exit:
+            return
+        if update_check.update_mode() != "frozen":
+            return                    # 源码运行不做自更新（正常也走不到这）
+        exe = Path(sys.executable).resolve()
+        try:
+            # 硬要求：退出前再复验一次（防下载后文件被改坏/杀软动过），不通过就不换
+            hit = update_check.check_pending_download(exe, __version__)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[update] 跳过退出时替换（复核异常：{type(exc).__name__}: {exc}）",
+                  flush=True)
+            return
+        if hit is None:
+            print("[update] 跳过退出时替换（待更新文件复核未通过，残留已按规则清理）",
+                  flush=True)
+            return
+        version = hit[0]
+        try:
+            bat = update_check.build_updater_bat(
+                pid=os.getpid(), current_exe=exe,
+                new_exe=update_check.pending_new_exe(exe), relaunch=False)
+            self._launch_updater_bat(bat)
+        except Exception as exc:  # noqa: BLE001 — 失败要被用户看到，不能静默退出
+            print(f"[update] ⚠️ 退出时替换安排失败：{type(exc).__name__}: {exc}"
+                  f"（新版本已下载好并保留，下次启动会再给更新入口）", flush=True)
+            info = self._update_pending_info
+            open_page = messagebox.askokcancel(
+                "更新没有成功",
+                "更新没有成功，现在的版本不受影响，下次打开还是它。\n\n"
+                "点「确定」打开下载页自己下；点「取消」直接退出。",
+                parent=self._root)
+            if open_page and info is not None and info.html_url:
+                self._open_release_page(info.html_url)
+            return
+        print(f"[update] 退出时替换已安排（不自动拉起），下次打开就是 v{version}",
+              flush=True)
+
+    # ---------------------------------------------------------------- 启动兜底与一次性提示
+
+    def _check_pending_update_at_startup(self) -> None:
+        """启动兜底：上次下载好了新版本但没来得及换（被强杀/直接关机）→
+        重新复验残留，完好就直接出「下载完成」窗口给更新入口（不重复下载），
+        并记下退出时替换；损坏/半截 → check_pending_download 内部已清理 + 留痕。"""
+        if self._headless or update_check.update_mode() != "frozen":
+            return
+        exe = Path(sys.executable).resolve()
+        try:
+            hit = update_check.check_pending_download(exe, __version__)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[update] ⚠️ 待更新文件复核失败：{type(exc).__name__}: {exc}", flush=True)
+            return
+        if hit is None:
+            return
+        version = hit[0]
+        info = update_check.ReleaseInfo(
+            tag=f"v{version}", version=version,
+            html_url=f"{update_check.RELEASES_HTML}/tag/v{version}",
+            exe_url="", sums_url="", exe_size=None)
+        self._mark_update_pending(info)
+        self._show_download_window(info)
+        self._enter_download_done_state(update_check.pending_new_exe(exe))
+
+    def _schedule_version_changed_hint(self) -> None:
+        """启动版本提示：上次运行版本 ≠ 本次（刚完成过替换/升级）→ ~1.5 秒后弹一次性
+        「已更新」小提示；首次运行只悄悄记下版本；版本没变 → 什么都不做。"""
+        self._updated_hint_job = None
+        if self._headless or update_check.update_mode() != "frozen":
+            return
+        last = update_check.load_last_seen_version(APP_DIR)
+        if last is None:
+            # 首次运行（或状态文件损坏）：只记录，不打扰
+            update_check.save_last_seen_version(APP_DIR, __version__)
+            return
+        if last == __version__:
+            return
+        print(f"[update] 版本已从 v{last} 变为 v{__version__}：准备弹一次性「已更新」提示",
+              flush=True)
+        self._updated_hint_job = self._root.after(1500, self._show_version_changed_hint)
+
+    def _show_version_changed_hint(self) -> None:
+        """一次性、非模态、可秒关的「已更新到最新版本」小提示（逐字文案 checklist ④）。
+        同一版本只弹一次：关闭时写回当前版本。版本号只进日志，不丢给普通用户。"""
+        self._updated_hint_job = None
+        if self._updated_hint_win is not None:
+            return
+        try:
+            if not self._root.winfo_exists():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        win = tk.Toplevel(self._root)
+        win.title("已更新到最新版本")
+        win.configure(bg=PANEL)
+        win.transient(self._root)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self._close_updated_hint)
+        win.bind("<Escape>", lambda _e: self._close_updated_hint())
+        self._updated_hint_win = win
+
+        body = ttk.Frame(win, padding=(20, 16, 20, 14))
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text="已更新到最新版本",
+                  font=("Microsoft YaHei UI", 12, "bold")).pack(anchor=tk.W)
+        ttk.Label(body, text="VRChat Live Translate 已更新到最新版本，一切照常使用。",
+                  wraplength=360, justify=tk.LEFT).pack(anchor=tk.W, pady=(10, 0))
+        link = tk.Label(body, text="看看这次更新了什么", fg=ACCENT_HOVER, bg=PANEL,
+                        cursor="hand2", font=FONT_UI)
+        link.pack(anchor=tk.W, pady=(8, 0))
+        link.bind("<Button-1>", lambda _e: self._open_release_page(
+            f"{update_check.RELEASES_HTML}/tag/v{__version__}"))
+        ok = ttk.Button(body, text="知道了", style="Accent.TButton",
+                        command=self._close_updated_hint)
+        ok.pack(anchor=tk.E, pady=(16, 0))
+        ok.focus_set()
+
+        win.update_idletasks()
+        rx, ry = self._root.winfo_x(), self._root.winfo_y()
+        rw = self._root.winfo_width()
+        win.geometry(f"+{rx + max((rw - win.winfo_reqwidth()) // 2, 20)}+{ry + 60}")
+        self._apply_dark_titlebar(win)
+        win.lift()
+        print("[update] 已弹出一次性「已更新到最新版本」提示", flush=True)
+
+    def _close_updated_hint(self) -> None:
+        """关闭「已更新」提示（右上角 X / 知道了 / Esc 共用）：写回当前版本，同一版本不再弹。"""
+        win, self._updated_hint_win = self._updated_hint_win, None
+        if win is None:
+            return                              # 没弹过就什么都不做（别误写状态文件）
+        try:
+            win.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+        update_check.save_last_seen_version(APP_DIR, __version__)
 
     def _refresh_key_status(self) -> None:
         """只显示来源 + 打码值，绝不显示明文。
@@ -1859,6 +2118,12 @@ class TranslationGUI:
             self._stop()
         except Exception as exc:
             print(f"[gui] 停止引擎时出错（继续关闭）：{exc}", file=sys.stderr)
+        try:
+            # 「稍后更新」的另一半：正常退出时替换（绝不自动拉起新版）。
+            # 放在销毁窗口之前：失败提示需要有地方弹；bat 自己会等本程序退出再动手。
+            self._maybe_replace_on_exit()
+        except Exception as exc:
+            print(f"[update] ⚠️ 退出时替换出现异常（继续关闭）：{exc}", file=sys.stderr)
         try:
             self._root.destroy()
         except Exception:

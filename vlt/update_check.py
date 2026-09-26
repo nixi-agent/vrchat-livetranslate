@@ -27,10 +27,16 @@ from .config_io import _fmt_scalar, _write_config_text, _yaml_set_in_text
 from .paths import is_frozen
 
 RELEASES_LATEST_API = "https://api.github.com/repos/nixi-agent/vrchat-livetranslate/releases/latest"
+# Release 页面基址（与上面的 API 同仓库）：拼 tag 页 = f"{RELEASES_HTML}/tag/vX.Y.Z"
+RELEASES_HTML = "https://github.com/nixi-agent/vrchat-livetranslate/releases"
 DEFAULT_TIMEOUT_S = 10.0
 DOWNLOAD_TIMEOUT_S = 120.0
 EXE_ASSET_NAME = "VRChatLiveTranslate.exe"
 SUMS_ASSET_NAME = "SHA256SUMS.txt"
+# exe 同目录：{"version": "...", "sha256": "..."}（【稍后】与异常恢复的凭据）
+PENDING_JSON = "update_pending.json"
+# APP_DIR：{"last_seen_version": "..."}（版本变化一次性提示用）
+STATE_JSON = "update_state.json"
 
 # 只允许这几个 host：查最新（api.github.com）、asset 跳转起点（github.com）、
 # asset 实际下载（两个 CDN 域）。重定向目标与最终落地地址都必须过这道白名单。
@@ -346,6 +352,13 @@ def download_and_verify(info: ReleaseInfo, dest_dir: Path,
         print("[update] 校验失败已删除", flush=True)
         raise UpdateCheckError("下载的文件与发布页的摘要对不上，已删除（请重试）")
     print(f"[update] 下载完成 sha256 校验通过（v{info.version}）", flush=True)
+    try:
+        write_pending(Path(dest_dir), info.version, actual)
+    except OSError as exc:
+        # json 写不进去不挡本次更新（【重载】不依赖它）；但【稍后】/残留恢复会因此走不通，
+        # 必须留痕 —— 禁静默降级
+        print(f"[update] ⚠️ 待更新信息没写下来（{exc}）：「稍后更新」退出时将不会自动替换",
+              flush=True)
     return dest
 
 
@@ -360,12 +373,15 @@ def update_mode() -> str:
 # ---------------------------------------------------------------- 更新器 bat 生成
 
 
-def build_updater_bat(*, pid: int, current_exe: Path, new_exe: Path) -> str:
+def build_updater_bat(*, pid: int, current_exe: Path, new_exe: Path,
+                      relaunch: bool = True) -> str:
     """生成更新器批处理文本（CRLF 行尾！cmd 对 LF-only 的 label/goto 会抽风）。
 
     逻辑：等 PID 退出（最多 ~60s）→ 备份 current 为 .bak → move .new 顶替（同卷近原子，
-    失败则用 .bak 还原）→ start 拉起新版 → 自删；失败留一行到 exe 旁的
+    失败则用 .bak 还原）→（relaunch=True 才）start 拉起新版 → 自删；失败留一行到 exe 旁的
     update_failed.log 并 pause（用户能看到窗口，不会无声消失）。
+    relaunch=False 用于【稍后】退出时替换：只换不拉，用户下次自己打开就是新版 ——
+    与 True 形态的唯一差别就是没有 start "" 那一行，其余逐字节相同。
     所有路径双引号包裹（桌面/用户名常含空格）；不写注册表、不要管理员。
     bat 正文只用 ASCII：cmd 按系统 OEM 代码页解析，塞中文注释在代码页不符时会变乱码。
     """
@@ -395,7 +411,10 @@ def build_updater_bat(*, pid: int, current_exe: Path, new_exe: Path) -> str:
         "goto fail",
         "",
         ":start",
-        f'start "" "{cur}"',
+    ]
+    if relaunch:
+        lines.append(f'start "" "{cur}"')
+    lines += [
         'del "%~f0"',
         "exit /b 0",
         "",
@@ -404,3 +423,97 @@ def build_updater_bat(*, pid: int, current_exe: Path, new_exe: Path) -> str:
         "pause",
     ]
     return "\r\n".join(lines) + "\r\n"
+
+
+# ---------------------------------------------------------------- 待更新状态与版本记录
+
+
+def file_sha256(path: Path) -> str:
+    """流式算文件的 sha256（hex）—— 残留 .new 复验用，别把 30MB+ 一次读进内存。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(_CHUNK), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def pending_new_exe(exe_path: Path) -> Path:
+    """exe 旁待替换的新版文件位置（与 download_and_verify 的落地路径同一规则）。"""
+    return Path(exe_path).parent / (EXE_ASSET_NAME + ".new")
+
+
+def write_pending(dest_dir: Path, version: str, sha256: str) -> Path:
+    """下载校验通过后写 update_pending.json（供【稍后更新】与异常恢复的复验凭据）。"""
+    p = Path(dest_dir) / PENDING_JSON
+    p.write_text(json.dumps({"version": version, "sha256": sha256},
+                            ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return p
+
+
+def check_pending_download(exe_path: Path,
+                           current_version: str = "") -> tuple[str, str] | None:
+    """残留 .new 的安全网：用之前必须重新校验，损坏/半截绝不放行。
+
+    exe 旁存在 <EXE_ASSET_NAME>.new 且 update_pending.json 完好 → 重新计算 .new 的
+    SHA256 与 json 比对：一致 → 返回 (version, sha256)；
+    不一致 / json 损坏缺字段 / .new 缺失 / 版本不比 current_version 新（换过的残留）→
+    清理残留（.new 与 json 都删）+ 逐分支 [update] 留痕，返回 None。
+    完全没有残留 → 静默返回 None（每次启动都会走这条路，不刷日志）。
+    """
+    exe_path = Path(exe_path)
+    new_exe = pending_new_exe(exe_path)
+    pending = exe_path.parent / PENDING_JSON
+
+    def _cleanup(reason: str) -> None:
+        new_exe.unlink(missing_ok=True)
+        pending.unlink(missing_ok=True)
+        print(f"[update] 待更新文件{reason}：残留已清理，按正常检查流程走", flush=True)
+
+    has_new, has_json = new_exe.exists(), pending.exists()
+    if not has_new and not has_json:
+        return None
+    if not has_new:
+        _cleanup("只剩记录文件、下载物缺失")
+        return None
+    if not has_json:
+        _cleanup("缺少记录文件，无法确认完整性")
+        return None
+    try:
+        meta = json.loads(pending.read_text(encoding="utf-8"))
+        version, expected = str(meta["version"]), str(meta["sha256"]).lower()
+        if parse_version(version) is None or len(expected) != 64:
+            raise ValueError("字段不合法")
+    except Exception:
+        _cleanup("记录文件损坏")
+        return None
+    if current_version and not is_newer(version, current_version):
+        # 待替换版本不新于当前版本 = 上次其实换成功了、只是残留没清掉
+        _cleanup(f"（v{version}）不比当前 v{current_version} 新，是换完剩下的")
+        return None
+    actual = file_sha256(new_exe)
+    if actual != expected:
+        _cleanup(f"完整性复核不通过（期望 {expected[:12]}… 实测 {actual[:12]}…）")
+        return None
+    print(f"[update] 检测到已下载好的新版本 v{version}，完整性复核通过（不重复下载）",
+          flush=True)
+    return version, expected
+
+
+def load_last_seen_version(app_dir: Path) -> str | None:
+    """上次运行记录的版本号；文件缺失/损坏 → None（当作首次运行看待，不报错）。"""
+    try:
+        data = json.loads((Path(app_dir) / STATE_JSON).read_text(encoding="utf-8"))
+        v = data.get("last_seen_version") if isinstance(data, dict) else None
+        return str(v) if isinstance(v, str) and v else None
+    except Exception:  # noqa: BLE001 — 坏 JSON / 文件不存在 / 缺字段都按「首次」处理
+        return None
+
+
+def save_last_seen_version(app_dir: Path, version: str) -> None:
+    """写回本次运行版本（版本变化提示「同一版本只弹一次」的凭据）。失败只留痕。"""
+    try:
+        (Path(app_dir) / STATE_JSON).write_text(
+            json.dumps({"last_seen_version": version}, ensure_ascii=False) + "\n",
+            encoding="utf-8")
+    except OSError as exc:
+        print(f"[update] ⚠️ 版本提示状态写不进去：{exc}", flush=True)

@@ -832,11 +832,31 @@ class TranslationGUI:
             text = _yaml_set_in_text(text, ["room", "nickname"],
                                      _yaml_quote(self._room_cfg.nickname))
             _write_config_text(p, text)
+            # ⚠️ 上面补建的只是**文件**。内存里的 `self._room_cfg` 还是「配置里根本没有 room 段」
+            # 时的默认值（`server_url` 为空）→ 紧接着勾选启用时，`RoomClient` 的启动校验会直接拒：
+            #     [room] ❌ 房间链路没启动：没填 server_url（config.yaml 的 room.server_url）
+            # 而用户打开 config.yaml 一看，明明有 —— 于是表现为「勾了房间没反应，
+            # 重启一次才好」。所以写完把新段回读回来，让**本轮**勾选就能连上。
+            self._room_cfg = self._room_cfg_from_text(text)
             print(f"[gui] 房间设置已保存：enabled={_fmt_scalar(bool(self._room_cfg.enabled))} "
                   f"room_code={self._room_cfg.room_code!r} nickname={self._room_cfg.nickname!r}",
                   flush=True)
         except Exception as exc:                # noqa: BLE001  存盘失败只留痕，不影响使用
             print(f"[gui] 保存房间设置失败：{exc}", flush=True)
+
+    def _room_cfg_from_text(self, text: str) -> RoomConfig:
+        """从配置**文本**里读 `room:` 段成 RoomConfig（补建段之后立刻回读用）。
+
+        解析失败就沿用内存里的现有设置（宁可用旧设置，也别把用户刚填的选项清掉）。
+        """
+        try:
+            raw = (yaml.safe_load(text) or {}).get("room")
+        except Exception as exc:                # noqa: BLE001
+            print(f"[gui] 房间段回读失败（沿用内存里的设置）：{exc}", flush=True)
+            return self._room_cfg
+        if not isinstance(raw, dict):
+            return self._room_cfg
+        return RoomConfig.from_dict(raw)
 
     def _start_room(self) -> None:
         """建 RoomClient 并启动（**幂等**）。任何异常只留痕 + 状态栏，绝不影响翻译。"""

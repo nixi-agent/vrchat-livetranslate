@@ -129,6 +129,57 @@ def test_room_row_present_and_not_clipped() -> bool:
             pass
 
 
+def test_room_first_toggle_after_section_created() -> bool:
+    """★ 回归：老 config.yaml 没有 `room:` 段时，勾选房间必须**当场**就能连（不该要求重启）。
+
+    真实事故（用户日志 2026-09-28）：
+
+        22:56:02 [gui] 房间设置已保存：enabled=true room_code='' nickname=''
+        22:56:02 [room] ❌ 房间链路没启动：没填 server_url（config.yaml 的 room.server_url）
+
+    而那个 config.yaml 里**有** server_url：补建的只是**文件**，内存里的 `RoomConfig`
+    还是「配置里没有 room 段」时的默认值（server_url 为空）→ 启动校验直接拒 →
+    用户看到「勾了房间没反应」，重启一次才好。
+    """
+    import tempfile
+
+    import vlt.gui as gui_mod
+    from vlt.gui import TranslationGUI
+    from vlt.room.model import RoomConfig
+
+    gui = TranslationGUI()
+    real_default = gui_mod.DEFAULT_CONFIG
+    tmp = Path(tempfile.mkdtemp()) / "config.yaml"
+    try:
+        # 老用户的配置：完全没有 room 段
+        tmp.write_text("session:\n  api_key: ''\n", encoding="utf-8")
+        gui_mod.DEFAULT_CONFIG = tmp
+        gui._room_cfg = RoomConfig.from_dict({})       # = 启动时读到「没有 room 段」的状态
+        assert not gui._room_cfg.server_url, "前置条件：此时内存里的 server_url 应为空"
+
+        gui._room_var.set(True)                        # 勾上「房间」
+        gui._room_code_var.set("testtest")
+        gui._room_nick_var.set("sand")
+        gui._sync_room_cfg_from_fields()
+        gui._save_room_cfg()
+
+        text = tmp.read_text(encoding="utf-8")
+        file_ok = "room:" in text and "vlt-room.kcm-nixi.cn" in text
+        mem_ok = bool(gui._room_cfg.server_url)
+        print(f"  补建后 server_url：文件={file_ok}，内存={gui._room_cfg.server_url!r}"
+              f"（房间码 {gui._room_cfg.room_code!r}）  {'OK' if file_ok and mem_ok else '✗'}")
+        assert file_ok, "room 段没有被补建进 config.yaml"
+        assert mem_ok, ("内存里的 server_url 仍为空 → 首次勾选还是会报「没填 server_url」，"
+                        "用户必须重启一次（这正是本用例防的回归）")
+        return True
+    finally:
+        gui_mod.DEFAULT_CONFIG = real_default
+        try:
+            gui._root.destroy()
+        except Exception:
+            pass
+
+
 def main() -> int:
     cases = [
         # 一句话：增量 → 增量 → 终版，应只占 1 条气泡
@@ -166,6 +217,11 @@ def main() -> int:
         all_ok &= test_room_row_present_and_not_clipped()
     except AssertionError as exc:
         print(f"  ❌ 房间行检查失败：{exc}")
+        all_ok = False
+    try:
+        all_ok &= test_room_first_toggle_after_section_created()
+    except AssertionError as exc:
+        print(f"  ❌ 首次勾选房间失败：{exc}")
         all_ok = False
     for i, (events, expect) in enumerate(cases, 1):
         print(f"用例 {i}:")

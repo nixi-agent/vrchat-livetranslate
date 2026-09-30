@@ -34,7 +34,8 @@ def _reload(executable: Path, meipass: Path, appdata: Path, frozen: bool = True)
     """
     import vlt.paths as p
 
-    saved = {k: os.environ.get(k) for k in ("APPDATA", "XDG_DATA_HOME", "APPIMAGE", "APPDIR")}
+    saved = {k: os.environ.get(k)
+             for k in ("APPDATA", "XDG_DATA_HOME", "APPIMAGE", "APPDIR", "VLT_APP_DIR")}
     os.environ["APPDATA"] = str(appdata)
     os.environ["XDG_DATA_HOME"] = str(appdata)
     for k in ("APPIMAGE", "APPDIR"):
@@ -173,6 +174,47 @@ def test_legacy_config_migrated_once() -> None:
         _restore(saved, old)
 
 
+def test_app_dir_env_override() -> None:
+    """`VLT_APP_DIR` 覆盖可写目录：脚本运行与 AppImage 能共用同一份数据。
+
+    默认两边是分开的（脚本=仓库根；AppImage/exe=用户数据目录），两份配置会漂移。
+    覆盖必须**优先于一切**（包括 AppImage / frozen / portable 分支）。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        shared = Path(tmp) / "shared-data"
+        exe_dir = Path(tmp) / "exe"
+        exe_dir.mkdir(parents=True, exist_ok=True)
+        meipass = Path(tmp) / "meipass"
+        meipass.mkdir(parents=True, exist_ok=True)
+
+        # 源码形态 + 覆盖
+        mod, saved, old = _reload(exe_dir / "run_gui.py", meipass,
+                                  Path(tmp) / "appdata", frozen=False)
+        try:
+            os.environ["VLT_APP_DIR"] = str(shared)
+            mod = importlib.reload(mod)
+            assert mod.app_dir() == shared, f"覆盖未生效：{mod.app_dir()}"
+        finally:
+            _restore(saved, old)
+
+        # AppImage 形态 + 覆盖（覆盖优先于用户数据目录）
+        exe = exe_dir / "VRChatLiveTranslate"
+        exe.write_bytes(b"")
+        (exe_dir / "portable.txt").write_text("", encoding="utf-8")   # 连绿色版也要让位
+        mod, saved, old = _reload(exe, meipass, Path(tmp) / "appdata", frozen=True)
+        try:
+            os.environ["APPIMAGE"] = str(exe_dir / "x.AppImage")
+            os.environ["VLT_APP_DIR"] = str(shared)
+            mod = importlib.reload(mod)
+            assert mod.is_appimage(), "前提：应识别为 AppImage"
+            assert mod.app_dir() == shared, f"覆盖未生效（AppImage）：{mod.app_dir()}"
+            got = mod.ensure_app_dir()
+            assert got == shared and got.exists(), "ensure_app_dir 应创建覆盖目录"
+        finally:
+            _restore(saved, old)
+    print("  VLT_APP_DIR 覆盖 OK（源码/AppImage 都优先用覆盖目录）")
+
+
 if __name__ == "__main__":
     print("test_paths:")
     test_source_mode_uses_repo_root()
@@ -180,4 +222,5 @@ if __name__ == "__main__":
     test_portable_marker_overrides()
     test_appimage_writes_to_user_data_dir()
     test_legacy_config_migrated_once()
+    test_app_dir_env_override()
     print("ALL PASSED")

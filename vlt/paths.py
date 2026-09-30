@@ -10,6 +10,8 @@
     `Program Files` 这类**只读目录**也能正常跑）
   - 例外：exe 旁边放一个 `portable.txt` → 用 exe 所在目录（绿色版，
     整个文件夹拷走配置跟着走）
+  - 例外 2：设了 `VLT_APP_DIR` → 用它（让脚本运行与 AppImage 共用同一份
+    config/logs，见 `_env_override_app_dir()`）
 - `BUNDLE_DIR`（只读、随程序分发）：`config.example.yaml`、`testdata/`
   - 打包后 = `_MEIPASS`；源码 = 仓库根
 
@@ -24,6 +26,8 @@ from pathlib import Path
 
 APP_NAME = "vrchat-livetranslate"
 PORTABLE_MARKER = "portable.txt"
+#: 覆盖可写目录的环境变量（脚本运行 ↔ AppImage 共用同一份 config/logs 时用，见 app_dir()）
+APP_DIR_ENV = "VLT_APP_DIR"
 
 # 直接看 sys.platform，不 import vlt.platform —— 那会绕成环（platform 依赖 output，output 依赖 paths）
 _IS_WINDOWS = sys.platform == "win32"
@@ -68,8 +72,26 @@ def _user_data_dir() -> Path:
     return base / APP_NAME
 
 
+def _env_override_app_dir() -> Path | None:
+    """`VLT_APP_DIR` 指定的可写目录（没设返回 None）。
+
+    用途：同一台机器上**既跑脚本又跑 AppImage** 时，让两边共用同一份
+    config.yaml / logs —— 默认是分开的（脚本 = 仓库根；AppImage / exe = 用户数据目录），
+    两份配置会各自漂移。例：
+
+        VLT_APP_DIR=~/.local/share/vrchat-livetranslate ./run_gui.sh
+    """
+    raw = (os.environ.get(APP_DIR_ENV) or "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser()
+
+
 def app_dir() -> Path:
     """可写目录（详见模块说明）。"""
+    override = _env_override_app_dir()
+    if override is not None:
+        return override          # 显式覆盖优先于一切（脚本/AppImage 共用一份数据）
     if is_appimage():
         # AppImage：源码在只读挂载里，必须写用户数据目录
         return _user_data_dir()

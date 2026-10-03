@@ -353,6 +353,17 @@ def log_startup_info(tag: str = "") -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"[startup] 版本读取失败：{exc}")
     print(f"[startup] cwd {Path.cwd()}")
+    # 程序本体路径：只有 cwd 是不够的（cwd = 「从哪儿启动」，不等于文件在哪）。
+    # 手腕屏走 OpenVR「后台应用」初始化，那条路对我们的 exe 路径敏感 —— 路径含非 ASCII
+    # 字符时可能初始化失败，而事后完全看不出程序放在哪。所以这里固定写两行。
+    _prog = sys.executable or "(未知)"
+    try:
+        _prog_ascii = _prog.isascii()
+    except Exception:  # noqa: BLE001
+        _prog_ascii = True
+    print(f"[startup] 程序路径 {_prog}")
+    _prog_hint = "是 ⚠️ 手腕屏可能用不了，建议把程序移到纯英文目录（例如 D:/VLT/）"
+    print(f"[startup] 程序路径含非 ASCII 字符：{_prog_hint if not _prog_ascii else '否'}")
     print("[startup] 日志时间戳为行首 HH:MM:SS.mmm（本机本地时间 = UTC+8）")
     try:
         root = Path(__file__).resolve().parent.parent

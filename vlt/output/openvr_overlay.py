@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import sys
 import time
 from pathlib import Path
 
@@ -46,6 +47,52 @@ def build_matrix(pos: tuple[float, float, float], rot_deg: tuple[float, float, f
             m.m[i][j] = r[i][j]
         m.m[i][3] = pos[i]
     return m
+
+
+# ------------------------------------------------- 初始化失败：把「为什么」写进日志
+# ⚠️ openvr 的异常**文本恒为空字符串**（原因只写在**异常类名**上，例如
+#    `InitError_Init_NoServerForBackgroundApp`）。这里曾经打的是 `{exc}`，
+#    结果日志里只剩一个冒号 —— 排查时等于没有信息（实测为此白跑两轮推理）。
+#    所以一律打 `type(exc).__name__`，并给常见类名配一句中文。
+_INIT_ERROR_HINTS = {
+    "InitError_Init_NoServerForBackgroundApp":
+        "没找到能接收「后台应用」的 SteamVR 服务：SteamVR 没启动（后台应用**不会**替用户启动它）；"
+        "或程序所在路径含非 ASCII 字符（中文、全角括号等），OpenVR 认不出这个应用",
+    "InitError_Init_InstallationNotFound":
+        "本机找不到 SteamVR 安装（没装，或安装信息读不到）",
+    "InitError_Init_VRClientDLLNotFound":
+        "找不到 SteamVR 的 vrclient 运行库（安装不完整，可在 Steam 里校验文件完整性）",
+    "InitError_Init_HmdNotFound":
+        "SteamVR 在跑，但它没检测到头显：确认头显已连上、SteamVR 窗口里能看到设备",
+    "InitError_Init_HmdNotFoundPresenceFailed":
+        "SteamVR 在跑，但头显连接中断（USB/驱动掉了）：重插头显或重启 SteamVR",
+    "InitError_Init_VRMonitorNotFound":
+        "SteamVR 的 vrmonitor 没起来：从 Steam 里正常启动一次 SteamVR",
+    "InitError_Init_VRMonitorStartupFailed":
+        "SteamVR 的 vrmonitor 启动失败：重启 SteamVR，必要时重启电脑",
+    "InitError_Init_AnotherAppLaunching":
+        "SteamVR 正在启动中：等它起完（头显里能看到 SteamVR 大厅）再勾一次手腕屏",
+    "InitError_Init_ShuttingDown":
+        "SteamVR 正在退出：等它退干净，重新启动 SteamVR 再勾一次",
+    "InitError_Init_UserConfigDirectoryInvalid":
+        "SteamVR 的用户配置目录不可用（权限问题，或被清理软件删了）",
+    "InitError_Init_PathRegistryNotFound":
+        "读不到 SteamVR 的安装路径（注册表项缺失）",
+    "InitError_Init_PathRegistryNotWritable":
+        "SteamVR 的路径/日志目录不可写（权限问题）",
+    "InitError_Init_NoLogPath":
+        "SteamVR 的日志目录不可用",
+    "InitError_Init_Retry":
+        "SteamVR 让稍后重试（多半正在启动/切换场景）：过几秒再勾一次",
+}
+
+
+def _no_server_hint() -> str:
+    """121 的**两种形态**只能从 SteamVR 自己的客户端日志里分辨，日志里说清去哪看。"""
+    return ("排查：SteamVR 日志目录里的 `vrclient_<程序名>.txt` 会写明是哪种 —— "
+            "「no one is listening」= SteamVR 没在跑；"
+            "「信号灯超时 / semaphore timeout」= SteamVR 在跑但命名管道不应答"
+            "（重启 SteamVR；不行就重启电脑）")
 
 
 # ---------------------------------------------------------------- overlay 本体
@@ -100,7 +147,15 @@ class WristOverlay:
         try:
             self._vr = openvr.init(openvr.VRApplication_Background)
         except Exception as exc:  # noqa: BLE001
-            print(f"[overlay] ⚠️ SteamVR 未运行或不可用，overlay 已禁用（其他输出不受影响）：{exc}")
+            # ⚠️ 打**类名**：openvr 异常的 str() 恒为空，只打 `{exc}` 等于没有信息
+            name = type(exc).__name__
+            print(f"[overlay] ⚠️ SteamVR 未运行或不可用，overlay 已禁用（其他输出不受影响）："
+                  f"{name}: {exc}", flush=True)
+            print(f"[overlay]   原因："
+                  f"{_INIT_ERROR_HINTS.get(name, '未知原因（请把这一行连同上下文发给我们）')}",
+                  flush=True)
+            if name == "InitError_Init_NoServerForBackgroundApp":
+                print(f"[overlay]   {_no_server_hint()}", flush=True)
             return False
         try:
             # ⚠️ overlay 接口是**模块级工厂函数** `openvr.IVROverlay()`，

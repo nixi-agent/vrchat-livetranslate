@@ -420,4 +420,14 @@ STRINGS: dict[str, str] = {
     "桌面字幕位置已记住": "Desktop subtitle position saved",
     "（字幕窗默认可穿透，先解锁再拖）":
         "(the window ignores clicks by default — unlock first, then drag)",
+    # ---- VRChat OSC 端口（设置 → 常规）----
+    "端口:": "Port:",
+    "保存端口": "Save Port",
+    "VRChat 默认收 9000 端口；只有你在 VRChat 里改过 OSC 端口（或中间挂了转发工具）时才需要动这里":
+        "VRChat listens on port 9000 by default — change this only if you changed "
+        "VRChat's OSC port (or run a forwarding tool in between)",
+    "端口必须是 1–65535 之间的整数": "Port must be an integer between 1 and 65535",
+    "OSC 端口已保存：{port}": "OSC port saved: {port}",
+    "OSC 端口已保存：{port}（正在翻译，重开翻译后生效）":
+        "OSC port saved: {port} (restart translation to apply)",
 }

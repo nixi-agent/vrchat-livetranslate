@@ -1871,6 +1871,90 @@ class TranslationGUI:
                                        wraplength=SETTINGS_WRAP)
         self._ui_lang_note.pack(anchor=tk.W)
 
+        ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=14)
+
+        # ---- VRChat OSC 端口 ----
+        # 默认 9000 是 **VRChat 那边**的 OSC 接收端口（我们往它发 /chatbox/input）。
+        # 用户在 VRChat 里改过端口、或中间挂了 OSC 转发工具（VRCT 之类）时，不跟着改就
+        # 一条气泡都发不出去 —— 而症状只是「chatbox 没反应」，界面上看不出是端口不对。
+        # 「VRChat OSC」是专有名词，不进词表（见仓库约定：专有名词不翻译）。
+        ttk.Label(body, text="VRChat OSC", style="Section.TLabel").pack(anchor=tk.W)
+        osc_row = ttk.Frame(body)
+        osc_row.pack(fill=tk.X, pady=(8, 4))
+        # 按钮先占右侧：空间不足时被压的才是输入区（与 key 行同一口径）
+        self._osc_save_btn = ttk.Button(osc_row, text=t("保存端口"),
+                                        command=self._on_save_osc_port)
+        self._osc_save_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Label(osc_row, text=t("端口:"), style="Dim.TLabel").pack(side=tk.LEFT)
+        self._osc_port_var = tk.StringVar(value=str(self._chatbox_port()))
+        self._osc_port_entry = ttk.Entry(osc_row, textvariable=self._osc_port_var,
+                                         width=8, style="Key.TEntry")
+        self._osc_port_entry.pack(side=tk.LEFT, padx=(8, 0))
+        self._osc_port_entry.bind("<Return>", lambda _e: self._on_save_osc_port())
+        self._attach_edit_menu(self._osc_port_entry)
+        ttk.Label(body,
+                  text=t("VRChat 默认收 9000 端口；只有你在 VRChat 里改过 OSC 端口"
+                         "（或中间挂了转发工具）时才需要动这里"),
+                  style="Muted.TLabel", justify=tk.LEFT,
+                  wraplength=SETTINGS_WRAP).pack(anchor=tk.W)
+        # 就地红字（与线路页同一口径）：保存被拒时必须在这一屏看得见
+        self._osc_err = ttk.Label(body, text="", style="Error.TLabel",
+                                  justify=tk.LEFT, wraplength=SETTINGS_WRAP)
+        self._osc_err.pack(anchor=tk.W, pady=(6, 0))
+
+    def _chatbox_port(self) -> int:
+        """当前 chatbox.port（脏值一律回落到 9000，绝不把非数字显示到输入框里）。"""
+        try:
+            return int((self._cfg.chatbox or {}).get("port", 9000))
+        except Exception:  # noqa: BLE001
+            return 9000
+
+    def _on_save_osc_port(self) -> None:
+        """把 VRChat 的 OSC 接收端口就地写回 config.yaml 的 `chatbox.port`。
+
+        写法照 `_save_room_cfg` / `_on_save_provider`：就地改文本，保住注释与键顺序；
+        `chatbox:` 段在老配置里可能缺失 → 用 `_yaml_set_or_create` 补建。
+        校验失败**不写盘**，就地红字 + 状态栏各留一行（禁静默丢弃）。
+        """
+        raw = (self._osc_port_var.get() or "").strip()
+        port = int(raw) if raw.isdigit() else None
+        if port is None or not 1 <= port <= 65535:
+            err = t("端口必须是 1–65535 之间的整数")
+            self._osc_err.configure(text="❌ " + err)
+            self._set_status("error", t("❌ 没保存：{msg}", msg=err))
+            print(f"[gui] ❌ OSC 端口没保存：{raw!r}（{err}）", flush=True)
+            return
+        p = DEFAULT_CONFIG
+        if not p.exists():
+            msg = f"找不到 {p.name}"
+            self._osc_err.configure(text=t("❌ 没保存：{msg}", msg=msg))
+            self._set_status("error", t("❌ 没保存：{msg}", msg=msg))
+            print(f"[gui] ❌ OSC 端口没保存：{msg}", flush=True)
+            return
+        try:
+            text = p.read_text(encoding="utf-8")
+            text = _yaml_set_or_create(text, ["chatbox", "port"], str(port))
+            _write_config_text(p, text)
+        except Exception as exc:                # noqa: BLE001  写盘失败只留痕，配置保持原样
+            self._osc_err.configure(text=t("❌ 没保存：{msg}", msg=exc))
+            self._set_status("error", t("❌ 没保存：{msg}", msg=exc))
+            print(f"[gui] ❌ 保存 OSC 端口失败（配置未改动）：{exc}", flush=True)
+            return
+        self._osc_err.configure(text="")
+        # ⚠️ 必须同步内存：引擎是在「开始翻译」时按 `self._cfg.chatbox` 建 Chatbox 的 ——
+        # 不同步的话本轮点开始翻译还用旧端口，症状＝「改了没反应」。
+        if isinstance(self._cfg.chatbox, dict):
+            self._cfg.chatbox["port"] = port
+        if any(e.running for e in self._engines):
+            # 已经在跑的那条引擎，端口在建链时就定死了（与线路同理）
+            self._set_status("warn", t("OSC 端口已保存：{port}（正在翻译，重开翻译后生效）",
+                                       port=port))
+            print(f"[gui] ⚠️ OSC 端口已保存：{port}，但翻译正在进行中 —— "
+                  f"需先停止再重新开始才生效", flush=True)
+        else:
+            self._set_status("ok", t("OSC 端口已保存：{port}", port=port))
+            print(f"[gui] OSC 端口已保存：{port}", flush=True)
+
     # ---------------------------------------------------------------- 设置弹窗 · 服务线路
     def _build_provider_section(self, body: ttk.Frame) -> None:
         """「服务线路」区：千问云 / 千问云·海外版（**互斥**，同一时刻只有一条在工作）。

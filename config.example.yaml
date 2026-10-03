@@ -121,7 +121,7 @@ glossary:
 
 chatbox:
   host: 127.0.0.1
-  port: 9000
+  port: 9000                 # VRChat 的 OSC 接收端口（也可在「设置 → 常规 → VRChat OSC」里改）
   max_chars: 144             # 官方上限（字符，不是字节）
   max_lines: 9
   interval_s: 2.0            # 增量刷新节奏（漏桶 5 条/5 秒 → 2 秒一条余量充足）

@@ -40,6 +40,39 @@ class TextDelta:
 # 阈值太小会在句子中间抢跑，把半句当成最终版。
 DEFAULT_FINAL_SILENCE_S = 3.0
 
+# 「麦克风也静了」的快封句（真链路实测 2026-10-01：省 ~1.8s）：
+# 实测（真链路 2 句）：服务端在**用户停止说话后 8s 内一条事件都不发**
+# （既无 response.text.done 也无 response.done）→ 没有语义完成信号可用，只能靠定时器；
+# 而累计译文在「说完前 0.74~0.89s」就不再增长 → 之后再等 3s 全是白等。
+# 所以：**麦克风已静音 ≥ fast_mic_quiet_s**（用户确实说完了）时，文字静默只要
+# fast_silence_s 就封句；用户还在说（< fast_mic_quiet_s）则仍用保守的 3.0s —— 那 2.3s 的
+# 大间隔是**句子中间**的停顿，不能拿它当证据。
+DEFAULT_FAST_FINAL_SILENCE_S = 1.1
+DEFAULT_FAST_FINAL_MIC_QUIET_S = 0.5
+
+
+def should_finalize(*, text_quiet_s: float, mic_quiet_s: float | None,
+                    silence_s: float = DEFAULT_FINAL_SILENCE_S,
+                    fast_silence_s: float | None = DEFAULT_FAST_FINAL_SILENCE_S,
+                    fast_mic_quiet_s: float = DEFAULT_FAST_FINAL_MIC_QUIET_S) -> bool:
+    """该不该把累计文本封成「最终版」（纯函数，便于离线测）。
+
+    两条路径：
+    - **慢**：文字静默 ≥ `silence_s`（3.0s）。任何时候都成立，但用户说完后要白等 3s。
+    - **快**：`fast_silence_s` 非 None、**麦克风已静音 ≥ `fast_mic_quiet_s`**、
+      且文字静默 ≥ `fast_silence_s`。用户都不说了，服务端的尾巴（实测最后一条分片在
+      说完前 0.7~0.9s 就到齐）就不会再长 → 可以早封。
+
+    `mic_quiet_s=None`：从未上送过音频（没有音频在流 = 没人在说话）→ 按「已静」看待。
+    """
+    if text_quiet_s >= silence_s:
+        return True
+    if fast_silence_s is None:
+        return False
+    if mic_quiet_s is not None and mic_quiet_s < fast_mic_quiet_s:
+        return False                      # 用户还在说：服务端可能只是慢，别抢跑
+    return text_quiet_s >= fast_silence_s
+
 
 @dataclass
 class SessionConfig:
@@ -66,6 +99,10 @@ class SessionConfig:
     # ⚠️ 必须大于服务端的「增量间隔」：实测连续说话时相邻 delta 可间隔 2.3s，
     #    阈值太小会在句子中间抢跑，把半句当成最终版。
     final_silence_s: float = DEFAULT_FINAL_SILENCE_S
+    # 快封句（麦克风也静了 → 用户确实说完了）：文字静默到这个值就封，省 ~1.8s。
+    # None = 关掉快路径（退回纯 final_silence_s）。
+    fast_final_silence_s: float | None = DEFAULT_FAST_FINAL_SILENCE_S
+    fast_final_mic_quiet_s: float = DEFAULT_FAST_FINAL_MIC_QUIET_S
 
     @property
     def url(self) -> str:

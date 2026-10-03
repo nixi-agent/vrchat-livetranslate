@@ -26,12 +26,26 @@ session:
   # 音色 id 按模型区分，不能与下面 text_input.tts 的音色表混用。
   voice: Tina
   # 断句：留空 = 用服务端默认（3.8 为 speaker_detection）；也可填 server_vad
+  # 实测（2026-10-01，4 轮真链路）：填 server_vad 会让**首条译文更早出现**
+  #   短句：开口后 1.19~1.23s → 0.57~0.69s（早 ~0.6s）
+  #   长句：开口后 3.29~3.35s → 2.30~2.48s（早 ~0.9s）
+  # ⚠️ 代价：server_vad 按**静音**判停，speaker_detection 认「谁在说」→ 环境嘈杂、或你中途
+  #    停顿较久时，更容易在句子中间断句（译文被切成更多小段）。吵的环境建议留空。
   turn_detection: null
   # 静默兜底：服务端在持续音频下可能长时间不发 response.done，
   # 超过这个静默时长就把累计文本当最终版发出（保证「句末刷最终版」必达）。
   # ⚠️ 必须大于服务端的增量间隔（实测连续说话时相邻 delta 最大 2.3s）——
   #    调小会在句子中间抢跑，把半句话当成最终版。
   final_silence_s: 3.0
+  # 快封句（2026-10-01 实测新增）：**麦克风也静了**（你确实说完了）时，文字静默
+  # fast_final_silence_s 就封句，不必再等那 3s。实测：服务端在你停止说话后 8s 内
+  # 一条事件都不发（无 text.done / 无 response.done），而累计译文在「说完前 0.7~0.9s」
+  # 就不再增长 → 之后全是白等。实测把「说完→这句定型」从 +2.1s 提到 +0.3s（省 ~1.8s）。
+  # 你还在说时（麦克风静音 < fast_final_mic_quiet_s）仍用上面的 3.0s —— 那 2.3s 的大间隔
+  # 是**句子中间**的停顿，不能当证据。
+  # 设成 null 或 0 可关掉快路径，退回纯 3.0s 行为。
+  fast_final_silence_s: 1.1
+  fast_final_mic_quiet_s: 0.5
   # RPM 10 预算：每次 WS 连接算一次请求
   max_new_sessions_per_minute: 4
   reconnect_backoff: [2, 5, 10, 30]

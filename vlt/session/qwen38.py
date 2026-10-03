@@ -21,7 +21,8 @@ from typing import Any
 
 import websockets
 
-from .base import AudioHandler, LiveTranslateSession, SessionConfig, TextDelta, TextHandler, UsageHandler
+from .base import (AudioHandler, LiveTranslateSession, SessionConfig, TextDelta, TextHandler,
+                   UsageHandler, should_finalize)
 
 # 关闭握手的上限（秒）。**真链路实测（2026-09-30）：百炼服务端不回 close 帧** ——
 # `ws.close()` 稳吃 10.01s（两次测量一致），也就是 websockets 的默认 close_timeout，
@@ -91,6 +92,7 @@ class QwenLiveTranslateSession(LiveTranslateSession):
         self._buf: list[str] = []          # 本段已确认文本的增量累加
         self._src_buf: list[str] = []
         self._last_text_at: float = 0.0    # 最近一次文本增量时间（静默兜底用）
+        self._last_audio_at: float = 0.0   # 最近一次**上送音频**时刻（快封句的「麦克风静音」依据）
         self._last_final_text = ""         # 最近一次已发出的最终版文本（允许再次终结）
         self._budget = ConnectionBudget(cfg.max_new_sessions_per_minute)
         # 延迟埋点
@@ -148,6 +150,9 @@ class QwenLiveTranslateSession(LiveTranslateSession):
     async def send_audio(self, pcm16_16k: bytes) -> None:
         if self._ws is None:
             raise RuntimeError("会话尚未 start()")
+        # 快封句的「麦克风静音」依据：注意引擎的 _SilenceGate 静音时**只暂停上送**，
+        # 所以「距上次上送的间隔」就是用户真实的停顿长度。
+        self._last_audio_at = time.perf_counter()
         await self._ws.send(json.dumps({
             "event_id": "evt_audio",
             "type": "input_audio_buffer.append",
@@ -340,16 +345,33 @@ class QwenLiveTranslateSession(LiveTranslateSession):
         `response.done`（它靠检测静音来收尾一段话）。若只等 done 事件，
         「句末刷最终版」就永远不会触发 —— 所以按静默时长兜底。
 
-        注意两点（都是实测踩出来的）：
-        1) 阈值必须大于服务端的增量间隔（实测最大 2.3s），否则会在句子中间抢跑；
-        2) **不能一发就永久封死**——长句后续还会有增量，文本变了就应再次终结。
+        2026-10-01 实测补充（真链路 2 句）：**停止上送后的 8s 内服务端一条事件都不发**
+        （既无 text.done 也无 response.done）→ 没有语义信号可用，只能靠定时器；
+        而累计译文在「说完前 0.74~0.89s」就不再增长 → 之后再等 3s 全是白等。
+        故加上**双条件快封句**：麦克风也静了（用户确实说完）时，文字静默 1.1s 就封，
+        实测把终版从「说完后 +2.1s」提到 **+0.3s**（省 ~1.8s）。判据在
+        `base.should_finalize()`（纯函数，离线可测）。
+
+        注意三点（都是实测踩出来的）：
+        1) 慢阈值必须大于服务端的增量间隔（实测最大 2.3s），否则会在句子中间抢跑；
+        2) **不能一发就永久封死**——长句后续还会有增量，文本变了就应再次终结；
+        3) 那 2.3s 的大间隔是**句子中间**的停顿 → 快路径必须有「麦克风已静」这一条，
+           否则照样会抢跑。
         """
         if self._closing or not self._buf:
             return
         cur = "".join(self._buf)
         if cur == self._last_final_text:
             return
-        if self._last_text_at and (time.perf_counter() - self._last_text_at) >= self.cfg.final_silence_s:
+        if not self._last_text_at:
+            return
+        now = time.perf_counter()
+        text_quiet = now - self._last_text_at
+        mic_quiet = (now - self._last_audio_at) if self._last_audio_at else None
+        if should_finalize(text_quiet_s=text_quiet, mic_quiet_s=mic_quiet,
+                           silence_s=self.cfg.final_silence_s,
+                           fast_silence_s=self.cfg.fast_final_silence_s,
+                           fast_mic_quiet_s=self.cfg.fast_final_mic_quiet_s):
             self._emit(confirmed=cur, pending="", is_final=True)
 
     def _map_text_event(self, etype: str, ev: dict) -> tuple[str, str, str | None] | None:

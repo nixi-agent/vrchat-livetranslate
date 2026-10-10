@@ -244,7 +244,8 @@ class TranslatedSink:
 
     @property
     def mic_reference_db(self) -> float | None:
-        """麦克风「说话电平」参考（dBFS）；取不到就是 None —— 引擎据此决定是否回落。"""
+        """麦克风「说话电平」参考（dBFS）；样本不足**或已过期**（`mic_window_s`）就是 None
+        —— 引擎据此决定是否回落固定增益。"""
         return self._p.mic_reference_db
 
     def push(self, pcm_48k_stereo: bytes) -> None:
@@ -341,8 +342,14 @@ class MicProxy:
 
     @property
     def mic_reference_db(self) -> float | None:
-        """麦克风「说话电平」参考（dBFS）；有声证据不足就是 None（**不猜**）。"""
-        return self._mic_ref.db()
+        """麦克风「说话电平」参考（dBFS）；有声证据不足**或已过 `mic_window_s`** → None。
+
+        ⚠️ 必须走 `valid(now)` 而不是直接 `db()`：`db()` 只看样本数、**不看新鲜度**。
+        不判过期的话，用户三分钟前说过一句话，`follow_mic` 就会拿那个电平一直算下去
+        （配置里的 `mic_window_s` 形同虚设）。取不到就是 None，让引擎如实回落固定增益。
+        """
+        now = time.monotonic()
+        return self._mic_ref.db() if self._mic_ref.valid(now) else None
 
     @property
     def level_config(self) -> LevelConfig:
@@ -586,7 +593,10 @@ class MicProxy:
         """
         if self._ref_warned or self._level_cfg.mode != level_match.MODE_FOLLOW_MIC:
             return
-        if self._mic_ref.db() is not None:
+        # 判据必须与 `mic_reference_db`（引擎实际读的那个）一致：样本不足**或**已过
+        # `mic_window_s` 都算「取不到」。用 `db() is not None` 判的话，参考过期了却照样
+        # 不报 —— 用户看到的还是「音量匹配没用」，日志里一个字都没有。
+        if self._mic_ref.valid(now):
             return
         # 刚起泵的前 mic_window_s 属于「还没说够话」，不是故障，别急着报。
         if self._pump_started_at and (now - self._pump_started_at) < self._level_cfg.mic_window_s:

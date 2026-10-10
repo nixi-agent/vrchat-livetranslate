@@ -412,6 +412,69 @@ and is quoted verbatim)
 (`Mic Proxy unavailable (virtual cable not open?); Original/Translated switching disabled` / `[proxy] 代理不可用 → 回到旧行为：译音输出由引擎自建（随翻译启停），主界面「原声/译音」切换已禁用`); chatbox / Wrist Overlay / Desktop Subtitles
 **keep working** as usual, unaffected.
 
+### Translated audio volume: match the translation to your microphone (off by default)
+
+Passthrough (your own voice) and the translated audio share **the same** virtual sound card output
+stream, and VRChat's microphone volume is a single knob — so a mismatch **between the two legs**
+(measured: the translation runs 1.7 to 14.7 dB too loud) cannot be fixed inside VRChat at all. It has
+to be fixed in the app. The settings live in `⚙ Settings → Audio → Translated Audio Volume` (right
+below "Mic Proxy" above) and apply instantly: they are recomputed **per sentence**, and no buffering
+is added to the translated audio.
+
+The three `mode` values:
+
+| Mode | Meaning |
+|---|---|
+| `off` (**default**) | Volume matching is off: the translated audio is passed through **byte for byte**, exactly as before this feature existed (and no measurement cost is paid) |
+| `fixed` | Fixed gain: shift all translated audio by `fixed_gain_db` dB (negative = quieter). Use it once you have measured "it is simply 6 dB too loud" |
+| `follow_mic` | Follow microphone: target = your speaking level on the microphone + `offset_db`, and the translation is aligned to it sentence by sentence (no re-tuning when you change device / microphone) |
+
+⚠️ **`follow_mic` needs a situation where your speaking level can actually be captured**: the
+reference level is computed on the side by the mic proxy's passthrough thread (only **voiced** blocks
+are collected, and the median over a rolling window is used — a cough or a tapped microphone won't
+drag it away), so it is **most accurate with Mic Proxy enabled**. When the proxy is off
+(`output.audio.proxy.enabled: false`), or when you have not been detected as speaking (fewer than
+`mic_min_blocks` voiced blocks / nothing heard from you for longer than `mic_window_s`), it **keeps
+the previous gain** (falling back to `fixed_gain_db` if it never got a reference at all) and leaves one
+line each in the status bar and the log
+(`Microphone level reference unavailable - translated volume matching falls back to fixed gain … dB`) —
+never silently.
+
+The matching `config.yaml` (`output.audio.level`, nine keys):
+
+| Key | Range | Default | Notes |
+|---|---|---|---|
+| `mode` | `off` / `fixed` / `follow_mic` | `off` | the three modes above |
+| `fixed_gain_db` | −36 to 12 | `0.0` | gain for `mode=fixed` (the UI slider only offers −24 to 6; the config accepts more) |
+| `offset_db` | −24 to 24 | `0.0` | target offset for `mode=follow_mic` (the UI slider only offers −12 to 12) |
+| `max_boost_db` | 0 to 24 | `6.0` | maximum boost. The peak limiter pushes it lower anyway — translated audio peaks already sit near the ceiling |
+| `max_cut_db` | 0 to 36 | `24.0` | maximum cut |
+| `ceiling_dbfs` | −6 to 0 (**0 excluded**) | `-1.0` | peak ceiling (hard limiter against clipping); 0 dBFS is full scale, so sitting on it always clips |
+| `max_step_db` | 0.5 to 12 | `3.0` | maximum gain change per sentence (stops the volume from jumping around) |
+| `mic_min_blocks` | 1 to 100 (integer) | `8` | at least 8 voiced 100 ms blocks (= 0.8 s of speech) before the microphone level is trusted; below that it **does not guess** |
+| `mic_window_s` | 5 to 600 | `120` | if nothing is heard from you for this long, the reference counts as stale and the gain stays put |
+
+```yaml
+output:
+  audio:
+    level:
+      mode: off                # off | fixed | follow_mic (default off = byte-identical to before)
+      fixed_gain_db: 0.0       # mode=fixed: fixed gain (dB, negative = quieter)
+      offset_db: 0.0           # mode=follow_mic: target = your mic speaking level + this offset
+      max_boost_db: 6.0        # maximum boost
+      max_cut_db: 24.0         # maximum cut
+      ceiling_dbfs: -1.0       # peak ceiling (limiter, against clipping)
+      max_step_db: 3.0         # maximum gain change per sentence
+      mic_min_blocks: 8        # at least 0.8 s of voiced speech before trusting the mic level
+      mic_window_s: 120        # nothing heard from you for this long → reference is stale
+```
+
+Any bad value **falls back to the default and says so** (`[level] ⚠️ …` / `[config] ⚠️ …` in the log):
+it neither stops the app from starting nor keeps running silently with a broken setting. How to tune it:
+start with `fixed` to remove the obvious "too loud / too quiet", then switch to `follow_mic` if you are
+tired of re-tuning per device, and talk normally into the microphone for a few seconds (≥ 0.8 s) so it
+can measure your level.
+
 ### Wrist-display fine-tune ("⚙ Settings → Wrist Overlay", 14 sliders, live while dragging)
 
 | Slider | Range / step | Slider | Range / step |

@@ -606,6 +606,28 @@ def test_reopen_mic_swaps_device_without_touching_output():
     print("  reopen_mic：换采集设备、输出流与 translated_sink 不变、同名幂等、可回默认 OK")
 
 
+def test_mic_reference_db_none_when_stale() -> None:
+    """`mic_window_s` 必须**接到运行路径**：参考过期后 `mic_reference_db` 取数返回 None。
+
+    为什么单列一条：`MicReference.valid()` 自己的语义有意义（`test_level_match.py` 覆盖了），
+    但「代理把过期参考当新鲜用」是**接线**问题 —— 实测把 `valid(now)` 去掉（直接 `db()`）
+    时，`tests/test_micproxy.py` 与 `tests/test_level_match.py` 都仍全绿，只有这条会红。
+    """
+    p = _make_proxy_with_buffer(level={"mode": "follow_mic", "mic_min_blocks": 3,
+                                      "mic_window_s": 5.0})
+    pcm = struct.pack("<2400h", *([3000] * 2400))        # 16kHz 单声道 150ms 说话块
+    t0 = time.monotonic() - 60.0                        # 「60 秒前说过话」
+    for _ in range(4):
+        p._mic_ref.feed(pcm, 16000, 1, now=t0)
+    assert p._mic_ref.db() is not None, "前提：样本够 → db() 必须给值"
+    assert p._mic_ref.valid(t0 + 1.0) is True, "前提：刚说完 → 有效"
+    assert p.mic_reference_db is None, "参考过期后必须返回 None（不许拿旧值当新鲜）"
+
+    p._mic_ref.feed(pcm, 16000, 1, now=time.monotonic())  # 重新说话
+    assert p.mic_reference_db is not None, "重新有话后应立刻恢复可用"
+    print("  mic_reference_db：有效期内有值 / 过期返回 None / 重新说话恢复 OK")
+
+
 if __name__ == "__main__":
     print("test_micproxy:")
     test_resample_16k_to_48k_dc_byte_exact()
@@ -631,4 +653,5 @@ if __name__ == "__main__":
     test_start_refused_in_test_process()
     test_pick_output_device_computes_fallbacks_in_auto_chain()
     test_reopen_mic_swaps_device_without_touching_output()
+    test_mic_reference_db_none_when_stale()
     print("ALL PASSED")

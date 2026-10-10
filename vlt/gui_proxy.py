@@ -9,6 +9,7 @@ from .i18n import t
 from .config_io import (_fmt_scalar, _yaml_set_in_text, _yaml_set_or_create,
                         _yaml_scalar)
 from .output import level_match
+from .output.level_match import format_db
 
 def _m(gui):
     return sys.modules[gui.__class__.__module__]
@@ -24,10 +25,6 @@ _LEVEL_TICK_MS = 500
 _LEVEL_UI_FIXED_DB = (-24.0, 6.0)
 _LEVEL_UI_OFFSET_DB = (-12.0, 12.0)
 
-
-def _fmt_level(v) -> str:  # noqa: ANN001, ANN202
-    """读数格式：没有测量值就是 `—`（绝不拿 0.0 冒充「测到了 0 dBFS」）。"""
-    return "—" if v is None else f"{float(v):+.1f}"
 
 def _is_test_process() -> bool:
     """当前进程是不是**测试/自检**进程 —— 这类进程绝不构造麦克风代理。
@@ -334,6 +331,11 @@ class ProxyMethods:
 
         夹取而不是拒收：手打 ``999`` 时如果什么都不做，界面显示 999、程序按 6 跑 ——
         这种「看到的和生效的不一样」比夹取更糟（禁静默降级）。
+
+        ⚠️ **必须接住 `tk.TclError`**：用户在 Spinbox 里手打 ``abc``、或清空后按回车 /
+        失焦时，`var.get()`（DoubleVar）抛的是 `_tkinter.TclError`（"expected floating-point
+        number but got …"）而不是 ValueError。漏了它，异常就会逃出 Tk 回调 → crashlog 记
+        一条「Tk 回调异常」、设置**静默不保存**、控件留着脏值 —— 与上面那句承诺正好相反。
         """
         var = getattr(self, var_name, None)
         if var is None:
@@ -344,7 +346,7 @@ class ProxyMethods:
                 return 0.0
         try:
             val = float(var.get())
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, tk.TclError):
             val = 0.0
         val = round(max(lo, min(hi, val)) * 2.0) / 2.0
         try:
@@ -393,18 +395,11 @@ class ProxyMethods:
         """热更新：代理换参考电平的参数、在跑的引擎换增益参数；都没在跑就只留一行痕。"""
         p = self._proxy
         if p is not None:
-            if not hasattr(p, "set_level_config"):
-                # Linux 那条代理（micproxy_linux.py，走 pw-cat 管道）本期没接音量匹配：
-                # 参数照样落盘、引擎侧照样生效，只是**麦克风参考电平**取不到 →
-                # `follow_mic` 会回落固定增益。如实说清楚，不甩一条 AttributeError。
-                print("[level] 当前平台的麦克风代理不支持热更新电平参数："
-                      "已落盘，麦克风电平参考取不到时 follow_mic 回落固定增益", flush=True)
-            else:
-                try:
-                    p.set_level_config(cfg)
-                except Exception as exc:             # noqa: BLE001 — 绝不因调参打断界面
-                    print(f"[level] ⚠️ 代理热更新失败：{type(exc).__name__}: {exc}"
-                          "（已落盘，下次启动生效）", flush=True)
+            try:
+                p.set_level_config(cfg)
+            except Exception as exc:                 # noqa: BLE001 — 绝不因调参打断界面
+                print(f"[level] ⚠️ 代理热更新失败：{type(exc).__name__}: {exc}"
+                      "（已落盘，下次启动生效）", flush=True)
         hit = 0
         for e in (self._engines or []):
             lm = getattr(e, "level_match", None)
@@ -463,7 +458,7 @@ class ProxyMethods:
             text = "—"
         else:
             text = t("麦克风 {mic} dBFS ｜ 译音 {tts} dBFS ｜ 增益 {gain} dB",
-                     mic=_fmt_level(mic), tts=_fmt_level(tts), gain=_fmt_level(gain))
+                     mic=format_db(mic), tts=format_db(tts), gain=format_db(gain))
         try:
             line.configure(text=text)
         except Exception:                            # noqa: BLE001

@@ -10,6 +10,7 @@ output.virtualmic，反向 import 会成环），所以可以离线逐条测（�
 from __future__ import annotations
 
 import math
+import threading
 from collections import deque
 from typing import Callable
 
@@ -101,6 +102,24 @@ def _limit(x: np.ndarray, ceiling_dbfs: float) -> np.ndarray:
     return x
 
 
+def _scale_and_limit(x: np.ndarray, gains, ceiling_dbfs: float) -> bytes:  # noqa: ANN001
+    """「增益 + 天花板限幅」的**唯一实现**：float64 样本 × 可广播的增益 → s16le 字节。
+
+    `apply_gain_db`（整块一个标量增益）与 `LevelMatcher.apply`（每帧一个增益，句首斜坡）
+    共用它 —— 以前两处各写一份限幅，改一处忘另一处就会「固定增益削波、跟随麦克风不削波」。
+    """
+    return _limit(x * gains, ceiling_dbfs).astype("<i2").tobytes()
+
+
+def format_db(v: float | None) -> str:
+    """电平/增益读数的**唯一**格式：没有测量值就是 `—`（绝不拿 0.0 冒充「测到了 0 dBFS」）。
+
+    日志（`engine._note_level_sentence_end`）与界面读数（`gui_proxy._level_set_readout`）
+    以前各留了一份逐字相同的实现，收敛到这里。
+    """
+    return "—" if v is None else f"{float(v):+.1f}"
+
+
 def apply_gain_db(pcm_s16: bytes, db: float, *, ceiling_dbfs: float = -1.0) -> bytes:
     """给 s16le PCM 施加固定增益，并在 ceiling_dbfs 处**硬限幅**（int16 安全）。
 
@@ -112,8 +131,8 @@ def apply_gain_db(pcm_s16: bytes, db: float, *, ceiling_dbfs: float = -1.0) -> b
     arr = np.frombuffer(pcm_s16, dtype="<i2")
     if arr.size == 0:
         return pcm_s16
-    x = arr.astype(np.float64) * (10.0 ** (float(db) / 20.0))
-    return _limit(x, ceiling_dbfs).astype("<i2").tobytes()
+    x = arr.astype(np.float64)
+    return _scale_and_limit(x, 10.0 ** (float(db) / 20.0), ceiling_dbfs)
 
 
 def _norm_mode(value) -> str | None:
@@ -243,26 +262,36 @@ class MicReference:
 
     中位数而不是均值：一次咳嗽 / 一下拍麦不该把整句译音的音量带跑（见测试里的
     +20 dB 尖峰用例）。
+
+    ⚠️ **跨线程**：`feed` 跑在代理的麦克风泵线程，`db` / `valid` / `count` 跑在 Tk 线程
+    （设置窗那条 500ms 读数 tick）。所有共享状态（`_blocks` / `_last_ts` / `_pending` /
+    `_cfg`）都在 `_lock` 里访问 —— 以前 `db()` 直接在 Tk 线程 `sorted(deque)`，泵线程同时
+    `append/popleft` 就会偶发 `RuntimeError: deque mutated during iteration`，而它被调用方的
+    `except Exception` 吞掉，用户看到的只是读数无缘无故闪一下 `—`。
     """
 
-    __slots__ = ("_cfg", "_blocks", "_last_ts", "_pending")
+    __slots__ = ("_cfg", "_blocks", "_last_ts", "_pending", "_lock")
 
     def __init__(self, cfg: LevelConfig) -> None:
         self._cfg = cfg
         self._blocks: deque[float] = deque()
         self._last_ts: float | None = None
         self._pending: np.ndarray = np.empty(0, dtype=np.float64)
+        self._lock = threading.Lock()
 
     def set_config(self, cfg: LevelConfig) -> None:
         """换参数但**不清历史**：UI 改一下滑块不该逼用户重新说 0.8 秒话。"""
-        self._cfg = cfg
-        self._trim()
+        with self._lock:
+            self._cfg = cfg
+            self._trim()
 
     @property
     def cfg(self) -> LevelConfig:
-        return self._cfg
+        with self._lock:
+            return self._cfg
 
     def _trim(self) -> None:
+        """按窗口裁掉最旧的块。**调用方必须已持有 `_lock`**（feed / set_config）。"""
         cap = max(self._cfg.mic_min_blocks, int(self._cfg.mic_window_s / BLOCK_S))
         while len(self._blocks) > cap:
             self._blocks.popleft()
@@ -278,54 +307,60 @@ class MicReference:
         usable = arr.size - (arr.size % ch)
         if usable <= 0:
             return
+        # 与共享状态无关的转换留在锁外：泵线程每 100ms 一块，别把 numpy 也串行化。
         x = arr[:usable].astype(np.float64) / 32768.0
         if ch > 1:
             x = x.reshape(-1, ch).mean(axis=1)
         sr = max(1, int(rate or 16000))
         per_block = max(1, int(round(sr * BLOCK_S)))
-        if self._pending.size:
-            x = np.concatenate((self._pending, x))
-            self._pending = np.empty(0, dtype=np.float64)
-        n_blocks = x.size // per_block
-        if n_blocks <= 0:
-            # 块比 100ms 还短：攒到够一块再算。不攒就会把碎片当成一整块（观测数虚高）。
-            self._pending = x
-            return
-        head = x[:n_blocks * per_block].reshape(n_blocks, per_block)
-        rest = x[n_blocks * per_block:]
-        if rest.size:
-            self._pending = rest
-        ms = np.sqrt(np.mean(head * head, axis=1))
-        got = False
-        for rms in ms:
-            r = float(rms)
-            if r <= 0.0:
-                continue
-            db = max(LEVEL_FLOOR_DB, 20.0 * math.log10(r))
-            if db < VOICED_FLOOR_DB:
-                continue        # 底噪 / 静音：不进队列，也不刷新 last_ts
-            self._blocks.append(db)
-            got = True
-        if got:
-            self._last_ts = now
-        self._trim()
+        with self._lock:
+            if self._pending.size:
+                x = np.concatenate((self._pending, x))
+                self._pending = np.empty(0, dtype=np.float64)
+            n_blocks = x.size // per_block
+            if n_blocks <= 0:
+                # 块比 100ms 还短：攒到够一块再算。不攒就会把碎片当成一整块（观测数虚高）。
+                self._pending = x
+                return
+            head = x[:n_blocks * per_block].reshape(n_blocks, per_block)
+            rest = x[n_blocks * per_block:]
+            if rest.size:
+                self._pending = rest
+            ms = np.sqrt(np.mean(head * head, axis=1))
+            got = False
+            for rms in ms:
+                r = float(rms)
+                if r <= 0.0:
+                    continue
+                db = max(LEVEL_FLOOR_DB, 20.0 * math.log10(r))
+                if db < VOICED_FLOOR_DB:
+                    continue        # 底噪 / 静音：不进队列，也不刷新 last_ts
+                self._blocks.append(db)
+                got = True
+            if got:
+                self._last_ts = now
+            self._trim()
 
     def db(self) -> float | None:
         """当前估计（dBFS）；样本不足 `mic_min_blocks` → None（**不猜**）。"""
-        if len(self._blocks) < self._cfg.mic_min_blocks:
-            return None
-        return _median(self._blocks)
+        with self._lock:
+            if len(self._blocks) < self._cfg.mic_min_blocks:
+                return None
+            snapshot = list(self._blocks)   # 先快照：排序绝不在遍历活 deque 时做
+        return _median(snapshot)
 
     def valid(self, now: float) -> bool:
         """样本够、且最近一次有声观测没过 `mic_window_s`。"""
-        if len(self._blocks) < self._cfg.mic_min_blocks:
-            return False
-        if self._last_ts is None:
-            return False
-        return (now - self._last_ts) <= self._cfg.mic_window_s
+        with self._lock:
+            if len(self._blocks) < self._cfg.mic_min_blocks:
+                return False
+            if self._last_ts is None:
+                return False
+            return (now - self._last_ts) <= self._cfg.mic_window_s
 
     def count(self) -> int:
-        return len(self._blocks)
+        with self._lock:
+            return len(self._blocks)
 
 
 class TranslatedLevel:
@@ -394,11 +429,36 @@ class LevelMatcher:
     # ---- 配置 / 状态 ----
 
     def set_config(self, cfg: LevelConfig) -> None:
-        """UI 改参数后热更新：**下一句**生效（句中不突变，避免爆音）。"""
+        """UI 改参数后热更新：**下一句**生效（句中不突变，避免爆音）。
+
+        两个例外，都是因为 `off` 期间 `apply()` 会短路：
+
+        * **进入 `off`**：把斜坡状态一次清干净。不清的话 `_ramping` 会一直挂着
+          （短路发生在斜坡推进之前），切回来时第一句从**上一个会话的旧增益**斜到 0 dB ——
+          实测：`收敛 -11.75 → 切 off → 切回：-11.75 → -11.14 → -8.83 → -5.89 → +0.00`。
+        * **从 `off` 切回 `fixed`/`follow_mic`**：立刻用 `_last_tts_db` / 当前参考重算一次，
+          首句就是正确档位（不重算就得整句 0 dB 播完、句尾才对齐）。这一步**不限速** ——
+          限速是防「句与句之间音量一跳一跳」，而这里是从「不加增益」重新起步，没有连续性
+          可保；爆音由句首那 20ms 斜坡兜（从当前增益滑到新目标）。
+
+        另外：新模式不是 `follow_mic` 时立刻清掉 `fallback` —— `fixed` 根本不看麦克风参考，
+        不清就会在「切过来」到「下一句句尾」之间一直挂着一条过期状态（界面读数据此显示回落）。
+        """
+        was_off = self._cfg.mode == MODE_OFF
         self._cfg = cfg
         if cfg.mode == MODE_OFF:
-            self._set_gain(0.0)
+            self._gain_db = 0.0
+            self._ramping = False
+            self._ramp_from = 0.0
+            self._ramp_to = 0.0
+            self._ramp_done_frames = RAMP_FRAMES
             self._fallback = False
+            return
+        if cfg.mode != MODE_FOLLOW_MIC:
+            self._fallback = False
+        if was_off:
+            self._set_gain(self._compute_gain(self._gain_db, self._last_tts_db,
+                                              self._last_peak_db, limit_step=False))
 
     @property
     def cfg(self) -> LevelConfig:
@@ -432,22 +492,31 @@ class LevelMatcher:
     # ---- 句尾重算 ----
 
     def note_sentence_end(self) -> float:
-        """一句译音说完：用**刚说完这句**的实测重算增益，返回新增益（dB）。
-
-        顺序不可改（见 .qoder-brief.md §2.1）：模式 → 目标 → 限幅 → 峰值限幅 → 限速。
-        """
+        """一句译音说完：用**刚说完这句**的实测重算增益，返回新增益（dB）。"""
         prev = self._gain_db
         self._last_tts_db = self._tts.level_db()
         self._last_peak_db = self._tts.peak_db()
         self._tts.reset()
+        self._set_gain(self._compute_gain(prev, self._last_tts_db, self._last_peak_db))
+        return self._gain_db
+
+    def _compute_gain(self, prev: float, tts_db: float | None,
+                      peak_db: float | None, *, limit_step: bool = True) -> float:
+        """目标增益的**唯一**计算处：模式 → 目标 → 限幅 → 峰值限幅 → 限速（顺序不可改）。
+
+        两个调用点共用它，参数来源不同：句尾（`note_sentence_end`）用刚测完这句的实测；
+        从 `off` 切回时（`set_config`）用上一次留下的实测，并且**不限速**（见 `set_config`）。
+        """
         mode = self._cfg.mode
 
         if mode == MODE_OFF:
             self._fallback = False
-            self._set_gain(0.0)
-            return self._gain_db
+            return 0.0
 
         if mode == MODE_FIXED:
+            # 固定增益与麦克风参考无关：上一次 `follow_mic` 失参考留下的 fallback 必须在这里
+            # 清掉，否则切到 fixed 之后 `status()["fallback"]` 会一直挂着一条过期状态。
+            self._fallback = False
             g: float = self._cfg.fixed_gain_db
         elif mode == MODE_FOLLOW_MIC:
             ref = self.mic_db()
@@ -458,25 +527,25 @@ class LevelMatcher:
                 # 过 → 回落固定增益。两种都置 fallback，调用方据此留痕（去重）。
                 self._fallback = True
                 g = prev if self._ever_ref else self._cfg.fixed_gain_db
-            elif self._last_tts_db is None:
+            elif tts_db is None:
                 # 首句还没有 tts 实测：用 prev（初值 = fixed_gain_db）。**不为「先测后放」
                 # 缓冲任何东西** —— 那会给译音凭空加一整句的延迟。
                 g = prev
             else:
                 self._fallback = False
-                g = ref + self._cfg.offset_db - self._last_tts_db
+                g = ref + self._cfg.offset_db - tts_db
                 g = _clamp(g, -self._cfg.max_cut_db, self._cfg.max_boost_db)
         else:
             g = prev
 
-        if self._last_peak_db is not None:
+        if peak_db is not None:
             # 峰值限幅：**只降不升**。译音峰值实测已贴 −2.2 dBFS、天花板 −1 → 最多 +1.2 dB。
-            g = min(g, self._cfg.ceiling_dbfs - self._last_peak_db)
+            g = min(g, self._cfg.ceiling_dbfs - peak_db)
 
+        if not limit_step:
+            return g
         # 限速：句间增益变化不超过 max_step_db，防止音量一跳一跳。
-        g = prev + _clamp(g - prev, -self._cfg.max_step_db, self._cfg.max_step_db)
-        self._set_gain(g)
-        return self._gain_db
+        return prev + _clamp(g - prev, -self._cfg.max_step_db, self._cfg.max_step_db)
 
     def _set_gain(self, new: float) -> None:
         if abs(new - self._gain_db) < 1e-9:
@@ -496,7 +565,13 @@ class LevelMatcher:
         **输出字节数与输入完全一致**（下游抖动缓冲要靠它算时长）。`mode=off` 走短路，
         逐字节原样返回 —— 与升级前行为一致，且不付任何测量开销。
         """
-        if not pcm_48k_stereo_s16 or self._cfg.mode == MODE_OFF:
+        if not pcm_48k_stereo_s16:
+            return pcm_48k_stereo_s16
+        if self._cfg.mode == MODE_OFF:
+            # 防御：off 期间永远走不到下面的斜坡推进，挂着 `_ramping` 只会让切回来的
+            # 第一句从旧增益斜到 0（`set_config` 进 off 时已经清过一次）。
+            self._ramping = False
+            self._ramp_done_frames = RAMP_FRAMES
             return pcm_48k_stereo_s16
         self._tts.feed(pcm_48k_stereo_s16)
         if self._gain_db == 0.0 and not self._ramping:
@@ -510,7 +585,7 @@ class LevelMatcher:
         # 48k 立体声恒为偶数个样本；万一来一个落单样本，也别让 reshape 抛 —— 原样带回，
         # 保证「输出字节数 == 输入字节数」这条硬约束不破。
         tail = pcm_48k_stereo_s16[frames * 4:]
-        x = arr[:frames * 2].astype(np.float64)
+        x = arr[:frames * 2].astype(np.float64).reshape(frames, 2)
         flat = 10.0 ** (self._gain_db / 20.0)
 
         if self._ramping:
@@ -527,6 +602,5 @@ class LevelMatcher:
         else:
             gains = np.full(frames, flat, dtype=np.float64)
 
-        y = (x.reshape(frames, 2) * gains[:, None]).reshape(-1)
-        out = _limit(y, self._cfg.ceiling_dbfs).astype("<i2").tobytes()
+        out = _scale_and_limit(x, gains[:, None], self._cfg.ceiling_dbfs)
         return out + tail if tail else out

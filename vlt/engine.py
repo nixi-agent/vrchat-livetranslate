@@ -28,7 +28,7 @@ from .platform.base import LoopbackTarget
 from .output.chatbox import Chatbox, TokenBucket
 from .output.merger import Merger
 from .output.overlay import OverlayConfig
-from .output.level_match import LevelConfig, LevelMatcher
+from .output.level_match import LevelConfig, LevelMatcher, format_db
 from .output.level_match import MODE_OFF as LEVEL_MODE_OFF
 from .output.virtualmic import VirtualMic, pick_output_device, resample_24k_mono_to_48k_stereo
 from .session.base import SessionConfig, TextDelta, create_session
@@ -176,11 +176,7 @@ def chunk_level_db(chunk: bytes) -> float:
 
 # 注：`vlt/output/level_match.py` 里**刻意**另存了一份同语义的私有 `_block_db`。
 # 那边不能 import 本模块 —— engine 已经 import output.virtualmic，反向 import 就成环。
-
-
-def _fmt_db(v: float | None) -> str:
-    """给「译音音量」那条留痕用的 dB 格式化：没数据画破折号，有数据带符号一位小数。"""
-    return "—" if v is None else f"{float(v):+.1f}"
+# dB 读数的格式化则**只有一份**：`level_match.format_db`（本模块与 gui_proxy 都 import 它）。
 
 
 def input_gate_settings(base: dict | None) -> tuple[bool, float, float, int]:
@@ -733,9 +729,9 @@ class Engine:
         if prev is not None and abs(gain - prev) < LEVEL_LOG_MIN_DELTA_DB:
             return                       # 稳态：增益几乎没动，不打（否则每句刷一行）
         self._level_logged_gain = gain
-        print(f"[level] 译音音量：麦克风 {_fmt_db(st.get('mic_db'))} dBFS | "
-              f"译音 {_fmt_db(st.get('tts_db'))} dBFS | 增益 {gain:+.1f} dB | "
-              f"峰值余量 {_fmt_db(st.get('headroom_db'))} dB", flush=True)
+        print(f"[level] 译音音量：麦克风 {format_db(st.get('mic_db'))} dBFS | "
+              f"译音 {format_db(st.get('tts_db'))} dBFS | 增益 {gain:+.1f} dB | "
+              f"峰值余量 {format_db(st.get('headroom_db'))} dB", flush=True)
 
     @property
     def level_match(self) -> LevelMatcher | None:

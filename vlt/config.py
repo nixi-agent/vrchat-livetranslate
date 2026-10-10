@@ -260,7 +260,10 @@ def _float_in_range(value, default: float, *, key: str, lo: float, hi: float,
 
 
 def _str_choice(value, default: str, *, key: str, choices: tuple[str, ...]) -> str:
-    """枚举型字符串配置：不在白名单 → 留痕 + 回落默认值（大小写/空格宽容）。
+    """枚举型字符串配置：不在白名单 → 留痕 + 回落默认值（容忍首尾空格，**大小写敏感**）。
+
+    大小写敏感是刻意的，与 `level_match._norm_mode` 同一口径 —— 两层各写一份校验，
+    口径不一致就会出现「config.py 收下了、level_match 又判非法」这种自相矛盾的留痕。
 
     ⚠️ 先过一道 YAML 1.1 的坑：PyYAML 把**裸词** `off` / `on` / `no` / `yes` 解析成
     布尔值，而 `output.audio.level.mode` 的默认值在 config.example.yaml 里就写作

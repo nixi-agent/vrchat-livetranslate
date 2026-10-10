@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import io
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -39,7 +40,18 @@ class FakeChatbox:
 
 def _mk_engine(direction: str = "mine", sinks: set[str] | None = None) -> Engine:
     cfg = AppConfig(
-        session_base={"api_key": "sk-test", "model": "qwen3.8-livetranslate-flash-realtime"},
+        session_base={
+            "api_key": "sk-test",
+            "model": "qwen3.8-livetranslate-flash-realtime",
+            # 真起引擎（test_runtime_enable_via_engine_loop_thread）要过
+            # `to_session_config`，它需要下面这几个键：
+            "base_url": "ws://127.0.0.1:1/realtime",
+            "voice": "Cherry",
+            "workspace_id": "",
+            "reconnect_backoff": [1],
+            "max_new_sessions_per_minute": 10,
+            "final_silence_s": 1.0,
+        },
         directions={
             "mine": Direction(source_lang="zh", target_lang="en"),
             "theirs": Direction(source_lang="en", target_lang="zh"),
@@ -492,6 +504,103 @@ def test_gui_push_chatbox_toggle() -> bool:
     return ok
 
 
+# ---------------------------------------------------------------- 8) 真起引擎：开关走事件循环线程
+#
+# 上面 `test_runtime_enable_creates_chatbox` **直接调内部协程** `_apply_chatbox_enabled`，
+# 把本 PR 的核心接线绕过去了：界面真正走的路径是
+#     set_chatbox_enabled() → run_coroutine_threadsafe → 引擎自己的事件循环线程。
+# 实测反证：把那行接线删成「只改 _sinks」后，只调内部协程的用例**仍然全绿**，
+# 而下面这条会红。所以这里必须**真起引擎**、从**主线程**推开关。
+
+
+class _FakeSession:
+    """够用的假会话：只需要不报错地被启停（同 tests/test_engine_stop.py）。"""
+
+    def __init__(self, cfg=None) -> None:
+        self.closed = False
+
+    async def start(self, on_text=None, on_audio=None, on_usage=None):
+        self.on_text = on_text
+        return None
+
+    async def send_audio(self, pcm: bytes) -> None:
+        return None
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def tick(self) -> None:
+        return None
+
+
+async def _fake_mic(session, tele, seconds: float = 0.0, device_pattern=None,
+                    device_name=None, stop_event=None) -> None:
+    """假采集器：无限循环直到 stop_event 置位 —— 保持引擎线程常驻（复刻真实 mic 契约）。"""
+    assert stop_event is not None, "引擎没把 stop_event 传给采集器"
+    while not stop_event.is_set():
+        await asyncio.sleep(0.02)
+
+
+def _wait_until(pred, timeout: float = 5.0, tick: float = 0.01) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(tick)
+    return pred()
+
+
+def test_runtime_enable_via_engine_loop_thread() -> bool:
+    """真起引擎：**主线程** set_chatbox_enabled(True) → 引擎事件循环线程建出气泡并生效。
+
+    覆盖本 PR 的核心接线（真 ``create_session`` / ``run_mic`` 换替身，手法同
+    ``tests/test_engine_stop.py``）：这条路径才是界面勾选框走的那条。
+    """
+    ok = True
+    orig_session = engine_mod.create_session
+    orig_mic = engine_mod.run_mic
+    engine_mod.create_session = lambda scfg: _FakeSession(scfg)
+    engine_mod.run_mic = _fake_mic
+
+    eng = _mk_engine("mine")
+    eng._sinks.discard("chatbox")                 # 模拟「开始翻译时没勾」
+    try:
+        eng.start()
+        cond = _wait_until(lambda: eng._loop is not None and eng._loop.is_running())
+        print(f"  真起引擎 → 事件循环线程运行中={cond}  {'OK' if cond else '✗'}")
+        ok &= cond
+
+        # 等 _build_and_run 把 merger 备好（此步在引擎线程内完成）
+        _wait_until(lambda: eng.merger is not None)
+
+        cond = eng.chatbox is None
+        print(f"  启动时没勾 → chatbox 仍为 None（启动路径没建）  {'OK' if cond else '✗'}")
+        ok &= cond
+
+        cond = eng.set_chatbox_enabled(True) is True
+        print(f"  主线程 set_chatbox_enabled(True) → 返回 {cond}（应为 True）  {'OK' if cond else '✗'}")
+        ok &= cond
+
+        cond = _wait_until(lambda: eng.chatbox is not None)
+        print(f"  引擎线程把开关应用完 → Chatbox={eng.chatbox is not None}  {'OK' if cond else '✗'}")
+        ok &= cond
+
+        cb = eng.chatbox
+        if cb is None:
+            ok = False
+        else:
+            eng._on_text(TextDelta(confirmed="Hello", is_final=True, source="你好"))
+            cond = cb.sent_ok > 0
+            print(f"  开启后下一条译文 → chatbox 发出 {cb.sent_ok} 条（应为 >0）  {'OK' if cond else '✗'}")
+            ok &= cond
+    finally:
+        eng.stop(timeout=5.0)
+        engine_mod.create_session = orig_session
+        engine_mod.run_mic = orig_mic
+
+    return ok
+
+
 # ---------------------------------------------------------------- 主入口
 
 
@@ -512,6 +621,7 @@ def main() -> int:
         ("运行时开关：关闭即停发 + 积压留痕", test_runtime_disable_stops_sending()),
         ("运行时开关：theirs 腿拒绝", test_theirs_chatbox_toggle_rejected()),
         ("运行时开关：界面推送（提示/静默）", test_gui_push_chatbox_toggle()),
+        ("运行时开关：真起引擎走事件循环线程", test_runtime_enable_via_engine_loop_thread()),
     ]
     bad = [name for name, ok in results if not ok]
     print("ALL PASSED" if not bad else f"FAILED: {', '.join(bad)}")

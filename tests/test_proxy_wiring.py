@@ -744,6 +744,130 @@ def test_mic_device_change_reopens_passthrough() -> None:
     print("  ✓ 改麦：在跑→reopen_mic 即时生效；名字没变 / 代理没跑→不调用")
 
 
+# ---------------------------------------------------------------- 译音音量匹配接线
+
+
+def _fake_translated_pcm(frames: int = 480, amp: int = 4000) -> bytes:
+    """一段 48k 立体声 int16 假译音：*frames* 帧 → ``frames * 4`` 字节。"""
+    return struct.pack("<h", amp) * (frames * 2)
+
+
+def _emit_holder(sink, level):                       # noqa: ANN001, ANN202
+    """只装 `Engine._emit_translated` 真正用到的两样东西（`_virtualmic` / `_level`）。
+
+    不构造真 Engine：那要 API key、要连 WebSocket，而这两条用例验的只是
+    「译音 PCM 的**唯一出口**有没有把匹配器串进去」这一段接线。方法本身取的是
+    `vlt.engine.Engine` 上的**真实现**，不是替身 —— 替身会把接线断掉也测不出来。
+    """
+    from vlt.engine import Engine
+
+    class _Holder:
+        _emit_translated = Engine._emit_translated
+
+        def __init__(self, vm, lv) -> None:           # noqa: ANN001
+            self._virtualmic = vm
+            self._level = lv
+
+    return _Holder(sink, level)
+
+
+def test_emit_translated_without_level_match_is_byte_identical() -> None:
+    """没注入 LevelMatcher（旧行为）/ `mode=off` → push 的内容**逐字节不变**。
+
+    这是 P0 验收：默认档必须与升级前**完全一致**，一个样点都不许动。
+    """
+    import inspect
+
+    from vlt.engine import Engine
+    from vlt.output.level_match import LevelConfig, LevelMatcher
+
+    params = list(inspect.signature(Engine.__init__).parameters)
+    assert "level_match" in params, f"Engine.__init__ 必须有 level_match 形参：{params}"
+    assert params[-1] == "level_match", \
+        f"level_match 必须放在形参末尾（既有调用点才不用改）：{params}"
+
+    pcm = _fake_translated_pcm()
+    sink = _FakeSink()
+    _emit_holder(sink, None)._emit_translated(pcm)
+    assert sink.pushed[-1] == pcm, "没注入匹配器时必须逐字节原样 push（= 升级前的行为）"
+
+    off = LevelMatcher(LevelConfig(mode="off"))
+    _emit_holder(sink, off)._emit_translated(pcm)
+    assert sink.pushed[-1] == pcm, f"mode=off 必须逐字节原样 push（默认档）：{off.gain_db()}"
+    assert off.gain_db() == 0.0, f"off 档增益恒 0：{off.gain_db()}"
+
+    # 没勾「译音输出」（_virtualmic 为 None）→ 一块都不许 push，也不许抛
+    sink2 = _FakeSink()
+    _emit_holder(None, None)._emit_translated(pcm)
+    assert sink2.pushed == [], "没有译音输出时不该有任何 push"
+    print("  ✓ 译音出口：没注入匹配器 / mode=off → 逐字节不变；没有译音输出 → 不 push")
+
+
+def test_emit_translated_with_level_match_processes_bytes() -> None:
+    """注入了 LevelMatcher（`mode=fixed`, −6 dB）→ 长度不变、内容因增益而不同、幅度约减半。"""
+    from vlt.output.level_match import LevelConfig, LevelMatcher
+
+    pcm = _fake_translated_pcm(amp=4000)
+    sink = _FakeSink()
+    m = LevelMatcher(LevelConfig(mode="fixed", fixed_gain_db=-6.0, ceiling_dbfs=-1.0))
+    _emit_holder(sink, m)._emit_translated(pcm)
+
+    out = sink.pushed[-1]
+    assert len(out) == len(pcm), \
+        f"输出字节数必须与输入**完全一致**（下游抖动缓冲靠它算时长）：{len(out)} vs {len(pcm)}"
+    assert out != pcm, "施加了 −6 dB 就不该还是原来那串字节"
+    amp_in = max(abs(x) for x in struct.unpack(f"<{len(pcm) // 2}h", pcm))
+    amp_out = max(abs(x) for x in struct.unpack(f"<{len(out) // 2}h", out))
+    ratio = amp_out / amp_in
+    assert 0.48 <= ratio <= 0.53, f"−6 dB 应把幅度压到约一半：{amp_in} → {amp_out}（{ratio:.3f}）"
+
+    # status() 是界面读数的唯一来源：三个字段都得在（缺一个读数行就会显示半真半假的数）
+    st = m.status()
+    for key in ("mode", "mic_db", "tts_db", "gain_db", "headroom_db", "fallback"):
+        assert key in st, f"status() 少了 {key}：{st!r}"
+    assert st["mode"] == "fixed" and st["gain_db"] == -6.0, st
+    print(f"  ✓ 注入匹配器：字节被处理（{amp_in} → {amp_out}，{ratio:.3f}）且长度恒等；status() 字段齐")
+
+
+def test_mic_pump_feeds_level_reference() -> None:
+    """代理的直通线程真的把每块麦克风数据喂给了电平参考（打桩 `MicReference.feed` 计数）。
+
+    钉的是「**复用同一块数据**」：电平参考绝不新开第二个采集设备 —— 参考电平来自
+    `_mic_pump` 已经在读的那块 chunk，采样率/声道数也必须是采集源的真实值
+    （喂错率会让 100ms 分块算错，中位数就变成一个没有物理意义的数）。
+    """
+    from vlt.output import level_match
+
+    calls: list[tuple[int, int, int]] = []
+    orig = level_match.MicReference.feed
+
+    def _counting(self, pcm, rate, channels, *, now):   # noqa: ANN001
+        calls.append((len(pcm), rate, channels))
+        return orig(self, pcm, rate, channels, now=now)
+
+    level_match.MicReference.feed = _counting            # type: ignore[assignment]
+    try:
+        with _wired_gui() as (gui, _cfg_path):
+            with _stubbed_audio(gui=gui) as src:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    assert gui._start_proxy() is True, "打桩环境下代理应能起来"
+                    _settle(0.3)                         # 让直通线程读完假源的那一块
+                assert calls, ("直通线程必须把麦克风块喂给电平参考"
+                               "（MicReference.feed 一次都没被调到 = 接线断了）")
+                size, rate, ch = calls[0]
+                assert (rate, ch) == (src.rate, src.channels), \
+                    f"喂进去的采样率/声道数必须是采集源的真实值：{(rate, ch)} vs {(src.rate, src.channels)}"
+                assert size > 0 and size % 2 == 0, f"喂进去的必须是 int16 PCM：{size} 字节"
+                ref = gui._proxy.mic_reference_db
+                assert ref is None or isinstance(ref, float), \
+                    f"mic_reference_db 只能是 float 或 None（样本不足时不许猜）：{ref!r}"
+                with contextlib.redirect_stdout(io.StringIO()):
+                    gui._close_proxy()                   # 撤补丁前收尾：别去碰真实采集后端
+    finally:
+        level_match.MicReference.feed = orig             # type: ignore[assignment]
+    print(f"  ✓ 代理直通线程喂了电平参考：{len(calls)} 次（{rate}Hz {ch}ch，复用同一块数据，未新开设备）")
+
+
 # ---------------------------------------------------------------- 入口
 
 
@@ -755,6 +879,9 @@ def main() -> int:
         test_settings_toggle_off_restarts_proxy_and_unwires_engine,
         test_buffer_change_reaches_running_proxy,
         test_mic_device_change_reopens_passthrough,
+        test_emit_translated_without_level_match_is_byte_identical,
+        test_emit_translated_with_level_match_processes_bytes,
+        test_mic_pump_feeds_level_reference,
     ]
     print("test_proxy_wiring:")
     failed = 0

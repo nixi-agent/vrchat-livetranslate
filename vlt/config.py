@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import sys
@@ -231,6 +232,49 @@ def _int_clamped(value, default: int, *, key: str, lo: int, hi: int) -> int:
     return n
 
 
+def _float_in_range(value, default: float, *, key: str, lo: float, hi: float,
+                    hi_exclusive: bool = False) -> float:
+    """带范围的浮点配置：非法 / 越界 → **留痕 + 回落默认值**（不夹到边界）。
+
+    与 `_int_clamped` 的差别是刻意的：那些整数是缓冲毫秒数，夹到边界仍是**可用**值；
+    这里管的是 dB —— `max_cut_db: 900` 夹成 36 等于替用户编了一个他从没要的声学设置，
+    还不如退回默认值并打一行 `[config] ⚠️`（同一口径：手写笔误不许让程序起不来，
+    也绝不许静默带病运行）。`hi_exclusive` 给 `ceiling_dbfs` 用：0 dBFS = 满刻度，
+    贴边必削波，所以是**开区间**。
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        print(f"[config] ⚠️ {key}={value!r} 不是数字 → 回落默认值 {default:g}", flush=True)
+        return default
+    if not math.isfinite(f):
+        print(f"[config] ⚠️ {key}={value!r} 不是有限数 → 回落默认值 {default:g}", flush=True)
+        return default
+    ok = (lo <= f < hi) if hi_exclusive else (lo <= f <= hi)
+    if not ok:
+        close = ")" if hi_exclusive else "]"
+        print(f"[config] ⚠️ {key}={f:g} 超出合理范围 [{lo:g}, {hi:g}{close} → "
+              f"回落默认值 {default:g}", flush=True)
+        return default
+    return f
+
+
+def _str_choice(value, default: str, *, key: str, choices: tuple[str, ...]) -> str:
+    """枚举型字符串配置：不在白名单 → 留痕 + 回落默认值（大小写/空格宽容）。
+
+    ⚠️ 先过一道 YAML 1.1 的坑：PyYAML 把**裸词** `off` / `on` / `no` / `yes` 解析成
+    布尔值，而 `output.audio.level.mode` 的默认值在 config.example.yaml 里就写作
+    `mode: off` —— 不还原成词，用户照模板写的**正确**配置反被判非法、还刷一条告警。
+    """
+    if isinstance(value, bool):
+        value = "on" if value else "off"
+    if isinstance(value, str) and value.strip() in choices:
+        return value.strip()
+    print(f"[config] ⚠️ {key}={value!r} 不是 {'/'.join(choices)} 之一 → "
+          f"回落默认值 {default!r}", flush=True)
+    return default
+
+
 def _resolve_api_key(api_key: str | None, require_key: bool, slot: str = "qianwen") -> str:
     """取 key；`require_key=False` 时"还没有 key"不抛错，而是返回空串。
 
@@ -367,6 +411,9 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
     raw_proxy = raw_audio.get("proxy") or {}
     if not isinstance(raw_proxy, dict):
         raw_proxy = {}
+    raw_level = raw_audio.get("level") or {}
+    if not isinstance(raw_level, dict):
+        raw_level = {}
     raw_capture = raw.get("capture") or {}
     raw_textin = raw.get("text_input") or {}
     # room 段原样带出（脏值交给 RoomConfig.from_dict 回落 + 留痕）；
@@ -393,6 +440,43 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
                 # 「首次启用说明已弹过」标记：程序自己维护（见 gui_proxy_hint），用户不用管。
                 # 放在配置里而不是内存/状态文件：用户换机拷配置时不该再被弹一次。
                 "hint_shown": bool(raw_proxy.get("hint_shown", False)),
+            },
+            # 译音音量（对齐麦克风）：治「译音比原声响/轻」。原声直通与译音**共用同一条**
+            # 虚拟声卡输出流，VRChat 的麦克风音量只能整体调 → 两条腿的相对失配只能在程序内修。
+            # ⚠️ 默认值与合法区间必须与 `vlt/output/level_match.py` 的 `DEFAULT_*` / `RANGES`
+            #    一致（这里**不 import 它**：config.py 在导入图里位于 output 包之下，与
+            #    「不 import engine」是同一条纪律，见上面 capture.gate_* 的注释）。
+            "level": {
+                "mode": _str_choice(
+                    raw_level.get("mode", "off"), "off",
+                    key="output.audio.level.mode",
+                    choices=("off", "fixed", "follow_mic")),
+                "fixed_gain_db": _float_in_range(
+                    raw_level.get("fixed_gain_db", 0.0), 0.0,
+                    key="output.audio.level.fixed_gain_db", lo=-36.0, hi=12.0),
+                "offset_db": _float_in_range(
+                    raw_level.get("offset_db", 0.0), 0.0,
+                    key="output.audio.level.offset_db", lo=-24.0, hi=24.0),
+                "max_boost_db": _float_in_range(
+                    raw_level.get("max_boost_db", 6.0), 6.0,
+                    key="output.audio.level.max_boost_db", lo=0.0, hi=24.0),
+                "max_cut_db": _float_in_range(
+                    raw_level.get("max_cut_db", 24.0), 24.0,
+                    key="output.audio.level.max_cut_db", lo=0.0, hi=36.0),
+                # 峰值天花板：0 dBFS = 满刻度，贴边必削波 → 上界是**开区间**。
+                "ceiling_dbfs": _float_in_range(
+                    raw_level.get("ceiling_dbfs", -1.0), -1.0,
+                    key="output.audio.level.ceiling_dbfs", lo=-6.0, hi=0.0,
+                    hi_exclusive=True),
+                "max_step_db": _float_in_range(
+                    raw_level.get("max_step_db", 3.0), 3.0,
+                    key="output.audio.level.max_step_db", lo=0.5, hi=12.0),
+                "mic_min_blocks": _int_clamped(
+                    raw_level.get("mic_min_blocks", 8), 8,
+                    key="output.audio.level.mic_min_blocks", lo=1, hi=100),
+                "mic_window_s": _float_in_range(
+                    raw_level.get("mic_window_s", 120.0), 120.0,
+                    key="output.audio.level.mic_window_s", lo=5.0, hi=600.0),
             },
         },
         "capture": {

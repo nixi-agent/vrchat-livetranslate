@@ -1,5 +1,5 @@
 """GUI 薄殼的既有委派表。"""
-from . import gui_settings, gui_update, gui_layout, gui_proxy_hint
+from . import gui_settings, gui_update, gui_layout, gui_proxy_hint, gui_proxy
 _DELEGATE_MAP = {
     "_build_settings_dialog": gui_settings.build_settings_dialog,
     "_sync_settings_pages": gui_settings.sync_settings_pages,
@@ -72,4 +72,10 @@ _DELEGATE_MAP = {
     "_build_controls": gui_layout.build_controls,
     "_build_output_row": gui_layout.build_output_row,
     "_indicator_kw": gui_layout._indicator_kw,
+    # 译音音量（固定增益 / 跟随麦克风）：实现住在 gui_proxy.ProxyMethods 上（与
+    # `_on_proxy_buffer_change` 同处），TranslationGUI 靠**继承**就能取到、走不到
+    # `__getattr__`。登记在这里只为让「薄壳有哪些委派」这张表保持完整。
+    "_on_level_change": gui_proxy.ProxyMethods._on_level_change,
+    "_sync_level_controls_state": gui_proxy.ProxyMethods._sync_level_controls_state,
+    "_refresh_level_readout": gui_proxy.ProxyMethods._refresh_level_readout,
 }

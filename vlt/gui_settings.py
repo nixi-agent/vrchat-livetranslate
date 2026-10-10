@@ -607,6 +607,83 @@ def build_settings_audio(gui, body: ttk.Frame) -> None:
     gui._proxy_hint.pack(anchor=tk.W, pady=(6, 0))
     gui._sync_proxy_controls_state()
 
+    # ---- 译音音量（固定增益 / 跟随麦克风）----
+    #      原声直通与译音共用**同一条**虚拟声卡输出流，VRChat 的麦克风音量只能整体调，
+    #      两条腿之间的相对失配修不了 → 只能在程序内修。参数落盘与热更新见
+    #      vlt/gui_proxy.py 的 `_on_level_change`（与上面那两个缓冲 spin 同一套路）。
+    gui._level_mode_combo = None
+    gui._level_fixed_spin = None
+    gui._level_offset_spin = None
+    ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=14)
+    ttk.Label(body, text=t("译音音量"), style="Section.TLabel").pack(anchor=tk.W)
+    ttk.Label(body,
+              text=t("原声与译音共用一条虚拟声卡输出流，VRChat 只能整体调麦克风音量"
+                     "——译音比原声响/轻要在这里修"),
+              style="Muted.TLabel", justify=tk.LEFT,
+              wraplength=SETTINGS_WRAP).pack(anchor=tk.W, pady=(4, 0))
+
+    _level_cfg = audio_cfg.get("level") or {}
+    _level_names = gui._level_mode_names()
+    _level_mode = str(_level_cfg.get("mode") or "off")
+    if _level_mode not in _level_names:
+        _level_mode = "off"
+    gui._level_mode_var = tk.StringVar(value=_level_names[_level_mode])
+
+    lgrid = ttk.Frame(body)
+    lgrid.pack(fill=tk.X, pady=(8, 2))
+    lgrid.columnconfigure(1, weight=1)
+
+    ttk.Label(lgrid, text=t("模式:"), style="Dim.TLabel").grid(
+        row=0, column=0, sticky="w", pady=3)
+    gui._level_mode_combo = ttk.Combobox(
+        lgrid, textvariable=gui._level_mode_var, state="readonly", width=18,
+        values=[_level_names[k] for k in ("off", "fixed", "follow_mic")])
+    gui._level_mode_combo.grid(row=0, column=1, sticky="w", padx=(8, 0), pady=3)
+    gui._level_mode_combo.bind("<<ComboboxSelected>>",
+                               lambda _e: gui._on_level_change())
+
+    gui._level_fixed_var = tk.DoubleVar(
+        value=float(_level_cfg.get("fixed_gain_db", 0.0)))
+    ttk.Label(lgrid, text=t("固定增益(dB):"), style="Dim.TLabel").grid(
+        row=1, column=0, sticky="w", pady=3)
+    gui._level_fixed_spin = ttk.Spinbox(
+        lgrid, from_=-24.0, to=6.0, increment=0.5, width=8,
+        textvariable=gui._level_fixed_var,
+        command=lambda: gui._on_level_change())
+    gui._level_fixed_spin.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=3)
+    gui._level_fixed_spin.bind("<FocusOut>", lambda _e: gui._on_level_change())
+    gui._level_fixed_spin.bind("<Return>", lambda _e: gui._on_level_change())
+
+    gui._level_offset_var = tk.DoubleVar(
+        value=float(_level_cfg.get("offset_db", 0.0)))
+    ttk.Label(lgrid, text=t("相对麦克风(dB):"), style="Dim.TLabel").grid(
+        row=2, column=0, sticky="w", pady=3)
+    gui._level_offset_spin = ttk.Spinbox(
+        lgrid, from_=-12.0, to=12.0, increment=0.5, width=8,
+        textvariable=gui._level_offset_var,
+        command=lambda: gui._on_level_change())
+    gui._level_offset_spin.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=3)
+    gui._level_offset_spin.bind("<FocusOut>", lambda _e: gui._on_level_change())
+    gui._level_offset_spin.bind("<Return>", lambda _e: gui._on_level_change())
+
+    # 实时读数：读的是**正在跑**的代理/引擎，绝不为它新开采集设备（tick 见
+    # gui_proxy._refresh_level_readout，只在设置窗可见时跑，窗口一关就停）。
+    ttk.Label(lgrid, text=t("当前增益:"), style="Dim.TLabel").grid(
+        row=3, column=0, sticky="w", pady=3)
+    gui._level_gain_lbl = ttk.Label(lgrid, text="—", style="Dim.TLabel", width=9)
+    gui._level_gain_lbl.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=3)
+
+    gui._level_readout_lbl = ttk.Label(body, text="—", style="Dim.TLabel",
+                                       justify=tk.LEFT, wraplength=SETTINGS_WRAP)
+    gui._level_readout_lbl.pack(anchor=tk.W, pady=(2, 0))
+    gui._level_hint = ttk.Label(body, text="", style="Muted.TLabel",
+                                justify=tk.LEFT, wraplength=SETTINGS_WRAP)
+    gui._level_hint.pack(anchor=tk.W, pady=(6, 0))
+    ttk.Label(body, text=t("改完立即生效（逐句重算，不给译音加缓冲）"),
+              style="Muted.TLabel", justify=tk.LEFT,
+              wraplength=SETTINGS_WRAP).pack(anchor=tk.W, pady=(2, 0))
+    gui._sync_level_controls_state()
+
     # ---- 输入门限 ----
     ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=14)
     ttk.Label(body, text=t("输入门限"), style="Section.TLabel").pack(anchor=tk.W)
@@ -1030,12 +1107,14 @@ def open_settings(gui, page: str | None = None) -> None:
     gui._apply_dark_titlebar(win)
     sync_settings_pages(gui)
     gui._sync_gate_level_probe()
+    gui._refresh_level_readout()      # 起「译音音量」实时读数的 500ms tick（可见时才续期）
 
 
 def close_settings(gui) -> None:
     """关闭设置弹窗。"""
     gui._settings_win.withdraw()
     gui._sync_gate_level_probe()
+    gui._refresh_level_readout()      # 窗口已不可见 → 取消挂起的 tick 且不再续期
 
 
 # ================================================================ 界面语言

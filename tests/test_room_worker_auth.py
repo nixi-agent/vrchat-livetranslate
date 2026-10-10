@@ -1,9 +1,9 @@
 """Actual Worker authentication accepts UTF-8 tokens and rejects malformed data."""
-import json
 import shutil
-import subprocess
 import unittest
 from pathlib import Path
+
+from _node_script import run_node
 
 
 class WorkerAuthTests(unittest.TestCase):
@@ -38,8 +38,7 @@ for(const token of ['synthetic-token','合成令牌 テスト']){
 console.log('Actual Worker token auth PASS');
 '''
         uri = (Path(__file__).resolve().parents[1]/'server/src/index.js').as_uri()
-        result = subprocess.run([shutil.which('node'), '--input-type=module', '-e', script, json.dumps(uri)],
-                                text=True, capture_output=True, timeout=10)
+        result = run_node(script, uri)
         self.assertEqual(result.returncode, 0, result.stderr)
 
 

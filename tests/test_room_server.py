@@ -1,9 +1,9 @@
 """Run actual Room handlers, not a rewritten relay, with no public connections."""
-import json
 import shutil
-import subprocess
 import unittest
 from pathlib import Path
+
+from _node_script import run_node
 
 
 class ServerTests(unittest.TestCase):
@@ -48,8 +48,7 @@ for(const type of ['ping','hello','unknown']){
 console.log('Actual Room UTF-8 and total inbound limits PASS');
 '''
         uri = (Path(__file__).resolve().parents[1]/'server/src/room.js').as_uri()
-        result = subprocess.run([shutil.which('node'), '--input-type=module', '-e', script, json.dumps(uri)],
-                                text=True, capture_output=True, timeout=10)
+        result = run_node(script, uri)
         self.assertEqual(result.returncode, 0, result.stderr)
 
 

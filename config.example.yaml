@@ -308,6 +308,18 @@ output:
                                   # ⚠️ 下限 60ms——麦克风输入块约 100ms，太小会把每块削掉大半。
       hint_shown: false        # 「首次启用说明已弹过」标记：程序自己维护（见 vlt/gui_proxy_hint），
                                # 用户不用管；写成 true 就不会再弹那条说明。
+    # 译音音量（对齐麦克风）：治「译音比原声响/轻」。两条腿共用一条输出流，
+    # VRChat 的麦克风音量只能整体调，所以相对失配必须在程序内修。
+    level:
+      mode: off                # off | fixed | follow_mic（默认 off = 与升级前行为逐字节一致）
+      fixed_gain_db: 0.0       # mode=fixed：固定增益（dB，负=更轻）
+      offset_db: 0.0           # mode=follow_mic：目标 = 麦克风说话电平 + 本偏移
+      max_boost_db: 6.0        # 最大提升（还会被峰值限幅压得更小：译音峰值已贴天花板）
+      max_cut_db: 24.0         # 最大衰减
+      ceiling_dbfs: -1.0       # 峰值天花板（限幅，防削波）
+      max_step_db: 3.0         # 单句最大增益变化（防音量跳变）
+      mic_min_blocks: 8        # 至少 8 个 100ms 有声块（0.8s 语音）才采信麦克风电平
+      mic_window_s: 120        # 麦克风电平的有效期（秒），超时视为过期
 
 # 打字输入（不想开麦时用键盘代替说话：界面下方输入框 + 回车发送）
 #

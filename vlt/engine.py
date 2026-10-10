@@ -28,6 +28,8 @@ from .platform.base import LoopbackTarget
 from .output.chatbox import Chatbox, TokenBucket
 from .output.merger import Merger
 from .output.overlay import OverlayConfig
+from .output.level_match import LevelConfig, LevelMatcher
+from .output.level_match import MODE_OFF as LEVEL_MODE_OFF
 from .output.virtualmic import VirtualMic, pick_output_device, resample_24k_mono_to_48k_stereo
 from .session.base import SessionConfig, TextDelta, create_session
 from .textin import DEFAULT_MODEL as DEFAULT_TEXT_MODEL
@@ -48,6 +50,10 @@ SENTENCE_GAP_S = 0.6
 # 就被 close() 掐掉了。现在总耗时有硬上限，且最新一条优先发（见 _drain_chatbox）。
 CHATBOX_DRAIN_BUDGET_S = 2.0
 CHATBOX_DRAIN_TICK_S = 0.05     # 隔一会儿再问一次令牌桶；刻意不与 min_gap_s 耦合
+# 译音音量那条留痕的**去重阈值**（dB）：稳态下每句增益都一样，逐句打印只会把日志刷成
+# 噪音。增益变化不足这个值就不打（本条腿的第一句无论如何都打一次，见
+# `_note_level_sentence_end`）。
+LEVEL_LOG_MIN_DELTA_DB = 0.5
 
 # ---- chatbox 气泡显示哪种文本（界面上是 `chatbox` 勾选框右边那颗切换按钮）----
 # 互斥二选一，**只影响 chatbox 气泡**：手腕屏 / 桌面字幕 / 聊天区恒为译文。
@@ -166,6 +172,15 @@ def chunk_level_db(chunk: bytes) -> float:
     if rms <= 0.0:
         return LEVEL_FLOOR_DB
     return max(LEVEL_FLOOR_DB, 20.0 * float(np.log10(rms)))
+
+
+# 注：`vlt/output/level_match.py` 里**刻意**另存了一份同语义的私有 `_block_db`。
+# 那边不能 import 本模块 —— engine 已经 import output.virtualmic，反向 import 就成环。
+
+
+def _fmt_db(v: float | None) -> str:
+    """给「译音音量」那条留痕用的 dB 格式化：没数据画破折号，有数据带符号一位小数。"""
+    return "—" if v is None else f"{float(v):+.1f}"
 
 
 def input_gate_settings(base: dict | None) -> tuple[bool, float, float, int]:
@@ -494,6 +509,7 @@ class Engine:
         audio_out: bool | None = None,
         audio_device: list[str] | None = None,
         audio_sink=None,
+        level_match: "LevelMatcher | None" = None,
     ) -> None:
         self._cfg = cfg
         self._direction = direction
@@ -511,6 +527,21 @@ class Engine:
         # VirtualMic，而是把译音 PCM 灌进代理那条常驻输出流（原声/译音一键切换）。
         # 归代理管生命周期 —— 引擎停翻译时**绝不能** close 它（见 _cleanup 的 _owns_virtualmic）。
         self._audio_sink = audio_sink
+
+        # ---- 译音音量匹配（见 vlt/output/level_match.py）----
+        # 为什么引擎**自建**：`gui_engine.py` 构造 Engine 时只传 audio_sink（代理的
+        # TranslatedSink），完全不感知音量匹配 —— 自建才能让「配置里改一处、CLI 与 GUI
+        # 两条路都生效」，也不必去改那个不在本期改动范围内的构造点。
+        # 为什么 `mode=off` 也照样建对象：off 时 `apply()` 走短路、逐字节原样返回（行为与
+        # 升级前一致，也不付测量开销），而**留一个活对象**正是界面能在会话中途把模式从
+        # 「关闭」切到「跟随麦克风」的前提（否则只能等下次「开始翻译」）。
+        self._level: LevelMatcher | None = level_match or self._build_level_matcher()
+        self._level_has_mic_ref = (
+            self._audio_sink is not None
+            and hasattr(self._audio_sink, "mic_reference_db"))
+        #: 上一次打过留痕的增益（None = 本条腿还没打过 → 第一句无论如何打一次）。
+        self._level_logged_gain: float | None = None
+        self._level_fallback_logged = False
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -658,6 +689,58 @@ class Engine:
         if self.chatbox_text_mode == CHATBOX_TEXT_SOURCE:
             return (d.source or "").strip()
         return d.display
+
+    def _build_level_matcher(self) -> LevelMatcher:
+        """从 config 自建译音音量匹配器（`level_match` 没注入时）。
+
+        麦克风参考电平走 `audio_sink.mic_reference_db`（= 代理的 `TranslatedSink`，它复用
+        `_mic_pump` 已经在读的块，不开第二个采集设备）。**没有代理**就没有参考来源 ——
+        `follow_mic` 会回落固定增益并留一次痕（见 `_note_level_sentence_end`）。
+        """
+        audio_cfg = (self._cfg.output or {}).get("audio") or {}
+        cfg = LevelConfig.from_dict(audio_cfg.get("level") or {})
+        sink = self._audio_sink
+
+        def _mic_db() -> float | None:
+            return getattr(sink, "mic_reference_db", None)
+
+        return LevelMatcher(cfg, mic_db=(_mic_db if sink is not None else None))
+
+    def _emit_translated(self, stereo_48k: bytes) -> None:
+        """译音 PCM 的**唯一出口**：音量匹配在这里施加（无匹配器 → 原样）。"""
+        if self._virtualmic is None:
+            return
+        self._virtualmic.push(self._level.apply(stereo_48k) if self._level is not None
+                              else stereo_48k)
+
+    def _note_level_sentence_end(self) -> None:
+        """一句译音说完：重算音量匹配增益，并按「变化 ≥ 0.5 dB」去重留痕。"""
+        if self._level is None:
+            return
+        self._level.note_sentence_end()
+        st = self._level.status()
+        mode = st.get("mode")
+        if mode == LEVEL_MODE_OFF:
+            return
+        gain = float(st.get("gain_db") or 0.0)
+        if st.get("fallback") and not self._level_fallback_logged:
+            self._level_fallback_logged = True
+            if not self._level_has_mic_ref:
+                # 有代理时这条由代理报（走状态栏 + 词条翻译）；没代理时没人报，这里补一次。
+                print("[level] ⚠️ 没有麦克风电平参考（未接麦克风代理？）→ 译音音量匹配"
+                      f"回落固定增益 {self._level.cfg.fixed_gain_db:g} dB", flush=True)
+        prev = self._level_logged_gain
+        if prev is not None and abs(gain - prev) < LEVEL_LOG_MIN_DELTA_DB:
+            return                       # 稳态：增益几乎没动，不打（否则每句刷一行）
+        self._level_logged_gain = gain
+        print(f"[level] 译音音量：麦克风 {_fmt_db(st.get('mic_db'))} dBFS | "
+              f"译音 {_fmt_db(st.get('tts_db'))} dBFS | 增益 {gain:+.1f} dB | "
+              f"峰值余量 {_fmt_db(st.get('headroom_db'))} dB", flush=True)
+
+    @property
+    def level_match(self) -> LevelMatcher | None:
+        """译音音量匹配器（界面读它的 `status()` 做实时读数、改参数后 `set_config()`）。"""
+        return self._level
 
     @property
     def virtualmic(self) -> VirtualMic | None:
@@ -1224,9 +1307,12 @@ class Engine:
         if self._pending_seal or (self._last_audio_ts
                                   and now - self._last_audio_ts >= SENTENCE_GAP_S):
             self._virtualmic.end_sentence()
+            # 上一句到此为止 → 用它的实测重算增益；紧接着 push 的那块就是「新句第一块」，
+            # 会吃到 20ms 线性斜坡（见 level_match.LevelMatcher.apply）。
+            self._note_level_sentence_end()
         self._pending_seal = False
         self._last_audio_ts = now
-        self._virtualmic.push(stereo)
+        self._emit_translated(stereo)
 
     def _on_usage(self, u: dict) -> None:
         self._events.on_stats({k: v for k, v in u.items() if isinstance(v, int)})
@@ -1314,8 +1400,9 @@ class Engine:
                             self._speak_stream, translated, kw)
                 else:
                     pcm24 = await asyncio.to_thread(synthesize, translated, **kw)
-                    self._virtualmic.push(resample_24k_mono_to_48k_stereo(pcm24))
+                    self._emit_translated(resample_24k_mono_to_48k_stereo(pcm24))
                     self._virtualmic.end_sentence()
+                    self._note_level_sentence_end()
                     spoke_s = len(pcm24) / 2 / 24000
             except TtsError as exc:
                 self._events.on_status("warn", f"打字译音失败：{exc}（文字输出不受影响）")
@@ -1361,12 +1448,15 @@ class Engine:
         truncated = False
         try:
             for pcm24 in synthesize_stream(text, **kw):
-                self._virtualmic.push(resample_24k_mono_to_48k_stereo(pcm24))
+                self._emit_translated(resample_24k_mono_to_48k_stereo(pcm24))
                 total += len(pcm24)
         except TtsStreamTruncated:
             truncated = True
         finally:
             self._virtualmic.end_sentence()
+            # 放在 finally 里：断流 / 抛异常时也必须重算并清空本句累积，
+            # 否则这半句的电平会漏进下一句，把增益算歪。
+            self._note_level_sentence_end()
         return total / 2 / 24000, truncated
 
     # ---------------------------------------------------------------- 断线自愈

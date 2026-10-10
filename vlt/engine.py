@@ -944,7 +944,9 @@ class Engine:
             self._events.on_status("warn", msg)
             print(f"[engine] ⚠️ {msg}", flush=True)
 
-        if self._chatbox_wanted:
+        # `is None` 守卫：运行时开关那条协程（set_chatbox_enabled → run_coroutine_threadsafe）
+        # 可能抢在本步之前执行、已把实例建好；没有守卫就会两边各建一个（后者覆盖前者）。
+        if self._chatbox_wanted and self._chatbox is None:
             self._chatbox = self._make_chatbox()
 
         if "overlay" in self._sinks:

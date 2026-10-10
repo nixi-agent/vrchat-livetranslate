@@ -148,8 +148,12 @@ class TranslationGUI(ProxyMethods):
         from .engine import chatbox_text_mode
         return chatbox_text_mode(self._cfg)
     def _on_chatbox_toggle(self) -> None:
-        """勾/取消 chatbox：落盘 + 刷新切换按钮的可用态。"""
+        """勾/取消 chatbox：落盘 + 刷新切换按钮的可用态 + **推到运行中的引擎**（即时生效）。"""
         self._save_ui_state(); self._refresh_chatbox_text_btn()
+        ctx = self._engine_ctx
+        ctx.cfg = self._cfg; ctx.chatbox_var = self._chatbox_var
+        ctx.engines = self._engines; ctx.set_status_fn = self._set_status
+        gui_engine.push_chatbox_toggle(ctx)
     def _refresh_chatbox_text_btn(self) -> None:
         """刷新按钮文案（显示**当前**模式）与可用态（未勾 chatbox → 置灰）。"""
         btn = getattr(self, "_chatbox_text_btn", None)

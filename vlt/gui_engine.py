@@ -47,6 +47,27 @@ def push_lang_to_engines(ctx: EngineCtx) -> None:
         src, tgt = (a, b) if direction == "mine" else (b, a or "zh")
         eng.set_languages(src, tgt)
 
+def push_chatbox_toggle(ctx: EngineCtx) -> None:
+    """把 chatbox 勾选框的当前状态推到所有**正在运行**的引擎（界面点一下即时生效）。
+
+    只有 direction=="mine" 的腿会接受（气泡只承载自己发言，见 ``Engine.set_chatbox_enabled``）。
+    若本次方向根本不含「我说的话」、用户却勾了 chatbox —— 没有任何腿能上屏，
+    必须像启动时那样明说（禁静默降级），否则用户对着"没反应的勾选框"排查。
+    """
+    want = bool(ctx.chatbox_var.get()) if ctx.chatbox_var else False
+    applied = False
+    for eng in ctx.engines:
+        try:
+            if eng.set_chatbox_enabled(want):
+                applied = True
+        except Exception as exc:              # noqa: BLE001
+            print(f"[gui] ⚠️ 运行时切换 chatbox 失败（忽略，其余腿照常）："
+                  f"{type(exc).__name__}: {exc}", flush=True)
+    if want and ctx.engines and not applied and ctx.set_status_fn:
+        _zh = ("chatbox 只发「我说的话」的译文（当前方向不含它）→ 本次 chatbox 不会输出；"
+               "对方的译文看手腕屏／聊天区")
+        ctx.set_status_fn("warn", t(_zh))
+
 # ================================================================ 启动
 
 def bind_gui_callbacks(ctx: EngineCtx, gui) -> None:

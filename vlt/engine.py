@@ -677,6 +677,66 @@ class Engine:
         """chatbox 只对「我说的话」方向有意义——对方的译文进手腕屏 / 聊天区，不进气泡。"""
         return "chatbox" in self._sinks and self._direction == "mine"
 
+    def _make_chatbox(self) -> Chatbox:
+        """按 ``cfg.chatbox`` 造一个 chatbox 输出（**唯一**一份参数口径）。
+
+        启动（``_build_and_run``）与运行时开气泡（``set_chatbox_enabled``）都走这里，
+        免得两处各写一遍、改参数时漏一处。
+        """
+        cb = self._cfg.chatbox or {}
+        return Chatbox(
+            host=cb.get("host", "127.0.0.1"),
+            port=int(cb.get("port", 9000)),
+            max_chars=int(cb.get("max_chars", 144)),
+            max_lines=int(cb.get("max_lines", 9)),
+            bucket=TokenBucket(
+                capacity=int(cb.get("bucket_capacity", 5)),
+                window_s=float(cb.get("bucket_window_s", 5.0)),
+                min_gap_s=float(cb.get("min_gap_s", 0.4)),
+            ),
+            notification_sound=bool(cb.get("notification_sound", True)),
+            dry_run=self._dry_run,
+        )
+
+    def set_chatbox_enabled(self, enabled: bool) -> bool:
+        """运行时开 / 关 chatbox 气泡（界面勾选框即时生效，不重建会话）。
+
+        返回 ``True`` = 本引擎接受本次开关；``False`` = 本引擎不该管气泡
+        （方向不是「我说的话」——气泡只承载自己发言，对方那条腿无意义）。
+
+        线程安全：界面线程直接调。改动一律排进引擎自己的事件循环线程执行，
+        与 ``_on_text`` 读 ``_sinks`` / ``_chatbox`` 同线程，不会抢；循环还没起来
+        （双引擎错峰 300ms 的空隙）则直接改 ``_sinks``，``_build_and_run`` 自会照它建。
+        """
+        if self._direction != "mine":
+            return False
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._apply_chatbox_enabled(bool(enabled)), loop)
+        elif enabled:
+            self._sinks.add("chatbox")
+        else:
+            self._sinks.discard("chatbox")
+        return True
+
+    async def _apply_chatbox_enabled(self, enabled: bool) -> None:
+        """（**事件循环线程**）真正应用 chatbox 开关：建 / 停实例，并处理积压。"""
+        if enabled:
+            self._sinks.add("chatbox")
+            if self._chatbox is None:
+                self._chatbox = self._make_chatbox()
+                print("[chatbox] 运行时开启气泡（下一条译文起生效）", flush=True)
+            return
+        self._sinks.discard("chatbox")
+        cb = self._chatbox
+        self._chatbox = None
+        if cb is not None:
+            left = cb.pending_count
+            if left:
+                # 用户主动关掉气泡 → 不再补发这些限流暂缓的最终版；但**不许静默丢**。
+                print(f"[chatbox] 运行时关闭气泡：放弃 {left} 条未补发的最终版", flush=True)
+            cb.close()
+
     def set_languages(self, source_lang: str | None, target_lang: str) -> bool:
         """运行时切换语言：重建会话。预算不足时返回 False 并通过 on_status 告知。"""
         d = self._cfg.directions.get(self._direction)
@@ -885,20 +945,7 @@ class Engine:
             print(f"[engine] ⚠️ {msg}", flush=True)
 
         if self._chatbox_wanted:
-            cb = self._cfg.chatbox or {}
-            self._chatbox = Chatbox(
-                host=cb.get("host", "127.0.0.1"),
-                port=int(cb.get("port", 9000)),
-                max_chars=int(cb.get("max_chars", 144)),
-                max_lines=int(cb.get("max_lines", 9)),
-                bucket=TokenBucket(
-                    capacity=int(cb.get("bucket_capacity", 5)),
-                    window_s=float(cb.get("bucket_window_s", 5.0)),
-                    min_gap_s=float(cb.get("min_gap_s", 0.4)),
-                ),
-                notification_sound=bool(cb.get("notification_sound", True)),
-                dry_run=self._dry_run,
-            )
+            self._chatbox = self._make_chatbox()
 
         if "overlay" in self._sinks:
             try:

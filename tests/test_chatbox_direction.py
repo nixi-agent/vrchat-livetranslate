@@ -321,6 +321,177 @@ def test_mode_switch_takes_effect_in_same_session() -> bool:
     return ok
 
 
+# ---------------------------------------------------------------- 7) 翻译中动态开关 chatbox
+#
+# 需求：主界面第二行 chatbox 勾选框，在**翻译进行中**勾选 / 取消要立即生效
+# （不重建会话、不停翻译）：勾上 → 下一条译文进气泡；取消 → 后续不再进气泡。
+
+
+class _Var:
+    def __init__(self, value: bool = False) -> None:
+        self._v = value
+
+    def get(self) -> bool:
+        return self._v
+
+    def set(self, v: bool) -> None:
+        self._v = v
+
+
+class _DropChatbox:
+    """假 chatbox：带 ``pending_count`` / ``close``，用来验证关闭时放弃积压的留痕。"""
+
+    def __init__(self, pending: int = 0) -> None:
+        self.sent: list[tuple[str, bool]] = []
+        self._pending = pending
+        self.closed = False
+
+    @property
+    def pending_count(self) -> int:
+        return self._pending
+
+    def send(self, text: str, is_final: bool = False) -> bool:
+        self.sent.append((text, is_final))
+        return True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_runtime_enable_creates_chatbox() -> bool:
+    """启动时没勾 chatbox → 运行中开启：建实例，且下一条译文进气泡。"""
+    ok = True
+
+    eng = _mk_engine("mine")
+    eng._sinks.discard("chatbox")                 # 模拟「开始翻译时没勾」
+    cond = eng._chatbox_wanted is False and eng.chatbox is None
+    print(f"  启动时没勾 → _chatbox_wanted={eng._chatbox_wanted} chatbox={eng.chatbox}  "
+          f"{'OK' if cond else '✗'}")
+    ok &= cond
+
+    # 事件循环还没起来的分支：直接改 sinks（错峰启动间隙用）
+    cond = eng.set_chatbox_enabled(True) is True and eng._chatbox_wanted is True
+    print(f"  循环未起时开 → _chatbox_wanted={eng._chatbox_wanted}  {'OK' if cond else '✗'}")
+    ok &= cond
+
+    # 事件循环线程里的真正应用：建实例（dry_run，不碰真 UDP）
+    asyncio.run(eng._apply_chatbox_enabled(True))
+    cond = eng.chatbox is not None
+    print(f"  运行时开启 → 建出 Chatbox={eng.chatbox is not None}  {'OK' if cond else '✗'}")
+    ok &= cond
+
+    fake_cb = eng.chatbox
+    eng._merger = Merger(sink=lambda text, is_final: fake_cb.send(text, is_final), interval_s=2.0)
+    eng._on_text(TextDelta(confirmed="Hello", is_final=True, source="你好"))
+    cond = fake_cb.sent_ok > 0
+    print(f"  开启后下一条译文 → chatbox 发出 {fake_cb.sent_ok} 条  {'OK' if cond else '✗'}")
+    ok &= cond
+
+    return ok
+
+
+def test_runtime_disable_stops_sending() -> bool:
+    """运行中取消：后续不再进气泡；限流积压被放弃但**留痕**（不静默丢）。"""
+    ok = True
+
+    eng = _mk_engine("mine")                       # sinks={"chatbox"}
+    fake = _DropChatbox(pending=2)
+    eng._chatbox = fake
+    eng._merger = Merger(sink=lambda text, is_final: fake.send(text, is_final), interval_s=2.0)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        asyncio.run(eng._apply_chatbox_enabled(False))
+    log = buf.getvalue()
+
+    cond = eng._chatbox_wanted is False and eng.chatbox is None
+    print(f"  运行中取消 → _chatbox_wanted={eng._chatbox_wanted} chatbox={eng.chatbox}  "
+          f"{'OK' if cond else '✗'}")
+    ok &= cond
+
+    cond = fake.closed is True
+    print(f"  取消 → 旧实例已 close={fake.closed}  {'OK' if cond else '✗'}")
+    ok &= cond
+
+    cond = "放弃 2 条" in log
+    print(f"  取消 → 放弃 2 条积压有留痕  {'OK' if cond else '✗'}")
+    ok &= cond
+
+    eng._on_text(TextDelta(confirmed="Hello", is_final=True, source="你好"))
+    cond = fake.sent == []
+    print(f"  取消后 _on_text → chatbox 收到 {len(fake.sent)} 条（应为 0）  {'OK' if cond else '✗'}")
+    ok &= cond
+
+    return ok
+
+
+def test_theirs_chatbox_toggle_rejected() -> bool:
+    """theirs 腿只承载对方发言，不该管气泡：开 / 关都返回 False。"""
+    eng = _mk_engine("theirs")
+    a, b = eng.set_chatbox_enabled(True), eng.set_chatbox_enabled(False)
+    cond = a is False and b is False
+    print(f"  theirs set_chatbox_enabled(True/False) → {a}/{b}（都应为 False）  "
+          f"{'OK' if cond else '✗'}")
+    return cond
+
+
+def test_gui_push_chatbox_toggle() -> bool:
+    """界面推开关：mine 腿接受→静默；仅 theirs 腿拒绝→黄字提示；没在翻译→静默。"""
+    ok = True
+    import types
+
+    from vlt import gui_engine
+
+    class _Eng:
+        def __init__(self, accept: bool) -> None:
+            self.accept = accept
+            self.calls: list[bool] = []
+
+        def set_chatbox_enabled(self, enabled: bool) -> bool:
+            self.calls.append(enabled)
+            return self.accept
+
+    def _ctx(engines, value=True):
+        statuses: list[tuple[str, str]] = []
+        c = types.SimpleNamespace(chatbox_var=_Var(value), engines=engines,
+                                  set_status_fn=lambda lvl, msg: statuses.append((lvl, msg)))
+        return c, statuses
+
+    # ① mine 腿接受 → 推到 True，且无提示
+    eng = _Eng(True)
+    c, statuses = _ctx([eng])
+    gui_engine.push_chatbox_toggle(c)
+    cond = eng.calls == [True] and statuses == []
+    print(f"  mine 接受 → 调用 {eng.calls}，状态栏 {len(statuses)} 条（应无）  {'OK' if cond else '✗'}")
+    ok &= cond
+
+    # ② 只有 theirs 腿（拒绝）→ 黄字提示，且复用已翻译词条
+    eng = _Eng(False)
+    c, statuses = _ctx([eng])
+    gui_engine.push_chatbox_toggle(c)
+    cond = (eng.calls == [True] and len(statuses) == 1
+            and statuses[0][0] == "warn" and "chatbox" in statuses[0][1])
+    print(f"  only theirs → 调用 {eng.calls}，状态栏 {statuses!r}  {'OK' if cond else '✗'}")
+    ok &= cond
+
+    # ③ 没在翻译（没有引擎）→ 静默，不提示
+    c, statuses = _ctx([])
+    gui_engine.push_chatbox_toggle(c)
+    cond = statuses == []
+    print(f"  未翻译 → 状态栏 {len(statuses)} 条（应无）  {'OK' if cond else '✗'}")
+    ok &= cond
+
+    # ④ 取消勾选 → 推 False；即使没有 mine 腿也不提示
+    eng = _Eng(False)
+    c, statuses = _ctx([eng], value=False)
+    gui_engine.push_chatbox_toggle(c)
+    cond = eng.calls == [False] and statuses == []
+    print(f"  取消勾选 → 调用 {eng.calls}，状态栏 {len(statuses)} 条（应无）  {'OK' if cond else '✗'}")
+    ok &= cond
+
+    return ok
+
+
 # ---------------------------------------------------------------- 主入口
 
 
@@ -337,6 +508,10 @@ def main() -> int:
         ("气泡原文模式：源文为空则不发声", test_mode_source_empty_skips_silently_but_logs()),
         ("气泡原文模式：打字送原字", test_mode_source_typed_input_sends_raw_text()),
         ("气泡文本模式：点击即生效（同会话）", test_mode_switch_takes_effect_in_same_session()),
+        ("运行时开关：开启即建气泡并生效", test_runtime_enable_creates_chatbox()),
+        ("运行时开关：关闭即停发 + 积压留痕", test_runtime_disable_stops_sending()),
+        ("运行时开关：theirs 腿拒绝", test_theirs_chatbox_toggle_rejected()),
+        ("运行时开关：界面推送（提示/静默）", test_gui_push_chatbox_toggle()),
     ]
     bad = [name for name, ok in results if not ok]
     print("ALL PASSED" if not bad else f"FAILED: {', '.join(bad)}")

@@ -354,7 +354,7 @@ ui:
   # 写数值 = **强制整个界面按该倍数缩放**（字号 + 窗口，忽略系统 DPI），如 1.25 / 1.5 / 2.0；
   # 1.0 = 强制 100%（HiDPI 屏上会明显变小，一般别设）。
   scale: auto
-  chatbox: true            # 输出勾选：chatbox 气泡
+  chatbox: true            # 输出勾选：chatbox 气泡（翻译进行中勾选/取消即时生效，不重建会话）
   chatbox_text: translated # chatbox 气泡显示什么：translated=译文（默认）| source=原文（ASR 识别结果）
   overlay: false           # 输出勾选：手腕屏（需要 SteamVR 在跑）
   desktop_overlay: false   # 输出勾选：桌面字幕（PC 桌面模式，贴在 VRChat 窗口上）

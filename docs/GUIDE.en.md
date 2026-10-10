@@ -195,6 +195,7 @@ Hello, I'm Nixi. Today, we're going to test out the real-time simultaneous inter
 - **Settings → Desktop Subtitles**: the translation font size / source font size / panel width / panel height / opacity / unlock & drag of the caption window pinned to the VRChat window
   (both are **set-once-and-forget** parameters, so they don't take up the main window; changes apply instantly)
 - **Typing input**: use the keyboard instead of the microphone when you don't want to talk — type in the bottom bar, **Enter sends**. The translation goes through the **exact same** downstream as speech (chat bubbles / wrist display / chatbox); with "Audio output" ticked **it also speaks**: the translation is synthesized via TTS and written into the virtual sound card so the other person hears it (see `text_input.tts` in "6. Configuration"). It replaces the **microphone**, so it's only available when the direction includes "I speak" (the box is greyed out otherwise)
+- **The `chatbox` toggle takes effect immediately**: while translating, tick / untick `chatbox` on the second row — **no need to stop and restart**: once ticked, the next translation goes to the bubble; once unticked, it stops (the line already on screen stays and fades by itself), and the session is not rebuilt. The bubble only carries the translation of **what you say**; if the direction doesn't include "I speak", ticking it produces nothing and a hint appears in the status bar (the wrist display / chat area are unaffected)
 
 #### Automated acceptance (headless, no window)
 

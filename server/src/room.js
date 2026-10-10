@@ -29,9 +29,6 @@ const FRAME_PING = "ping";
 const FRAME_PONG = "pong";
 const FRAME_ERR = "err";
 
-/** 需要计进限速桶的帧（心跳也算：它同样消耗 DO 的 CPU）。 */
-const RATE_LIMITED = new Set([FRAME_SEG, FRAME_FINAL, FRAME_PING]);
-
 /** 客户端拿到这些码就不再重连（重连也只会一直被拒，白烧请求）。 */
 const FATAL_CODES = new Set(["auth", "room_full", "bad_room", "banned"]);
 
@@ -115,6 +112,18 @@ export class Room {
 
   // ------------------------------------------------------------ 收消息
   async webSocketMessage(ws, message) {
+    const att = attached(this.state, ws) || { id: null, nick: "", win: 0, n: 0 };
+    const now = Date.now();
+    if (now - (att.win || 0) >= 1000) { att.win = now; att.n = 0; }
+    att.n = (att.n || 0) + 1;
+    attach(this.state, ws, att);
+    if (att.n > RATE_LIMIT_FPS) {
+      return this.sendErr(ws, "rate", `超过 ${RATE_LIMIT_FPS} 帧/秒，这一帧被丢了`);
+    }
+    const size = typeof message === "string" ? new TextEncoder().encode(message).byteLength : message.byteLength;
+    if (size > MAX_FRAME_BYTES) {
+      return this.sendErr(ws, "bad_frame", `帧超过 ${MAX_FRAME_BYTES} 字节`);
+    }
     const raw = typeof message === "string" ? message : new TextDecoder().decode(message);
     let frame;
     try {
@@ -125,29 +134,8 @@ export class Room {
     if (!frame || typeof frame !== "object" || typeof frame.t !== "string") {
       return this.sendErr(ws, "bad_frame", "帧里缺 t（帧类型）");
     }
-    if (raw.length > MAX_FRAME_BYTES) {
-      return this.sendErr(ws, "bad_frame", `帧超过 ${MAX_FRAME_BYTES} 字节`);
-    }
-
-    const att = attached(this.state, ws) || { id: null, nick: "", win: 0, n: 0 };
     if (frame.t !== FRAME_HELLO && !att.id) {
       return this.sendErr(ws, "bad_frame", "还没握手（先发 hello）");
-    }
-
-    // ---- 每连接限速：固定 1 秒窗口，超了就丢帧 + 回一条非致命 err ----
-    if (RATE_LIMITED.has(frame.t)) {
-      const now = Date.now();
-      if (now - (att.win || 0) >= 1000) {
-        att.win = now;
-        att.n = 0;
-      }
-      att.n = (att.n || 0) + 1;
-      // 每帧都得回写：deserializeAttachment 拿到的是**副本**，不写回去 n 就永远是 1，
-      // 限速形同虚设。attachment 只有几个字段，序列化成本可以忽略。
-      attach(this.state, ws, att);
-      if (att.n > RATE_LIMIT_FPS) {
-        return this.sendErr(ws, "rate", `超过 ${RATE_LIMIT_FPS} 帧/秒，这一帧被丢了`);
-      }
     }
 
     switch (frame.t) {

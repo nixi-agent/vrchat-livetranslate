@@ -320,7 +320,8 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
               "[config]    该线路与国内版 API key **不互通**，请在「设置 → 常规」里"
               "用海外版账号（https://www.qwencloud.com/）重新填一次 key", flush=True)
     # provider 与 base_url 的 host 对不上 → 打一行 WARN（不报错，地址仍以 base_url 为准）。
-    _warn_provider_host_mismatch(provider, base_url)
+    if provider != endpoints.PROVIDER_CHATGPT:
+        _warn_provider_host_mismatch(provider, base_url)
     session_base = {
         "model": s.get("model", "qwen3.8-livetranslate-flash-realtime"),
         "base_url": base_url,
@@ -349,7 +350,7 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
         # 而词库对两条腿（实时会话 / 打字翻译）是同一份 —— 放在这里两处都拿得到。
         "glossary": _as_str_map(raw.get("glossary"), "glossary（专有词库）"),
         # 密钥按线路分槽：千问云与百炼各存一份（切线路不用重填）。slot = 线路 id。
-        "api_key": _resolve_api_key(api_key, require_key, slot=endpoints.key_slot(provider)),
+        "api_key": "" if provider == endpoints.PROVIDER_CHATGPT else _resolve_api_key(api_key, require_key, slot=endpoints.key_slot(provider)),
     }
     directions = {}
     for name, d in (raw.get("directions") or {}).items():

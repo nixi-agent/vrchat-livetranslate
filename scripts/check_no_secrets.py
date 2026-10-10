@@ -57,15 +57,14 @@ def main() -> int:
             for m in pat.finditer(text):
                 if ALLOW.search(m.group()):
                     continue
-                bad.append((f, name, m.group()[:40]))
+                bad.append((f, name, text.count('\n', 0, m.start()) + 1))
 
     if bad:
         print("\n" + "=" * 62)
         print("❌ 提交被拦下：检测到疑似凭据")
         print("=" * 62)
-        for f, name, tok in bad:
-            print(f"  [{name}] {f}")
-            print(f"      命中片段: {tok}")
+        for f, name, line in bad:
+            print(f"  [{name}] {f}:{line}")
         print("\n处理方式：")
         print("  1) 把 key 移出文件（改成读环境变量 DASHSCOPE_API_KEY）")
         print("  2) 确认是误报后：git commit --no-verify")

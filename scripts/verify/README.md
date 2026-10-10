@@ -80,3 +80,9 @@ bash scripts/verify/run_suite.sh
 - `verify_proxy_loopback.py` / `verify_proxy_app_start.py` **不写任何文件**（只读音频、打印判据），
   配置也只读临时沙箱那份；`verify_proxy_loopback_linux.py` 同样不写文件，但会**短暂**在
   PipeWire 里声明一对节点（就是产品运行时的行为），退出前一定回收并**自检零残留**。
+
+## ChatGPT 提示词防护
+
+防护机制、实测发现及验证边界见 [Findings](../../docs/ChatGPT-prompt-defense.md)。
+耗用订阅额度的额外实机测试程式、长对话资料与录音只保留在本机忽略的暂存目录，不随 repo、套件或 CI 发布。
+Repo 中的 ChatGPT 政策、字幕分片、GUI 和生命周期测试都是离线回归，不登录 ChatGPT 或建立语音服务连接。

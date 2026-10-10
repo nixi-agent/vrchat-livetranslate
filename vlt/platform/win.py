@@ -315,7 +315,10 @@ class PyaudioLoopbackSource(QueueAudioSource):
         while not stop.is_set():
             try:
                 avail = self._stream.get_read_available()
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                if not stop.is_set():
+                    print(f"[loopback] 采集线程退出（poll）：{type(exc).__name__} "
+                          f"errno={getattr(exc, 'errno', None)}", flush=True)
                 break
             if avail <= 0:
                 time.sleep(0.01)
@@ -323,7 +326,10 @@ class PyaudioLoopbackSource(QueueAudioSource):
             try:
                 data = self._stream.read(min(avail, self._chunk_max),
                                          exception_on_overflow=False)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                if not stop.is_set():
+                    print(f"[loopback] 采集线程退出（read）：{type(exc).__name__} "
+                          f"errno={getattr(exc, 'errno', None)}", flush=True)
                 break
             self._emit(data)
 

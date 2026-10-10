@@ -8,11 +8,13 @@
 from __future__ import annotations
 
 import getpass
+import ipaddress
 import os
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from typing import Any
+from urllib.parse import urlsplit
 
 from .protocol import ROOM_CODE_LEN, is_valid_room_code, normalize_room_code
 
@@ -261,7 +263,23 @@ class RoomConfig:
         if not url:
             return "没填 server_url（config.yaml 的 room.server_url）"
         if not (url.startswith("wss://") or url.startswith("ws://")):
-            return f"server_url={url!r} 不是 ws:// 或 wss:// 开头"
+            return "server_url 不是 ws:// 或 wss:// 开头"
+        try:
+            url.encode('utf-8')
+            parsed = urlsplit(url)
+            host = parsed.hostname
+            if not host or parsed.username or parsed.password:
+                return "server_url 必须包含主机名，不能包含登录凭据"
+            if parsed.scheme == 'ws':
+                local = host.lower() == 'localhost'
+                try:
+                    local = local or ipaddress.ip_address(host).is_loopback
+                except ValueError:
+                    pass
+                if not local:
+                    return "远程房间必须使用 wss://；ws:// 仅限本机 loopback"
+        except ValueError:
+            return "server_url 格式无效"
         if not self.room_code:
             return "没填 room_code（8 位房间码，两端必须一致）"
         return None

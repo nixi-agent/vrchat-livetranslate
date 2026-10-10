@@ -404,13 +404,19 @@ def log_startup_info(tag: str = "") -> None:
     except Exception as exc:
         print(f"[startup] git 信息读取失败：{exc}")
     try:
-        from .config import load_api_key
-        k = load_api_key()
-        print(f"[startup] API 密钥：{k[:6]}****{k[-4:]}（{len(k)} 字符）")
-    except SystemExit as exc:
-        print(f"[startup] API 密钥：未配置（{exc}）")
+        import yaml
+        from . import endpoints
+        from .config import DEFAULT_CONFIG, load_api_key
+        from .credentials import mask_key
+        raw = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding='utf-8')) if DEFAULT_CONFIG.exists() else {}
+        provider = endpoints.normalize_provider(((raw or {}).get('session') or {}).get('provider', endpoints.DEFAULT_PROVIDER))
+        if provider != endpoints.PROVIDER_CHATGPT:
+            key = load_api_key(slot=endpoints.key_slot(provider))
+            print(f"[startup] API 密钥：{mask_key(key)}")
+    except SystemExit:
+        print("[startup] API 密钥：未配置")
     except Exception as exc:
-        print(f"[startup] API 密钥：读取失败 {exc}")
+        print(f"[startup] API 密钥诊断不可用（{type(exc).__name__}）")
     print("=" * 64)
 
 

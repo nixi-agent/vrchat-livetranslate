@@ -982,10 +982,8 @@ def open_mic(device_name: str | None, *, rate: int = 16000, channels: int | None
 def _mic_target_node(device_name: str | None) -> str:
     """设备描述 / 稳定 `node.name` → PipeWire `node.name`；查不到返回 ""。
 
-    匹配顺序：描述**全名精确** → `node.name`**精确**。后者是兜底：WiVRn 之类的源
-    可能在重连后改 `node.description`（如丢掉 `(microphone)` 后缀），若配置存的是描述，
-    逐字匹配就会落空、静默回退默认麦（实测出现的 `设备表里查不到 'WiVRn(microphone)'`）。
-    允许直接按 `node.name`（`wivrn.source`）匹配后，这种漂移不再丢设备。
+    匹配顺序：稳定 `node.name` 精确 → 旧配置的描述精确。
+    GUI 保存稳定节点名；优先匹配它，避免另一设备的描述与节点名碰撞时录错设备。
     """
     if not device_name:
         return ""
@@ -993,13 +991,14 @@ def _mic_target_node(device_name: str | None) -> str:
         # 局部导入避免与 devices.py↔platform 的循环导入（与 win.open_mic 同一条纪律）。
         from ..devices import enumerate_mic_devices
         infos = enumerate_mic_devices()
-        for info in infos:                    # 1) 描述精确
-            if info.name == device_name:
-                return str(getattr(info, "node_name", "") or "")
-        for info in infos:                    # 2) node.name 精确（稳定标识兜底）
+        for info in infos:                    # 1) 稳定节点名优先
             node = str(getattr(info, "node_name", "") or "")
             if node and node == device_name:
                 return node
+        # 2) 旧描述必须唯一，不能按设备列举顺序猜测来源。
+        matches = [str(getattr(info, "node_name", "") or "")
+                   for info in infos if info.name == device_name]
+        return matches[0] if len(matches) == 1 else ""
     except Exception:                         # noqa: BLE001 — 查不到不该让整条腿挂掉
         pass
     return ""

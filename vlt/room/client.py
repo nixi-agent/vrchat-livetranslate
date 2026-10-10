@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 import threading
 from dataclasses import dataclass
@@ -145,7 +146,7 @@ class RoomClient:
             self._last_error = ""
         self._set_conn(ConnectionState.CONNECTING)
         self._notify(f"启动房间链路（房间 {self._room}，昵称 {self._nick}，"
-                     f"服务端 {self.cfg.server_url}）")
+                     f"服务端 {self._masked_url(self._connect_url())}）")
         self._thread = threading.Thread(
             target=self._thread_main, name=f"room-{self._room}", daemon=True)
         self._thread.start()
@@ -244,25 +245,30 @@ class RoomClient:
             self._ws = None
 
     def _connect_url(self) -> str:
-        """拼出真正用来连的 URL：把房间码（和令牌）补进查询串。
-
-        为什么不能直接连 `server_url`：Worker **在把请求交给 DO 之前**就要拿房间码做路由
-        （`idFromName(room)`）和鉴权 —— 非法请求不进 DO，才不用替攻击流量付 DO 请求费。
-        所以房间码必须出现在查询串里；hello 帧里那个 `room` 只是给 DO 复核用的第二道。
-        用户已经自己在 `server_url` 里写了 `room=` / `k=` 就不覆盖（尊重手写）。
-        """
+        """房间码用于 Worker 路由；旧 URL 内的令牌迁移至 Authorization。"""
         base = self.cfg.server_url.strip()
         parts = urlsplit(base)
         query: dict[str, str] = dict(parse_qsl(parts.query, keep_blank_values=True))
         if self._room and not query.get("room"):
             query["room"] = self._room
-        token = (self.cfg.token or "").strip()
-        if token and not any(query.get(k) for k in TOKEN_QUERY_KEYS):
-            query["k"] = token
-        if not query:
-            return base
+        for key in TOKEN_QUERY_KEYS:
+            query.pop(key, None)
         return urlunsplit((parts.scheme, parts.netloc, parts.path,
                            urlencode(query), parts.fragment))
+
+    def _auth_token(self) -> str:
+        query = dict(parse_qsl(urlsplit(self.cfg.server_url.strip()).query, keep_blank_values=True))
+        return next((query[key] for key in TOKEN_QUERY_KEYS if query.get(key)),
+                    (self.cfg.token or '').strip())
+
+    def _auth_header(self) -> dict[str, str] | None:
+        token = self._auth_token()
+        if not token:
+            return None
+        # Bearer 的 token68 不接受 Unicode；保留普通令牌对旧 Worker 的兼容性。
+        value = 'Bearer ' + token if re.fullmatch(r'[A-Za-z0-9._~+/-]+=*', token) else (
+            'VLT ' + base64.urlsafe_b64encode(token.encode('utf-8')).decode('ascii'))
+        return {'Authorization': value}
 
     @staticmethod
     def _masked_url(url: str) -> str:
@@ -296,8 +302,9 @@ class RoomClient:
         import websockets                              # 延迟导入：没开房间功能就不该付这个开销
 
         try:
-            return await websockets.connect(
+            connection = websockets.connect(
                 url,
+                additional_headers=self._auth_header(),
                 open_timeout=CONNECT_TIMEOUT_S,
                 close_timeout=2.0,
                 # 心跳走**应用层** ping/pong：DO 休眠时协议层 ping 由 CF 边缘代答，
@@ -305,6 +312,9 @@ class RoomClient:
                 ping_interval=None,
                 max_size=MAX_FRAME_BYTES,
             )
+            # 不跟随重定向，避免将 Authorization 转交其他端点。
+            connection.process_redirect = lambda exc: exc
+            return await connection
         except websockets.exceptions.InvalidStatus as exc:
             raise self._fatal_from_http(getattr(exc.response, "status_code", 0)) from exc
 
@@ -316,7 +326,7 @@ class RoomClient:
             self._ws = ws
             try:
                 await ws.send(encode_frame(
-                    FRAME_HELLO, room=self._room, tok=self.cfg.token or None,
+                    FRAME_HELLO, room=self._room,
                     nick=self._nick, ts=now_ms()))
                 with self._lock:
                     self._sent += 1

@@ -18,6 +18,9 @@ for p in (str(ROOT), str(TESTS)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+from _cfgbox import sandbox_config  # noqa: E402
+sandbox_config(reset=True)
+
 import test_overlay_steamvr as fakeov  # noqa: E402  复用假 openvr 与调用记录
 from vlt.config import DEFAULT_CONFIG  # noqa: E402
 

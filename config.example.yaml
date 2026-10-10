@@ -73,9 +73,9 @@ session:
 # 音频设备选择（空字符串 = 自动检测，也可在界面下拉里选）
 # 两端的设备名来源不同：
 #   Windows → WASAPI 设备的名字（如 "Steam Streaming Speakers (loopback)"）
-#   Linux   → PipeWire 输出节点的 description（如 "REDMI 电脑音箱 2 Pro 模拟立体声"）
+#   Linux   → 麦克风保存稳定的 PipeWire node.name，界面显示 description
 capture:
-  mic_device: ""            # 麦克风设备名；空 = 自动检测（默认设备）
+  mic_device: ""            # Windows 设备名 / Linux node.name；空 = 自动检测
   loopback_device: ""       # 「别人说话」的采集端点；空 = 自动回退链
                             # Linux 上就是 VRChat 输出到的那个 sink（见 GUIDE.linux.md 第六节）
   # ---- 输入门限（只作用于 VRChat 输出 = 「别人说话」那条腿）----

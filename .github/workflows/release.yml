@@ -9,7 +9,7 @@ on:
   workflow_dispatch:            # 手动跑一次只产出 artifact（不建 release）
 
 permissions:
-  contents: write               # 建 release / 传附件需要
+  contents: read
 
 # ⚠️ 必须开 UTF-8：Windows runner 的 stdout 默认是 cp1252，脚本里带 emoji/中文的 print
 # 会 UnicodeEncodeError 直接打挂这一步（CI 上实测过 check_no_secrets.py 崩在「✅」）。
@@ -122,9 +122,23 @@ jobs:
             dist/SHA256SUMS.txt
           if-no-files-found: error
 
+  release:
+    needs: [build, appimage]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: VRChatLiveTranslate-exe
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: VRChatLiveTranslate-AppImage
+          path: dist
       - name: 建 Release 并附上 exe + AppImage
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           name: ${{ github.ref_name }}
           # ⚠️ 关掉自动附加的「What's Changed / New Contributors」（用户 2026-09 明确要求）：

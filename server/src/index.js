@@ -65,6 +65,12 @@ function pickToken(url, request) {
   }
   const auth = request.headers.get("Authorization") || "";
   if (auth.toLowerCase().startsWith("bearer ")) return auth.slice(7).trim();
+  if (auth.toLowerCase().startsWith("vlt ")) {
+    try {
+      const bytes = Uint8Array.from(atob(auth.slice(4).trim().replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+      return new TextDecoder("utf-8", {fatal: true}).decode(bytes);
+    } catch { return ""; }
+  }
   return "";
 }
 
@@ -75,7 +81,7 @@ export default {
     if (url.pathname !== "/ws") {
       return json(200, {
         service: "vlt-room-relay",
-        hint: "WebSocket 端点是 /ws?room=<8位房间码>&k=<令牌>",
+        hint: "WebSocket 端点是 /ws?room=<8位房间码>；令牌使用 Authorization: Bearer 或 Authorization: VLT",
         auth: env.ROOM_TOKEN_HASH ? "已开启（ROOM_TOKEN_HASH）" : "未开启（任何人都能进房）",
       });
     }
@@ -97,7 +103,7 @@ export default {
     if (env.ROOM_TOKEN_HASH) {
       const token = pickToken(url, request);
       if (!token) {
-        return json(401, { error: "auth", msg: "这个房间要令牌：用 ?k=<令牌> 或 Authorization: Bearer" });
+        return json(401, { error: "auth", msg: "这个房间要令牌：用 Authorization: Bearer 或 Authorization: VLT" });
       }
       const got = await sha256Hex(token);
       const want = String(env.ROOM_TOKEN_HASH).trim().toLowerCase();

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Callable
 
@@ -73,9 +74,21 @@ def save_api_key(key: str, slot: str = SLOT_QIANWEN) -> Path:
     """写入用户目录（按 slot 分槽），返回路径。校验失败抛 ValueError（不写文件）。"""
     validated = _validate_key(key)
     d = _get_storage_dir()
-    d.mkdir(parents=True, exist_ok=True)
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
     p = _key_file(slot)
-    p.write_text(validated, encoding="utf-8")
+    if os.name == 'posix':
+        d.chmod(0o700)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=d, delete=False) as file:
+            temporary = Path(file.name)
+            file.write(validated)
+        if os.name == 'posix':
+            temporary.chmod(0o600)
+        os.replace(temporary, p)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return p
 
 

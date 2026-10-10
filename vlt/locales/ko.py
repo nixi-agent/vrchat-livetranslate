@@ -496,3 +496,5 @@ STRINGS: dict[str, str] = {
     "🎙 原声": "🎙 원음",
     "🗣 译音": "🗣 번역음",
 }
+from .chatgpt import STRINGS as _CHATGPT
+STRINGS.update(_CHATGPT["ko"])

@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -128,8 +129,15 @@ def on_device_scan_result(ctx: AudioCtx, cfg, mics, loops, outs,
     names_holder["mic"] = []
     mic_display = [auto]
     for info in mics:
-        names_holder["mic"].append(info.name)
+        names_holder["mic"].append(
+            (info.node_name or info.name) if ctx.linux_fixed_audio else info.name)
         mic_display.append(format_device_display(info))
+
+    if ctx.linux_fixed_audio:
+        counts = Counter(mic_display[1:])
+        for i, info in enumerate(mics, 1):
+            if counts[mic_display[i]] > 1 and info.node_name:
+                mic_display[i] += f" [{info.node_name}]"
 
     names_holder["loop"] = []
     loop_display = [auto]
@@ -157,6 +165,13 @@ def on_device_scan_result(ctx: AudioCtx, cfg, mics, loops, outs,
     mic_name = capture_cfg.get("mic_device") or ""
     loop_name = capture_cfg.get("loopback_device") or ""
     out_name = audio_cfg.get("device_name") or ""
+
+    # Linux 旧配置仍存描述：仅在唯一命中时迁移，之后重连改描述也保留同一节点。
+    if ctx.linux_fixed_audio and mic_name and mic_name not in names_holder["mic"]:
+        matches = [i for i, info in enumerate(mics) if info.name == mic_name]
+        if len(matches) == 1:
+            mic_name = names_holder["mic"][matches[0]]
+            save_device_config(ctx, cfg, mic_name, loop_name, out_name)
 
     if mic_name and mic_name in names_holder["mic"]:
         ctx.mic_combo.set(mic_display[names_holder["mic"].index(mic_name) + 1])

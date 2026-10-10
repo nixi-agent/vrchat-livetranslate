@@ -51,6 +51,9 @@ def refresh_api_key_in_cfg(cfg) -> None:
     不自写第二套优先级；一个来源都没有时它会抛 SystemExit —— 这里置空串，
     绝不让异常冒到界面/主循环。留痕：来源 + 打码值，绝不打明文。
     """
+    if provider(cfg) == endpoints.PROVIDER_CHATGPT:
+        cfg.session_base["api_key"] = ""
+        return
     from .config import load_api_key
     from .credentials import key_source, mask_key
 

@@ -5,6 +5,7 @@ GUI 与 CLI 共用同一个 Engine 类；区别只在事件回调和音频源。
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -544,6 +545,7 @@ class Engine:
         self._text_deltas = 0          # 收到的译文本条数
         self._text_hist: deque[tuple[float, str]] = deque(maxlen=40)
         self._session_started_at = 0.0
+        self._progress_at = None
         self._pump_task: asyncio.Task | None = None
 
         self._connect_ts: list[float] = []
@@ -568,6 +570,10 @@ class Engine:
         # 之类）→ **留痕**并回落千问云默认端点，绝不让 Engine 构造就崩；真正连接时实时那条腿
         # 会用 SessionConfig.url 再报一次明确错误。
         sb = cfg.session_base or {}
+        if sb.get('provider') == endpoints.PROVIDER_CHATGPT:
+            self._chat_endpoint = self._tts_endpoint = None
+            print('[net] ChatGPT 订阅语音：不使用打字翻译/译音 HTTP 端点', flush=True)
+            return
         base_url = sb.get("base_url") or endpoints.default_base_url(endpoints.DEFAULT_PROVIDER)
         try:
             self._chat_endpoint = endpoints.chat_url(base_url)
@@ -1083,7 +1089,31 @@ class Engine:
                 self._overlay.tick()
             if self._session is not None:
                 self._session.tick()
+                self._log_audio_progress()
                 await self._watchdog()      # 会话挂了就自动重连（不再让这条腿永久死掉）
+
+    def _log_audio_progress(self, now=None) -> None:
+        if self._cfg.session_base.get('provider') != endpoints.PROVIDER_CHATGPT or self._session is None:
+            return
+        now = time.monotonic() if now is None else now
+        if self._progress_at is not None and now-self._progress_at < 30:
+            return
+        self._progress_at = now
+        try:
+            snapshot = self._session.diagnostics()
+            keys = ('alive', 'phase', 'bridge', 'source_events', 'translation_events',
+                    'source_age_s', 'translation_age_s', 'source_chars', 'translation_chars',
+                    'finalized', 'bridge_pending_bytes', 'bridge_consumed_bytes')
+            progress = {key: snapshot.get(key) for key in keys
+                        if type(snapshot.get(key)) in (bool, int, float, str, type(None))}
+            progress.update(input_chunks=self._audio_in_chunks, send_fails=self._proxy.send_fails,
+                            gate_dropped=self._input_gate.dropped_chunks,
+                            gate_opened=self._input_gate.opened,
+                            output_deltas=self._text_deltas,
+                            repeat_dropped=self._repeat_dropped)
+            print(f'[{self._direction}][progress] {json.dumps(progress)}', flush=True)
+        except Exception:  # noqa: BLE001 — 诊断不能中断采集或泄露错误内容。
+            print(f'[{self._direction}][progress] unavailable', flush=True)
 
     async def _feed_audio(self) -> None:
         if self._source.startswith("pcm:"):
@@ -1239,7 +1269,7 @@ class Engine:
         线程安全（界面线程直接调用）；空文本 / 引擎没在跑 / 方向不是「我说」→ False。
         """
         text = (text or "").strip()
-        if not text or self._loop is None or not self.running:
+        if not text or self._loop is None or not self.running or self._chat_endpoint is None:
             return False
         if self._direction != "mine":
             # 打字替代的是**麦克风**，只对「我说」方向有意义；「别人说」那条腿的
@@ -1249,6 +1279,8 @@ class Engine:
         return True
 
     async def _async_send_text(self, text: str) -> None:
+        if self._chat_endpoint is None:
+            return
         d = self._cfg.directions.get(self._direction) or Direction()
         tcfg = self._cfg.text_input or {}
         try:

@@ -1,0 +1,4 @@
+# 選用 ChatGPT 訂閱語音時，另安裝這份依賴。
+# Codex CLI 需由官方 @openai/codex 安裝並登入 ChatGPT。
+websockets>=14
+opencc-python-reimplemented>=0.1.7,<0.2

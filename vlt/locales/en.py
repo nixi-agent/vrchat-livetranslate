@@ -1,10 +1,8 @@
 """English 词表：key = 中文原文（与 `t("…")` 调用点逐字一致），value = 英文界面文案。
-
 语气约定：深色主题桌面工具，简洁、口语化；按钮用祈使句；标题/按钮用 Title Case。
 带 {占位符} 的条目，占位符名必须与调用点 `t("…", name=…)` 一致。
 """
 from __future__ import annotations
-
 STRINGS: dict[str, str] = {
     # ---- 语言名（源/目标语言下拉里显示；表本身仍以中文名为 key）----
     "中文": "Chinese",
@@ -39,7 +37,6 @@ STRINGS: dict[str, str] = {
     "译文会显示在这里": "Translations will appear here",
     "点「开始翻译」后开始说话": "Hit Start, then just talk",
     "状态：{msg}": "Status: {msg}",
-
     # ---- 房间文本中继 ----
     "房间": "Room",
     "房间码:": "Room code:",
@@ -62,7 +59,6 @@ STRINGS: dict[str, str] = {
     "全选": "Select All",
     "和填了同一个房间码的人互相看到对方说的话；只有你自己说的话会被发出去。": "Everyone who enters the same room code sees each other's speech. Only what you say is sent.",
     "改动会即时保存；已连接时按新设置重连。": "Changes are saved right away; if connected, the room reconnects with the new settings.",
-
     # ---- 手腕屏微调面板 ----
     "锚点:": "Anchor:",
     "tracker 序号:": "Tracker #:",
@@ -500,3 +496,5 @@ STRINGS: dict[str, str] = {
     "🎙 原声": "🎙 Original",
     "🗣 译音": "🗣 Translated",
 }
+from .chatgpt import STRINGS as _CHATGPT
+STRINGS.update(_CHATGPT["en"])

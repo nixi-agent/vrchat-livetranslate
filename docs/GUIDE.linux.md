@@ -170,6 +170,11 @@ Hello, I'm Nixi. Today, we're going to test out the real-time simultaneous inter
 
 ### Linux 上的音频设备（只有「麦克风」需要选）
 
+麦克风下拉显示设备描述，配置 `capture.mic_device` 保存稳定的 PipeWire `node.name`。
+设备重连后即使描述改变，仍使用同一节点。旧描述配置在扫描唯一匹配设备时自动迁移；
+若升级前描述已经改变，或多个设备同名而无法确定原节点，请重新选择麦克风。
+同名选项会显示节点名称供区分；旧描述无法唯一匹配时按界面「自动检测」使用默认输入。
+
 Linux 与 Windows 在这里**刻意不一样**：设置里的「音频设备」只有**一个下拉**（`麦克风`），
 `VRChat 音频` 与 `译音输出` 两项在 Linux 上不暴露给用户。
 

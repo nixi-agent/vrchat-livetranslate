@@ -54,6 +54,32 @@ Linux 的安装与用法：**[GUIDE.linux.md](docs/GUIDE.linux.md)** ·
 
 ## 📖 使用指南
 
+### ChatGPT 订阅语音（源码预览）
+
+新增「ChatGPT 订阅语音」路径，已实测中文语音 → 日文字幕及日文译音。
+此路径使用官方 Codex CLI 的订阅语音连线，不需要 OpenAI API key；模型由服务端选择，
+不能把它当成通用 API Credit，也不保证指定 `gpt-live` 型号可用。
+
+1. 安装本项目的源码依赖、官方 Codex CLI，以及 Chrome 或 Edge。
+2. 额外安装：`.venv\Scripts\python.exe -m pip install -r requirements-chatgpt.txt`。
+3. 开启 GUI，在设置切换至「ChatGPT 订阅语音（消耗 Codex 额度）」，按「登录 ChatGPT」完成浏览器登录。
+   本工具使用独立登录，首次使用需在界面登录；本机 `codex login` 不会自动共用。
+   登录完成后显示「ChatGPT 已登录」，按钮改为「切换 ChatGPT 帐户」。
+   凭证由官方 CLI 储存在用户数据目录的 `vrchat-livetranslate/codex/`，
+   Windows 为 `%APPDATA%\vrchat-livetranslate\codex\`；换帐户不修改日常 Codex 登录。
+4. 选择「我说」及中文 → 日本语，开始翻译。需要让 VRChat 玩家听见日文时，
+   开启「译音输出」，设置虚拟声卡，并在 VRChat 选择其录音端作为麦克风。
+   选「双向同时」可同时将你的中文转成日文、将对方的日文转成繁体中文字幕；
+   日文译音只从「我说」方向送往虚拟麦克风，对方方向不输出声音。
+
+支持单向及双向语音翻译，使用 Juniper 声音；打字翻译与 Qwen 声音预听不适用。
+双向模式会建立两条独立语音连线，两个方向各自使用订阅额度。
+语音连线会启动隔离的背景 Chromium，停止翻译时清理；不使用主浏览器的个人资料。
+可用性及额度取决于登录帐户与 Codex 语音服务。现有下载版 exe 尚未包含此预览功能。
+
+提示词防护机制、实测发现与验证边界见 [Findings](docs/ChatGPT-prompt-defense.md)。
+耗用订阅额度的额外实机测试与资料仅保留本机，不随 repo、套件或 CI 发布；CI 只运行离线回归。
+
 从**快速上手**到**已知限制**的完整内容（安装、API key、用法、配置、排障、项目结构、开发）都在单独文档里：
 
 - **Windows** → **[使用指南（docs/GUIDE.md）](docs/GUIDE.md)**

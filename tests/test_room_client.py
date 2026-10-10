@@ -18,6 +18,7 @@ TCP 连接才逼得出来。所以这里用 `websockets.serve` 在 127.0.0.1 的
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import io
 import json
@@ -306,7 +307,7 @@ class FakeRelay:
                 await ws.close(code=1002, reason="bad hello")
                 return
             conn.hello = hello
-            reject = self._check_hello(hello)
+            reject = self._check_hello(hello, ws.request.headers.get('Authorization', ''))
             if reject is not None:
                 code, msg = reject
                 self.failed_hellos.append(f"{code}: {msg}")
@@ -330,13 +331,16 @@ class FakeRelay:
             if conn.peer_id is not None:
                 await self._broadcast_members()
 
-    def _check_hello(self, hello: dict[str, Any]) -> tuple[str, str] | None:
+    def _check_hello(self, hello: dict[str, Any], authorization: str) -> tuple[str, str] | None:
         """鉴权（真服务端放在 Worker 层）：帧型 / 房间码 / 令牌 / 人数上限。"""
         if hello.get("t") != FRAME_HELLO:
             return "bad_frame", f"首帧必须是 hello，收到 {hello.get('t')!r}"
         if str(hello.get("room") or "") != self.room_code:
             return "bad_room", f"房间码不对：{hello.get('room')!r}"
-        if self.token and str(hello.get("tok") or "") != self.token:
+        received = authorization[7:] if authorization.startswith('Bearer ') else ''
+        if authorization.startswith('VLT '):
+            received = base64.urlsafe_b64decode(authorization[4:]).decode('utf-8')
+        if self.token and received != self.token:
             return "auth", "进房令牌不对"
         with self._lock:
             # 只数已经拿到成员 id 的：正在握手的这条连接不算人头
@@ -1079,18 +1083,18 @@ def test_connect_url_carries_room_and_masks_token() -> None:
         url = client._connect_url()
         assert f"room={TEST_ROOM}" in url, \
             f"★ 连接 URL 必须自带房间码（真 Worker 靠它路由，缺了直接 400）：{url}"
-        assert f"k={token}" in url, f"配了 token 就该补进查询串：{url}"
+        assert token not in url, '令牌只能进入 Authorization，不能进入 URL'
 
         masked = client._masked_url(url)
         assert token not in masked, f"★ 掩码没生效，明文令牌还在：{masked}"
-        assert "k=***" in masked, f"掩码要留下 k=*** 才看得出「配了令牌」：{masked}"
         assert f"room={TEST_ROOM}" in masked, "掩码不该把房间码也抹掉（排查要用）"
 
         # 用户已经手写了 room=/k= 就不覆盖（尊重手写，别搞出两份口径）
         hand = RoomClient(RoomConfig(server_url=f"{r.url}?room=HANDWRIT&k=mine",
                                      room_code=TEST_ROOM, nickname="小明"), lambda m: None)
-        assert hand._connect_url() == f"{r.url}?room=HANDWRIT&k=mine", \
+        assert hand._connect_url() == f"{r.url}?room=HANDWRIT", \
             f"★ 手写的 room=/k= 被覆盖了：{hand._connect_url()}"
+        assert hand._auth_token() == 'mine', '旧 query token 应迁移到 header'
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -1103,11 +1107,11 @@ def test_connect_url_carries_room_and_masks_token() -> None:
         leaked = [ln for ln in logged.splitlines() if token in ln]
         assert not leaked, f"★ 连接日志里有明文令牌：{leaked}"
         assert f"room={TEST_ROOM}" in logged, f"日志里应能看出连的是哪个房间：{logged[-200:]}"
-        assert "k=***" in logged, f"日志里应看得出配了令牌（掩码形式）：{logged[-200:]}"
 
         assert any(f"room={TEST_ROOM}" in p for p in r.paths), \
             f"★ 握手请求的路径里没带房间码：{r.paths}"
-        assert any("k=" in p for p in r.paths), f"握手请求的路径里没带令牌：{r.paths}"
+        assert not any("k=" in p for p in r.paths), '握手路径不应带令牌'
+        assert 'tok' not in r.conn().hello, 'HELLO 不应重传令牌'
         last_path = r.paths[-1]
     print(f"  连接 URL 自带房间码 + 令牌掩码 OK（握手路径 {last_path}，日志无明文令牌）")
 

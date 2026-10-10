@@ -25,7 +25,7 @@ curl http://127.0.0.1:8787/
 WebSocket 端点：
 
 ```
-ws://127.0.0.1:8787/ws?room=<8位房间码>[&k=<令牌>]
+ws://127.0.0.1:8787/ws?room=<8位房间码>
 ```
 
 - `room` 必填，8 位 Crockford Base32（不含易混的 `I/L/O/U`；填错了会自动把
@@ -35,8 +35,9 @@ ws://127.0.0.1:8787/ws?room=<8位房间码>[&k=<令牌>]
 - 客户端连上后第一帧发 `hello`，服务端回 `welcome`，然后开始即收即转。
 
 拿真客户端打本地 DO（批次 1 用这个验过，见下「已验证」）—— `server_url` **不用**手写
-`?room=`，`RoomClient._connect_url()` 会把归一化后的房间码补进查询串（配了 `token`
-就一并补 `k=`；用户已经手写了 `room=`/`k=` 就不覆盖）：
+`?room=`，`RoomClient._connect_url()` 会把归一化后的房间码补进查询串。
+令牌只放在 Authorization header；旧 URL 内的 `k`/`tok`/`token` 会迁移到 header，
+不再进入连接 URL 或 HELLO。远程地址必须使用 `wss://`，`ws://` 仅允许本机 loopback：
 
 ```python
 RoomConfig(server_url="ws://127.0.0.1:8787/ws", room_code="TEST1234", ...)
@@ -62,8 +63,11 @@ $sha = [System.Security.Cryptography.SHA256]::Create()
 服务端**只存哈希**，明文令牌既不落盘也不进日志。鉴权在 Worker 层做完：
 令牌不对直接 401/403，**不进 DO** —— 否则每一发攻击流量都在替你付 DO 请求费。
 
-客户端这边对齐同一口径：令牌走查询串会被日志原样打出来，所以 `RoomClient` 打连接日志前
-先过 `_masked_url()`，把 `k`/`tok`/`token` 的值抹成 `***`（日志会跟着 crashlog 落到用户硬盘上）。
+普通 ASCII 令牌使用 `Authorization: Bearer <token>`，兼容旧 Worker。
+Unicode 或不符合 token68 的令牌使用 `Authorization: VLT <UTF-8 token 的 base64url>`；
+这类令牌需更新 Worker 后使用。base64url 是编码，不是加密，远程仍必须使用 TLS。
+客户端不会跟随重定向，避免认证明文转交其他端点。服务端保留旧 query/Bearer 客户端兼容性，
+旧 query 客户端仍可能把令牌写入代理访问日志，应升级；不能保证旧客户端请求不留令牌。
 
 ## 部署（已上线，2026-09-28）
 

@@ -38,7 +38,8 @@ def _provider_choices() -> tuple[tuple[str, str], ...]:
     用户一换界面语言配置就"失效"了 —— 同一件事存两份迟早漂移（见 endpoints.py 的铁律）。
     """
     return ((t("千问云"), endpoints.PROVIDER_QIANWEN),
-            (t("千问云·海外版"), endpoints.PROVIDER_QWENCLOUD))
+            (t("千问云·海外版"), endpoints.PROVIDER_QWENCLOUD),
+            (t("ChatGPT 订阅语音（消耗 Codex 额度）"), endpoints.PROVIDER_CHATGPT))
 
 
 def _persist_provider(cfg_path: "Path", provider: str, base_url: str) -> None:

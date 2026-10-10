@@ -174,6 +174,9 @@ class LiveTranslateSession(abc.ABC):
 
 def create_session(cfg: SessionConfig) -> LiveTranslateSession:
     """按模型名前缀分发到对应代次的实现（可插拔点）。"""
+    if cfg.provider == endpoints.PROVIDER_CHATGPT:
+        from .chatgpt_live import ChatGPTLiveSession
+        return ChatGPTLiveSession(cfg)
     model = cfg.model.lower()
     if model.startswith("qwen3.8-livetranslate") or model.startswith("qwen3.5-livetranslate"):
         from .qwen38 import QwenLiveTranslateSession  # 3.5/3.8 共用一套写出逻辑，差异在事件映射

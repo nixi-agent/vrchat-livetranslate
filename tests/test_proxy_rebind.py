@@ -20,6 +20,8 @@
 
 覆盖任务书的六条：接线生效 / 不双写 / owner 正确（含 `_cleanup` 不 close 注入 sink）/
 follow_mic 跟随 / 并发 / 故障注入可被本文件抓红。
+外加 review #2 补的一条：**本方向不需要译音输出腿**（`theirs`，或没勾「译音输出」的 `mine`）
+→ 重接线只记下接线，`_virtualmic` 仍为 None、一次都不 open 设备（与 `_build_and_run` 同一个门）。
 """
 from __future__ import annotations
 
@@ -100,28 +102,37 @@ class _FakeProxySink:
 # ---------------------------------------------------------------- 离线引擎
 
 
-def _cfg(level_mode: str) -> AppConfig:
-    """一份够用的离线配置：`output.audio.level.mode` 可调，方向带 `output_audio=True`。"""
+def _cfg(level_mode: str, *, output_audio: bool = True,
+         audio_enabled: bool = True, direction: str = "mine") -> AppConfig:
+    """一份够用的离线配置：`output.audio.level.mode` 可调，方向带 `output_audio`。
+
+    *output_audio* / *audio_enabled* / *direction* 用来摆出「本方向压根不需要译音输出腿」
+    的现场（review #2）：`theirs` 腿、或没勾「译音输出」的 `mine` 腿。
+    """
     return AppConfig(
         session_base={"model": "x", "base_url": "x", "voice": "x", "api_key": "x",
                       "workspace_id": "", "reconnect_backoff": [1],
                       "max_new_sessions_per_minute": 10, "final_silence_s": 1.0},
-        directions={"mine": Direction(source_lang="zh", target_lang="en",
-                                      output_audio=True)},
+        directions={direction: Direction(source_lang="zh", target_lang="en",
+                                         output_audio=output_audio)},
         chatbox={}, merger={}, overlay={},
-        output={"audio": {"enabled": True, "level": {"mode": level_mode}}},
+        output={"audio": {"enabled": audio_enabled, "level": {"mode": level_mode}}},
     )
 
 
-def _engine(level_mode: str = "off", audio_sink=None):  # noqa: ANN001, ANN202
+def _engine(level_mode: str = "off", audio_sink=None, *,            # noqa: ANN001
+            direction: str = "mine", output_audio: bool = True,
+            audio_enabled: bool = True):
     """离线构造一个 Engine（**不 start**）：不连网络、不开设备、不起事件循环线程。
 
     构造期的 `[net] ⚠️ 出网端点派生失败…`（dummy base_url="x" 解析不出 host）与本用例无关，
     吞掉以免污染验收输出。
     """
     events = E.EngineEvents(on_status=lambda lvl, msg: None)
+    cfg = _cfg(level_mode, output_audio=output_audio, audio_enabled=audio_enabled,
+               direction=direction)
     with contextlib.redirect_stdout(io.StringIO()):
-        return E.Engine(cfg=_cfg(level_mode), direction="mine", source="mic",
+        return E.Engine(cfg=cfg, direction=direction, source="mic",
                         sinks=set(), events=events, settle_s=30.0, dry_run=True,
                         audio_sink=audio_sink)
 
@@ -142,6 +153,34 @@ def _arm_self_built(engine, created: list, *, opens: bool = True) -> dict:  # no
     engine._make_audio_out = _stub                      # noqa: SLF001
     engine._setup_virtualmic({})                        # noqa: SLF001
     return state
+
+
+def _recording_stub(created: list):
+    """只**记录**「引擎想自建输出腿」这件事，本身不建立任何腿。
+
+    与 `_arm_self_built` 的桩不同：那个用完就 `_setup_virtualmic()` 真建一条腿，这个只用来
+    数「引擎有没有试图造腿 / open 设备」—— review #2 要断言的正是**一次都没有**。
+    """
+    def _stub(_audio_cfg: dict) -> _FakeVM:
+        vm = _FakeVM(name=f"VM{len(created)}")
+        created.append(vm)
+        return vm
+
+    return _stub
+
+
+class _AliveThread:
+    """`Engine.running` 只看 `_thread.is_alive()` —— 摆个恒活的替身即可模拟「翻译进行中」。"""
+
+    @staticmethod
+    def is_alive() -> bool:
+        return True
+
+
+def _fake_running(engine) -> None:                      # noqa: ANN001
+    """把离线引擎摆成「在跑」：不真起线程、不起事件循环。"""
+    engine._thread = _AliveThread()                     # noqa: SLF001
+    engine._stopping = False                            # noqa: SLF001
 
 
 def _capture(fn, *a, **k):                              # noqa: ANN001, ANN202
@@ -312,6 +351,67 @@ def test_rebind_skip_and_not_running_branches() -> None:
     print("  ✓ 无变化→「跳过」留痕（不 close/不重造）；未运行→只记下接线、不 open 设备")
 
 
+# ---------------------------------------------------------------- ⑤b 不需要输出腿的方向（review #2）
+
+
+def test_rebind_skips_directions_without_audio_output() -> None:
+    """★ review #2：本方向**不需要**译音输出腿 → 重接线只记接线，绝不建腿 / open 设备。
+
+    以前 `rebind_audio_sink` 第 3 步无条件调 `_setup_virtualmic`，绕过了 `_build_and_run`
+    建腿那个门（`audio_enabled and d.output_audio`）。后果：关代理时 `rebind(None)` 会给
+    `theirs` 腿（或没勾「译音输出」的 `mine` 腿）真去 open 引擎自建虚拟声卡并**占住端点**，
+    用户再开代理就可能因设备被自己占着而失败 → 代理降级。
+
+    ★ **故障注入**：把 `rebind_audio_sink` 里 `if not self._audio_out_wanted():` 那个分支
+    删掉 → (a) 的 `created_a` 会多出一条已 open 的 `_FakeVM`、`_virtualmic` 不再是 None
+    → 本用例变红。
+    """
+    # (a) 方向不含「我说」（theirs）：引擎在跑，手里还攥着代理的 sink → 关代理
+    created_a: list[_FakeVM] = []
+    sink_a = _FakeProxySink()
+    eng_a = _engine(level_mode="off", audio_sink=sink_a,
+                    direction="theirs", output_audio=False)
+    eng_a._make_audio_out = _recording_stub(created_a)      # noqa: SLF001
+    _fake_running(eng_a)
+    assert eng_a.running, "前提：引擎在跑"
+    assert eng_a._virtualmic is None, "前提：theirs 腿本来就没有输出腿"   # noqa: SLF001
+
+    ok_a, out_a = _capture(eng_a.rebind_audio_sink, None)
+    assert ok_a is True, f"跳过也算「接线可用」→ True：{out_a!r}"
+    assert eng_a._virtualmic is None, \
+        f"★ 不该凭空多出一条输出腿：{eng_a._virtualmic!r}"                # noqa: SLF001
+    assert created_a == [], f"★ 一次都不许 open 设备：{created_a!r}"
+    assert eng_a._audio_sink is None, "接线本身仍要记下来（下次 start 照它建）"  # noqa: SLF001
+    assert sink_a.close_calls == 0, "不变量：注入的 sink 归代理管，绝不 close"
+    assert "不需要译音输出" in out_a and "跳过" in out_a, \
+        f"必须逐分支留痕说清「本方向不需要译音输出 → 跳过」：{out_a!r}"
+
+    # (b) 没勾「译音输出」的 mine 腿（output.audio.enabled=False）→ 开代理时同样只记接线
+    created_b: list[_FakeVM] = []
+    eng_b = _engine(level_mode="off", audio_enabled=False)
+    eng_b._make_audio_out = _recording_stub(created_b)      # noqa: SLF001
+    _fake_running(eng_b)
+    sink_b = _FakeProxySink(mic_db=-21.0)
+    ok_b, out_b = _capture(eng_b.rebind_audio_sink, sink_b)
+    assert ok_b is True, f"跳过 → True：{out_b!r}"
+    assert eng_b._virtualmic is None and created_b == [], \
+        f"★ 不建腿、不开设备：{eng_b._virtualmic!r} {created_b!r}"        # noqa: SLF001
+    assert eng_b._audio_sink is sink_b, "接线仍要记下来"                   # noqa: SLF001
+    assert "不需要译音输出" in out_b, f"必须逐分支留痕：{out_b!r}"
+
+    # (c) 对照：同一个门**开着**（mine + output_audio + enabled）→ 照常真的换腿
+    created_c: list[_FakeVM] = []
+    eng_c = _engine(level_mode="off")
+    _arm_self_built(eng_c, created_c)
+    sink_c = _FakeProxySink()
+    ok_c, out_c = _capture(eng_c.rebind_audio_sink, sink_c)
+    assert ok_c is True and eng_c._virtualmic is sink_c, \
+        f"对照：门开着就该真的换腿：{out_c!r}"                             # noqa: SLF001
+    assert "已重接线" in out_c, f"对照：成功留痕：{out_c!r}"
+    print("  ✓ 不需要输出腿的方向（theirs / 没勾译音输出）→ 只记接线、_virtualmic 仍 None、"
+          "0 次 open（对照：门开着照常换腿）")
+
+
 # ---------------------------------------------------------------- ⑥ 失败分支（自建打不开）
 
 
@@ -390,6 +490,7 @@ def main() -> int:
         test_rebind_back_to_self_built_never_closes_injected,
         test_cleanup_never_closes_injected_sink,
         test_rebind_skip_and_not_running_branches,
+        test_rebind_skips_directions_without_audio_output,
         test_rebind_failure_when_self_build_cannot_open,
         test_concurrent_emit_and_rebind_no_loss_no_crash,
     ]

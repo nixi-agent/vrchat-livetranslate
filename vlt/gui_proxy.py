@@ -10,6 +10,7 @@ from .config_io import (_fmt_scalar, _yaml_set_in_text, _yaml_set_or_create,
                         _yaml_scalar)
 from .output import level_match
 from .output.level_match import format_db
+from .output.micproxy import MODE_TRANSLATED
 
 def _m(gui):
     return sys.modules[gui.__class__.__module__]
@@ -206,6 +207,56 @@ class ProxyMethods:
         return ok, fail
 
 
+    def _proxy_translated_wanted(self) -> bool:
+        """中途开代理后要不要把档位切到「译音」—— 口径与 `gui_engine.start()` **完全一致**。
+
+        那边是 `want_audio = vmic_var.get()`，再 `Direction.output_audio = want_audio and
+        direction == "mine"`（译音输出只对「我说的话」那条腿有效）。两条都成立才切：没勾
+        「译音输出」、或当前方向不含「我说」时切过去等于让对方听静音 —— 比原声更糟。
+        """
+        ctx = getattr(self, "_engine_ctx", None)
+        var = getattr(ctx, "vmic_var", None)
+        if var is None:
+            var = getattr(self, "_vmic_var", None)
+        try:
+            want = bool(var.get()) if var is not None else False
+        except Exception:                            # noqa: BLE001 — 占位控件不一定能 get
+            want = False
+        if not want:
+            return False
+        return any(direction == "mine" and getattr(eng, "running", False)
+                   for eng, direction in zip(self._engines or [],
+                                             self._engine_dirs or []))
+
+
+    def _proxy_adopt_translation(self, proxy) -> None:  # noqa: ANN001
+        """让**中途新建**的代理知道「翻译正在跑」，并按 start() 的口径决定档位（review #1）。
+
+        为什么必须补这一手：`MicProxy._translation_active` 默认 False，而
+        `set_translation_active()` 只在翻译启停时被调（`gui_engine.start/stop`）——
+        中途开代理这条路径以前从头到尾没调它，于是 `set_mode(MODE_TRANSLATED)` 被代理
+        直接拒（`micproxy.set_mode` 里那条「翻译未运行，无法切到译音档」）。症状是：
+        重接线已把译音 PCM 灌进代理的 translated 环形缓冲，代理却停在原声档、没人 drain
+        （溢出丢弃），用户点「原声/译音」还被告知「翻译未运行」→ 这一轮根本听不到译音。
+        """
+        try:
+            proxy.set_translation_active(True)
+        except Exception as exc:                     # noqa: BLE001 — 绝不让它打断界面
+            print(f"[proxy] ⚠️ 通知代理「翻译在跑」失败：{type(exc).__name__}: {exc}"
+                  "（档位停在原声；主界面「原声/译音」按钮仍可手动切）", flush=True)
+            return
+        if not self._proxy_translated_wanted():
+            print("[proxy] 中途开代理：未勾「译音输出」或本方向不含「我说」→ 档位保持原声"
+                  "（与「开始翻译」同一口径：切过去等于让对方听静音）", flush=True)
+            return
+        if proxy.set_mode(MODE_TRANSLATED):
+            print("[proxy] 中途开代理 → 档位切到「译音」（与「开始翻译」的默认行为一致；"
+                  "可在主界面「原声/译音」按钮切回）", flush=True)
+        else:
+            print("[proxy] ⚠️ 中途开代理后切「译音」失败（保持原档位；"
+                  "主界面「原声/译音」按钮仍可手动切）", flush=True)
+
+
     def _restart_proxy(self) -> None:
         """设置页勾选框的落地点：想开就开、想关就关，按钮态与提示一起刷新。
 
@@ -228,10 +279,25 @@ class ProxyMethods:
                               flush=True)
                         self._set_status(
                             "warn",
-                            t("麦克风代理不可用（虚拟声卡没打开？）；原声/译音切换已禁用"))
+                            t("引擎译音输出重接线失败（本轮译音未接上代理，"
+                              "重新点「开始翻译」可恢复）"))
                     elif ok:
+                        # ★ review #1：新建的代理 `_translation_active` 是 False，不补这一手
+                        #   它就以为翻译没在跑 → `set_mode(MODE_TRANSLATED)` 被拒 → 译音灌进
+                        #   translated 缓冲却没人 drain，这一轮根本听不到译音。
+                        self._proxy_adopt_translation(proxy)
+                        # 如实报**当前档位**：以前这里恒写「原声/译音切换生效」，而代理其实
+                        # 停在原声档 —— 与实际相反的留痕比没有留痕更难排查。
+                        gear = ("译音" if getattr(proxy, "mode", None) == MODE_TRANSLATED
+                                else "原声")
                         print(f"[proxy] 翻译进行中开了代理：已把 {ok} 个在跑引擎的译音输出接到"
-                              "代理 translated_sink（follow_mic 参考即时可用，原声/译音切换生效）",
+                              f"代理 translated_sink（follow_mic 参考即时可用；"
+                              f"当前档位 {gear}）", flush=True)
+                    else:
+                        # 在跑的引擎没有 rebind_audio_sink（旧实现 / 测试替身）→ 没能接上，
+                        # 如实留一行痕（禁静默降级：状态栏保持「已启用」，那是真的）。
+                        print("[proxy] ⚠️ 翻译进行中开了代理，但在跑引擎不支持重接线："
+                              "这些引擎本轮译音仍走自建输出，重新点「开始翻译」后才会接到代理",
                               flush=True)
             return
         running = any(getattr(e, "running", False) for e in self._engines)
@@ -248,7 +314,8 @@ class ProxyMethods:
                       flush=True)
                 self._set_status(
                     "warn",
-                    t("打开虚拟声卡失败：{err}（其余功能不受影响）", err="engine rebind"))
+                    t("引擎切回自建译音输出失败（虚拟声卡打不开？本轮译音不出声，"
+                      "重新点「开始翻译」可恢复）"))
             elif ok:
                 print(f"[proxy] 翻译进行中关掉了代理：已把 {ok} 个在跑引擎的译音输出切回引擎自建"
                       "虚拟声卡（翻译不中断）", flush=True)

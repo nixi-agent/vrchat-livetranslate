@@ -5,7 +5,6 @@ GUI 与 CLI 共用同一个 Engine 类；区别只在事件回调和音频源。
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import threading
 import time
@@ -714,12 +713,12 @@ class Engine:
         `_virtualmic` 被短暂置 None 时抛 AttributeError。`_level.apply` 也在锁内，保持
         「输出腿为空就不施加增益」的既有语义（锁序恒为 _sink_lock → LevelMatcher._lock）。
 
-        ⚠️ 锁用 `getattr` 容错：`tests/test_proxy_wiring.py` 的 `_Holder` **直接借用**本方法
-        （只摆 `_virtualmic` / `_level`，从不构造 Engine，故没有 `_sink_lock`），那份用例不许改。
-        生产路径里 `_sink_lock` 恒在（`__init__` 建），锁一定生效；缺失时退化成无锁（单线程安全）。
+        ⚠️ 锁是**无条件**的，与 `_end_sentence` 对称 —— 这里以前用 `getattr(self, "_sink_lock",
+        None)` + `nullcontext()` 兜底，唯一目的是迁就 `tests/test_proxy_wiring.py` 的 `_Holder`
+        （借真方法、不造 Engine）。代价是：属性将来缺失 / 改名 → **锁静默失效**而不是报错。
+        现在替身自己带一把 `_sink_lock`，生产侧不留这个后门。
         """
-        lock = getattr(self, "_sink_lock", None)
-        with (lock if lock is not None else contextlib.nullcontext()):
+        with self._sink_lock:
             vm = self._virtualmic
             if vm is None:
                 return
@@ -733,7 +732,25 @@ class Engine:
             if vm is not None:
                 vm.end_sentence()
 
-    def rebind_audio_sink(self, sink) -> bool:
+    def _audio_out_wanted(self) -> bool:
+        """本引擎这条腿**该不该有**译音输出腿 —— 与 `_build_and_run` 建腿是**同一个门**。
+
+        判据两条都要成立：`output.audio.enabled`（界面「译音输出」勾选框；`audio_out`
+        覆盖优先，CLI 用）与本方向的 `Direction.output_audio`（只有「我说的话」那条腿
+        才为真，见 `gui_engine.start`）。
+
+        为什么 `rebind_audio_sink` 必须复用它：重接线是运行期从界面线程打进来的，绕过
+        这个门就会给**本来不该有输出腿**的引擎（`theirs`，或没勾「译音输出」的 `mine`）
+        凭空建一条；更糟的是关代理时 `rebind(None)` 会真去 open 引擎自建虚拟声卡并占住
+        端点，之后用户再开代理可能因设备被自己占着而失败（review #2）。
+        """
+        audio_cfg = (self._cfg.output or {}).get("audio") or {}
+        enabled = (self._audio_out_override if self._audio_out_override is not None
+                   else audio_cfg.get("enabled", False))
+        d = self._cfg.directions.get(self._direction)
+        return bool(enabled) and d is not None and bool(d.output_audio)
+
+    def rebind_audio_sink(self, sink: "object | None") -> bool:
         """运行期把「译音输出腿」整条换掉（翻译进行中开 / 关麦克风代理时用），不必重开翻译。
 
         为什么不能只把参考接线改活（issue #90 里写明）：只改参考会让「引擎自建的 VirtualMic」
@@ -748,22 +765,41 @@ class Engine:
         * 麦克风电平参考（`follow_mic`）是**活引用**（见 `_build_level_matcher`），换 sink 后
           `LevelMatcher.mic_db()` 立刻读到新 sink 的 `mic_reference_db`；这里同步刷新
           `_level_has_mic_ref` 并清 `_level_fallback_logged`（换接线后允许再留一次痕）。
+        * **本方向压根不需要译音输出腿**（没勾「译音输出」/ 方向不含「我说」，判据见
+          `_audio_out_wanted`）→ 只记下接线，**绝不**建腿或 open 任何设备。
 
         **不变量**：切换后同一端点只有一个 owner（自建与注入不同时活着）；`_owns_virtualmic`
-        与实际 close 的对象一致；引擎停止时永远不 close 注入的 sink（见 `_cleanup`）。
+        与实际 close 的对象一致；引擎停止时永远不 close 注入的 sink（见 `_cleanup`）；
+        不该有输出腿的引擎重接线后 `_virtualmic` 仍为 None。
 
         线程安全：整个切换在 `_sink_lock` 临界区里完成，与音频泵 / 事件循环线程读 `_virtualmic`
         的 `_emit_translated` / `_end_sentence` 互斥。
 
-        返回 True = 已切换，或本就指向同一 sink / 引擎没在跑（只记下接线，下次 start 生效）；
-        返回 False = 切换后译音输出不可用（自建 VirtualMic 打不开）。每种情况都逐分支留痕
-        （跳过一行 / 成功一行 / 失败 WARN，禁静默降级）。
+        **返回值语义**（签名恒为 bool，别改）：
+
+        * ``True`` = 接线**可用** —— 含四种情况：已实时切换 / 本就指向同一 sink（无需切换）/
+          引擎未运行只记下接线 / 本方向不需要输出腿（跳过）。
+        * ``False`` = 切换后译音输出腿**不可用**（自建 VirtualMic 打不开）→ 本轮译音不出声。
+
+        每种情况都逐分支留痕（跳过一行 / 成功一行 / 失败 WARN，禁静默降级）。
         """
         with self._sink_lock:
             # 无变化：已经指向同一 sink（含都为 None）→ 跳过，不做无谓的 close/reopen。
             if sink is self._audio_sink:
                 print("[engine] 译音输出接线未变化（sink="
                       f"{'代理' if sink is not None else 'None'}）→ 跳过重接线", flush=True)
+                return True
+
+            # 本方向不需要译音输出腿 → 只记接线，**绝不**建腿或 open 设备（review #2）。
+            # 与 `_build_and_run` 建腿同一个门（`_audio_out_wanted`）：绕过它就会给 `theirs`
+            # 或没勾「译音输出」的 `mine` 凭空多出一条腿，关代理时还会真去占住虚拟声卡端点。
+            if not self._audio_out_wanted():
+                self._audio_sink = sink
+                self._level_has_mic_ref = (sink is not None
+                                           and hasattr(sink, "mic_reference_db"))
+                self._level_fallback_logged = False
+                print("[engine] 本方向不需要译音输出（未勾「译音输出」或方向不含「我说」）→ "
+                      "跳过重接线：只记下接线，不建输出腿、不开任何设备", flush=True)
                 return True
 
             # 没在跑、也没有在用的输出腿：只把接线记下来，下次「开始翻译」自会照它建。
@@ -1154,9 +1190,9 @@ class Engine:
                       f"{type(exc).__name__}: {exc}", flush=True)
 
         audio_cfg = (self._cfg.output or {}).get("audio") or {}
-        audio_enabled = self._audio_out_override if self._audio_out_override is not None else audio_cfg.get("enabled", False)
-        d = self._cfg.directions.get(self._direction)
-        if audio_enabled and d is not None and d.output_audio:
+        # 建腿的门**只有一处口径**：`_audio_out_wanted()`（`rebind_audio_sink` 复用它，
+        # 否则运行期重接线会给不该有输出腿的方向凭空建一条）。
+        if self._audio_out_wanted():
             self._setup_virtualmic(audio_cfg)
 
         merger_cfg = self._cfg.merger or {}

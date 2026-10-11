@@ -131,6 +131,47 @@ class _FakeProxy:
         self.mode = mode
 
 
+class _StubWidget:
+    """占位控件（headless 下没有真 Tk 控件）：只记 configure 的关键字。"""
+
+    def __init__(self) -> None:
+        self.kw: dict = {}
+
+    def configure(self, **kw) -> None:
+        self.kw.update(kw)
+
+    def cget(self, k):                       # noqa: ANN001
+        return self.kw.get(k)
+
+
+class _StubVar:
+    """占位 Tk 变量：只提供 get/set。"""
+
+    def __init__(self, v) -> None:           # noqa: ANN001
+        self._v = v
+
+    def get(self):
+        return self._v
+
+    def set(self, v) -> None:                # noqa: ANN001
+        self._v = v
+
+
+#: **老用户形态**的 config.yaml（更早的模板生成）：`output.audio` 在，但整段 `proxy:` 没有。
+#: 界面上的代理设置在这个形态下曾经是**静默不落盘**的（`_yaml_set_in_text` 缺父键 → 原样返回）。
+LEGACY_GUI_CONFIG = (
+    "ui:\n"
+    "  lang: zh\n"
+    "session:\n"
+    "  api_key: test-key-not-real\n"
+    "output:\n"
+    "  audio:\n"
+    "    enabled: false           # 总开关\n"
+    "    buffer_ms: 300           # 起播前先攒这么多\n"
+    "    max_buffer_ms: 2000\n"
+)
+
+
 # ---------------------------------------------------------------- ① 解析 / 夹取
 
 
@@ -346,6 +387,73 @@ def test_gui_proxy_controls_state_and_writeback() -> None:
         i18n.set_language("zh")
 
 
+def test_legacy_config_proxy_keys_really_persist() -> None:
+    """**老配置（没有 `output.audio.proxy` 整段）**：设置页的开关与两条缓冲也必须真落盘。
+
+    与 `test_gui_proxy_controls_state_and_writeback` 是一对：那份用**带 proxy 段**的配置
+    （就地替换路径），这份用老配置（**需要补建整段**的路径）。旧写法 `_yaml_set_in_text`
+    在这种配置上是**静默 no-op**（缺父键 → 原样返回，不抛不报）——
+    用户现象就是「代理关掉、下次启动又开了」「直通缓冲改了没记住」。
+    顺带把「落盘成功不许出现 [proxy] WARN」钉住（WARN 只留给真的写不进去）。
+    """
+    import vlt.config as cfg_mod
+    import vlt.gui as gui_mod
+
+    tmp = Path(tempfile.mkdtemp(prefix="vlt-proxy-legacy-"))
+    home = tmp / "home"
+    home.mkdir()
+    cfg_path = tmp / "config.yaml"
+    cfg_path.write_text(LEGACY_GUI_CONFIG, encoding="utf-8", newline="\n")
+
+    saved_env = _isolate_env(home)
+    saved = (cfg_mod.DEFAULT_CONFIG, gui_mod.DEFAULT_CONFIG, gui_mod._is_test_process)
+    cfg_mod.DEFAULT_CONFIG = cfg_path
+    gui_mod.DEFAULT_CONFIG = cfg_path
+    gui_mod._is_test_process = lambda: False                 # type: ignore[assignment]
+    gui = None
+    try:
+        from vlt.gui import TranslationGUI
+
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            gui = TranslationGUI(headless=True)              # 不开真窗口、更不开音频设备
+        gui._voice_ctx.voice_mode_btn = _StubWidget()        # 主界面「原声/译音」按钮占位
+        gui._proxy_check = _StubWidget()
+        gui._proxy_hint = _StubWidget()
+        gui._passthrough_spin = _StubWidget()                # 不能是 None：否则写回路径整条短路
+        gui._translated_spin = _StubWidget()
+        gui._proxy_enabled_var = _StubVar(False)
+        gui._passthrough_var = _StubVar(240)
+        gui._translated_buf_var = _StubVar(600)
+        gui._cfg.session_base["api_key"] = "test-key-not-real"
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            gui._on_proxy_toggle()                           # 用户：关掉麦克风代理
+            gui._on_proxy_buffer_change()                    # 用户：直通 240 / 译音 600
+        out = buf.getvalue()
+
+        data = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        audio = (data.get("output") or {}).get("audio") or {}
+        proxy = audio.get("proxy") or {}
+        assert proxy.get("enabled") is False, f"代理开关没落盘（老配置缺整段）：{audio!r}"
+        assert proxy.get("passthrough_buffer_ms") == 240, f"直通缓冲没落盘：{audio!r}"
+        assert audio.get("buffer_ms") == 600, f"译音缓冲没落盘：{audio!r}"
+        assert audio.get("enabled") is False and audio.get("max_buffer_ms") == 2000, \
+            f"老配置里已有的兄弟键被动了：{audio!r}"
+        assert "# 总开关" in cfg_path.read_text(encoding="utf-8"), "注释被吃掉了"
+        assert "[proxy] ⚠️" not in out, f"落盘成功就不该有 WARN（禁静默指的是失败路径）：{out!r}"
+        assert gui._proxy_wanted() is False, "内存快照没跟上落盘"
+        print("  ✓ 老配置（无 proxy 整段）：代理开关 + 直通/译音缓冲三键都真的落盘"
+              "（补建 proxy: 段，原键与注释不动）")
+    finally:
+        cfg_mod.DEFAULT_CONFIG, gui_mod.DEFAULT_CONFIG, \
+            gui_mod._is_test_process = saved
+        _restore_env(saved_env)
+        from vlt import i18n
+        i18n.set_language("zh")
+
+
 # ---------------------------------------------------------------- 入口
 
 
@@ -354,6 +462,7 @@ def main() -> int:
         test_proxy_config_parsing_and_clamping,
         test_proxy_keys_inplace_persistence,
         test_gui_proxy_controls_state_and_writeback,
+        test_legacy_config_proxy_keys_really_persist,
     ]
     print("test_proxy_config:")
     failed = 0

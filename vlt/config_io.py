@@ -186,6 +186,32 @@ def _yaml_set_or_create(text: str, path: list[str], value: str) -> str:
     return "\n".join(lines)
 
 
+def _yaml_set_or_create_checked(text: str, path: list[str], value: str) -> str:
+    """`_yaml_set_or_create` 的**写后复检**版：解析回来确认路径上的值真的等于 *value*。
+
+    为什么要多这一步：两个就地改写函数在「父键找不到 / 落点找不到」时都是**原样返回**
+    （不抛、不报错也不留痕）—— 于是 `_write_config_text` 写回的是同一份文本，调用方只看到
+    「没异常」，磁盘上其实一个字没变。这正是本仓库最忌讳的静默降级，光看返回值分不出来。
+    实测形态：老用户的 `config.yaml`（更早的模板生成，**没有** `output.audio.proxy` 整段）
+    里写 `proxy.hint_shown`，旧路径是静默 no-op → 「首次启用说明每次都弹」。
+
+    复检**在内存里、写盘之前**：不等就直接抛，磁盘上的文件一个字没动，调用方那句
+    「配置未改动」才是真话（与 `ui_text._persist_provider` 同一口径）。
+    """
+    out = _yaml_set_or_create(text, path, value)
+    node = yaml.safe_load(out)
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            raise RuntimeError(
+                f"{'.'.join(path)} 没能写进配置（就地改写找不到落点，路径在 {key!r} 处断开）")
+        node = node[key]
+    want = yaml.safe_load(value)
+    if node != want:
+        raise RuntimeError(
+            f"{'.'.join(path)} 写进去的值不是期望的 {value!r}（读到 {node!r}）")
+    return out
+
+
 def _yaml_quote(x: object) -> str:
     """YAML 双引号标量（复用 JSON 的转义规则 —— YAML 双引号风格是它的超集）。
 

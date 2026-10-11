@@ -761,18 +761,43 @@ def _load_level(extra: str = "") -> tuple[dict, str]:
     """把一段 YAML 落成临时 config.yaml 并 `load_config`，返回 (归一化后的 level 段, 留痕)。
 
     留痕捕回来既保住测试输出干净，又能断言「不静默」。全程离线：只读临时文件。
+
+    ⚠️ **必须 hermetic：三步逐个封掉凭据来源**。`load_config` 内部会调 `load_api_key()`，
+    而后者在「界面保存的 key」存在时会打一行 `[config] API key 来源：…`，被本函数当留痕捕回来
+    → 与多处 `assert log == ""` 冲突。那会让用例**只在开发者本机红（存过 key）、CI 与无 key
+    机器绿**：实测 Arch 本机 `rc=1`、空 HOME `rc=0`（同一提交）。故在此逐条封：① 界面保存
+    （`credentials._storage_dir_override` → 空目录）② `DASHSCOPE_API_KEY` ③ `~/.bailian/config.json`
+    （HOME/USERPROFILE 指向空目录，Windows 上 `expanduser("~")` 用后者）。用例结果与机器状态无关。
     """
     import contextlib
     import io
+    import os
     import tempfile
 
+    from vlt import credentials
     from vlt.config import load_config
 
     p = Path(tempfile.mkdtemp(prefix="vlt-level-cfg-")) / "config.yaml"
     p.write_text(_LEVEL_MIN_YAML + extra, encoding="utf-8")
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        cfg = load_config(p, require_key=False)
+
+    empty_home = Path(tempfile.mkdtemp(prefix="vlt-level-home-"))
+    saved_override = credentials._storage_dir_override
+    saved_env = {k: os.environ.pop(k) for k in ("DASHSCOPE_API_KEY",) if k in os.environ}
+    saved_homes = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
+    credentials._storage_dir_override = lambda: empty_home / ".vrchat-livetranslate"
+    os.environ["HOME"] = os.environ["USERPROFILE"] = str(empty_home)
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cfg = load_config(p, require_key=False)
+    finally:
+        credentials._storage_dir_override = saved_override
+        os.environ.update(saved_env)
+        for k, v in saved_homes.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     audio = (cfg.output or {}).get("audio") or {}
     return (audio.get("level") or {}), buf.getvalue()
 
@@ -1028,6 +1053,30 @@ def test_module_has_no_device_or_engine_dependency():
     print(f"  离线约束：level_match.py 只 import {sorted(mods)}（无 engine/设备库）OK")
 
 
+def test_load_level_hermetic_against_saved_key() -> None:
+    """★ `_load_level` 必须与「本机是否存过 API key」无关（复审实测的非 hermetic 回归）。
+
+    机器上存过界面 key 时 `load_api_key()` 会打一行 `[config] API key 来源：…`；`_load_level`
+    若不封来源，这行会被当留痕捕回来 → 同一条断言在**开发者本机红、CI / 无 key 机器绿**。
+    这里造一个含假 key 的凭据目录（= 模拟「存过 key 的机器」），断言留痕仍为空。
+    """
+    import tempfile
+
+    from vlt import credentials
+
+    fake = Path(tempfile.mkdtemp(prefix="vlt-fake-cred-"))
+    (fake / "api_key.txt").write_text("sk-" + "F4k3K3y" * 14, encoding="utf-8")
+    saved = credentials._storage_dir_override
+    credentials._storage_dir_override = lambda: fake
+    try:
+        lv, log = _load_level("    level:\n      mode: follow_mic\n")
+        assert lv["mode"] == "follow_mic", lv
+        assert log == "", f"本机存过 key 不得让合法配置留痕：{log!r}"
+    finally:
+        credentials._storage_dir_override = saved
+    print("  `_load_level` hermetic：本机存过界面 key（假凭据目录）时仍零留痕 OK")
+
+
 if __name__ == "__main__":
     print("test_level_match:")
     test_block_db_known_sine()
@@ -1056,6 +1105,7 @@ if __name__ == "__main__":
     test_format_db_is_the_only_formatter()
     test_config_layer_matches_level_match()
     test_config_float_in_range_and_str_choice()
+    test_load_level_hermetic_against_saved_key()
     test_mic_reference_is_thread_safe()
     test_module_has_no_device_or_engine_dependency()
     print("ALL PASSED")

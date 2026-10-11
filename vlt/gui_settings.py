@@ -133,6 +133,10 @@ def build_settings_dialog(gui) -> None:
     win.withdraw()
     win.protocol("WM_DELETE_WINDOW", lambda: close_settings(gui))
     win.bind("<Escape>", lambda _e: close_settings(gui))
+    # 窗口被销毁（关程序时根窗会连带销毁子窗）→ 把挂起的读数 tick 一起取消。
+    # 不取消的话那个 `after` 会带着已经死掉的命令名到点，Tk 收尾打一行
+    # `invalid command name "..._refresh_level_readout"`（末影猫 L5 报的收尾噪音）。
+    win.bind("<Destroy>", gui._cancel_level_tick, add="+")
     for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
         win.bind(seq, lambda e: on_settings_wheel(gui, e))
     gui._settings_win = win

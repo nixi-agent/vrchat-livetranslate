@@ -796,10 +796,16 @@ def test_emit_translated_without_level_match_is_byte_identical() -> None:
     assert sink.pushed[-1] == pcm, f"mode=off 必须逐字节原样 push（默认档）：{off.gain_db()}"
     assert off.gain_db() == 0.0, f"off 档增益恒 0：{off.gain_db()}"
 
-    # 没勾「译音输出」（_virtualmic 为 None）→ 一块都不许 push，也不许抛
+    # 没勾「译音输出」（_virtualmic 为 None）→ 一块都不许 push，也不许抛。
+    # ⚠️ 判据要拿**同一个 sink 做差分**：以前这里建了个 `sink2` 却从没把它接进 holder，
+    #    `assert sink2.pushed == []` 于是恒真（接线以后断了也照样绿）= 空断言。
     sink2 = _FakeSink()
-    _emit_holder(None, None)._emit_translated(pcm)
-    assert sink2.pushed == [], "没有译音输出时不该有任何 push"
+    holder2 = _emit_holder(sink2, None)
+    holder2._emit_translated(pcm)
+    assert sink2.pushed == [pcm], "正向对照：接着译音输出时该 sink 必须收到这一块"
+    holder2._virtualmic = None            # 相当于用户关掉「译音输出」
+    holder2._emit_translated(pcm)
+    assert sink2.pushed == [pcm], "没有译音输出时不该再有任何 push"
     print("  ✓ 译音出口：没注入匹配器 / mode=off → 逐字节不变；没有译音输出 → 不 push")
 
 

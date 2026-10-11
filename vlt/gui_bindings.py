@@ -78,4 +78,5 @@ _DELEGATE_MAP = {
     "_on_level_change": gui_proxy.ProxyMethods._on_level_change,
     "_sync_level_controls_state": gui_proxy.ProxyMethods._sync_level_controls_state,
     "_refresh_level_readout": gui_proxy.ProxyMethods._refresh_level_readout,
+    "_cancel_level_tick": gui_proxy.ProxyMethods._cancel_level_tick,
 }

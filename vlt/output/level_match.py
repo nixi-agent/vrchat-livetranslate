@@ -66,11 +66,12 @@ def _rms_db(x: np.ndarray) -> float:
     return max(LEVEL_FLOOR_DB, 20.0 * math.log10(rms))
 
 
-def _block_db(pcm_s16: bytes) -> float:
-    """一块 s16le PCM 的 RMS 电平（dBFS，0 = 满刻度）；纯静音回落 LEVEL_FLOOR_DB。
+def block_db(pcm_s16: bytes) -> float:
+    """一块 s16le PCM 的 RMS 电平（dBFS，满刻度 = 0）；纯静音回落 LEVEL_FLOOR_DB。
 
-    与 engine.chunk_level_db **同语义**（这里刻意私有一份：本模块不能 import engine，
-    否则 engine → output.virtualmic → output.level_match → engine 成环）。
+    这是「块电平」的**唯一实现**：`vlt/engine.py` 的 `chunk_level_db`（输入门限那条腿）
+    委托到这里，不再是两处各写一份。可安全委托的原因：engine **本来就** import 本模块
+    （engine → output.level_match 单向），所以反向委托不成环 —— 本模块仍然不 import engine。
     """
     if not pcm_s16:
         return LEVEL_FLOOR_DB
@@ -405,11 +406,19 @@ class LevelMatcher:
     """引擎侧门面：`apply()` 累积本句电平并施加当前增益，句尾 `note_sentence_end()` 重算。
 
     增益**只在句首变**（句中变会造成音量台阶），且变化时对句首前 20ms 做线性斜坡。
+
+    ⚠️ **跨线程：全部共享状态都在 `_lock` 里**。`apply()` 有两个调用者 ——
+    `Engine._on_audio`（事件循环线程）与 `Engine._speak_stream`（`asyncio.to_thread`
+    的工作线程，`_speak_lock` 只串行化「打字」那两条，管不到说话那条腿）。说话译音与
+    打字 TTS 重叠时，`_tts._sumsq/_n/_peak`（`+=` 会丢更新）与
+    `_ramping/_ramp_done_frames` 会被两线程交错读改写：句子电平互相污染、增益算歪，
+    句首斜坡的推进也会丢帧。`set_config` / `status` / `gain_db` / `mic_db` 跑在 Tk 线程，
+    同样进锁。
     """
 
     __slots__ = ("_cfg", "_mic_db", "_gain_db", "_tts", "_last_tts_db", "_last_peak_db",
                  "_fallback", "_ever_ref", "_ramping", "_ramp_from", "_ramp_to",
-                 "_ramp_done_frames")
+                 "_ramp_done_frames", "_lock")
 
     def __init__(self, cfg: LevelConfig,
                  mic_db: Callable[[], float | None] | None = None) -> None:
@@ -425,6 +434,9 @@ class LevelMatcher:
         self._ramp_from = 0.0
         self._ramp_to = 0.0
         self._ramp_done_frames = RAMP_FRAMES
+        #: 用 **RLock**：本类内部有嵌套获取（`status`/`note_sentence_end`/`set_config`
+        #: 持锁时还会调 `mic_db()`），普通 Lock 会自锁。跨线程语义与 Lock 相同。
+        self._lock = threading.RLock()
 
     # ---- 配置 / 状态 ----
 
@@ -444,61 +456,71 @@ class LevelMatcher:
         另外：新模式不是 `follow_mic` 时立刻清掉 `fallback` —— `fixed` 根本不看麦克风参考，
         不清就会在「切过来」到「下一句句尾」之间一直挂着一条过期状态（界面读数据此显示回落）。
         """
-        was_off = self._cfg.mode == MODE_OFF
-        self._cfg = cfg
-        if cfg.mode == MODE_OFF:
-            self._gain_db = 0.0
-            self._ramping = False
-            self._ramp_from = 0.0
-            self._ramp_to = 0.0
-            self._ramp_done_frames = RAMP_FRAMES
-            self._fallback = False
-            return
-        if cfg.mode != MODE_FOLLOW_MIC:
-            self._fallback = False
-        if was_off:
-            self._set_gain(self._compute_gain(self._gain_db, self._last_tts_db,
-                                              self._last_peak_db, limit_step=False))
+        with self._lock:
+            was_off = self._cfg.mode == MODE_OFF
+            self._cfg = cfg
+            if cfg.mode == MODE_OFF:
+                self._gain_db = 0.0
+                self._ramping = False
+                self._ramp_from = 0.0
+                self._ramp_to = 0.0
+                self._ramp_done_frames = RAMP_FRAMES
+                self._fallback = False
+                return
+            if cfg.mode != MODE_FOLLOW_MIC:
+                self._fallback = False
+            if was_off:
+                self._set_gain(self._compute_gain(self._gain_db, self._last_tts_db,
+                                                  self._last_peak_db, limit_step=False))
 
     @property
     def cfg(self) -> LevelConfig:
-        return self._cfg
+        with self._lock:
+            return self._cfg
 
     def gain_db(self) -> float:
-        return self._gain_db
+        with self._lock:
+            return self._gain_db
 
     def mic_db(self) -> float | None:
-        if self._mic_db is None:
-            return None
-        try:
-            return self._mic_db()
-        except Exception:                                    # noqa: BLE001
-            return None
+        with self._lock:
+            if self._mic_db is None:
+                return None
+            try:
+                return self._mic_db()
+            except Exception:                                # noqa: BLE001
+                return None
 
     def status(self) -> dict:
-        """给 UI 读数用（`—` 由 UI 判 None 决定，这里只给原始值）。"""
-        headroom = None
-        if self._last_peak_db is not None:
-            headroom = self._cfg.ceiling_dbfs - (self._last_peak_db + self._gain_db)
-        return {
-            "mode": self._cfg.mode,
-            "mic_db": self.mic_db(),
-            "tts_db": self._last_tts_db,
-            "gain_db": self._gain_db,
-            "headroom_db": headroom,
-            "fallback": self._fallback,
-        }
+        """给 UI 读数用（`—` 由 UI 判 None 决定，这里只给原始值）。
+
+        整体持锁：四个字段必须来自**同一瞬间**的快照，否则界面会显示
+        「增益是新的、余量是旧的」这种自相矛盾的读数。
+        """
+        with self._lock:
+            headroom = None
+            if self._last_peak_db is not None:
+                headroom = self._cfg.ceiling_dbfs - (self._last_peak_db + self._gain_db)
+            return {
+                "mode": self._cfg.mode,
+                "mic_db": self.mic_db(),
+                "tts_db": self._last_tts_db,
+                "gain_db": self._gain_db,
+                "headroom_db": headroom,
+                "fallback": self._fallback,
+            }
 
     # ---- 句尾重算 ----
 
     def note_sentence_end(self) -> float:
         """一句译音说完：用**刚说完这句**的实测重算增益，返回新增益（dB）。"""
-        prev = self._gain_db
-        self._last_tts_db = self._tts.level_db()
-        self._last_peak_db = self._tts.peak_db()
-        self._tts.reset()
-        self._set_gain(self._compute_gain(prev, self._last_tts_db, self._last_peak_db))
-        return self._gain_db
+        with self._lock:
+            prev = self._gain_db
+            self._last_tts_db = self._tts.level_db()
+            self._last_peak_db = self._tts.peak_db()
+            self._tts.reset()
+            self._set_gain(self._compute_gain(prev, self._last_tts_db, self._last_peak_db))
+            return self._gain_db
 
     def _compute_gain(self, prev: float, tts_db: float | None,
                       peak_db: float | None, *, limit_step: bool = True) -> float:
@@ -564,43 +586,56 @@ class LevelMatcher:
 
         **输出字节数与输入完全一致**（下游抖动缓冲要靠它算时长）。`mode=off` 走短路，
         逐字节原样返回 —— 与升级前行为一致，且不付任何测量开销。
-        """
-        if not pcm_48k_stereo_s16:
-            return pcm_48k_stereo_s16
-        if self._cfg.mode == MODE_OFF:
-            # 防御：off 期间永远走不到下面的斜坡推进，挂着 `_ramping` 只会让切回来的
-            # 第一句从旧增益斜到 0（`set_config` 进 off 时已经清过一次）。
-            self._ramping = False
-            self._ramp_done_frames = RAMP_FRAMES
-            return pcm_48k_stereo_s16
-        self._tts.feed(pcm_48k_stereo_s16)
-        if self._gain_db == 0.0 and not self._ramping:
-            return pcm_48k_stereo_s16
-        arr = np.frombuffer(pcm_48k_stereo_s16, dtype="<i2")
-        if arr.size == 0:
-            return pcm_48k_stereo_s16
-        frames = arr.size // 2
-        if frames <= 0:
-            return pcm_48k_stereo_s16
-        # 48k 立体声恒为偶数个样本；万一来一个落单样本，也别让 reshape 抛 —— 原样带回，
-        # 保证「输出字节数 == 输入字节数」这条硬约束不破。
-        tail = pcm_48k_stereo_s16[frames * 4:]
-        x = arr[:frames * 2].astype(np.float64).reshape(frames, 2)
-        flat = 10.0 ** (self._gain_db / 20.0)
 
-        if self._ramping:
-            left = max(0, RAMP_FRAMES - self._ramp_done_frames)
-            n = min(left, frames)
-            gains = np.full(frames, flat, dtype=np.float64)
-            if n > 0:
-                ramp = np.linspace(self._ramp_from, self._ramp_to, n, endpoint=False)
-                gains[:n] = 10.0 ** (ramp / 20.0)
-            self._ramp_done_frames += frames
-            if self._ramp_done_frames >= RAMP_FRAMES:
+        整段在 `_lock` 里（见类 docstring）：本方法有两个线程在调，句首斜坡的
+        推进与 `_tts` 的累积都是读改写。
+        """
+        with self._lock:
+            if not pcm_48k_stereo_s16:
+                return pcm_48k_stereo_s16
+            if self._cfg.mode == MODE_OFF:
+                # 防御：off 期间永远走不到下面的斜坡推进，挂着 `_ramping` 只会让切回来的
+                # 第一句从旧增益斜到 0（`set_config` 进 off 时已经清过一次）。
                 self._ramping = False
                 self._ramp_done_frames = RAMP_FRAMES
-        else:
-            gains = np.full(frames, flat, dtype=np.float64)
+                return pcm_48k_stereo_s16
+            self._tts.feed(pcm_48k_stereo_s16)
+            if self._gain_db == 0.0 and not self._ramping:
+                return pcm_48k_stereo_s16
+            arr = np.frombuffer(pcm_48k_stereo_s16, dtype="<i2")
+            if arr.size == 0:
+                return pcm_48k_stereo_s16
+            frames = arr.size // 2
+            if frames <= 0:
+                return pcm_48k_stereo_s16
+            # 48k 立体声恒为偶数个样本；万一来一个落单样本，也别让 reshape 抛 —— 原样带回，
+            # 保证「输出字节数 == 输入字节数」这条硬约束不破。
+            tail = pcm_48k_stereo_s16[frames * 4:]
+            x = arr[:frames * 2].astype(np.float64).reshape(frames, 2)
+            flat = 10.0 ** (self._gain_db / 20.0)
 
-        out = _scale_and_limit(x, gains[:, None], self._cfg.ceiling_dbfs)
-        return out + tail if tail else out
+            if self._ramping:
+                left = max(0, RAMP_FRAMES - self._ramp_done_frames)
+                n = min(left, frames)
+                gains = np.full(frames, flat, dtype=np.float64)
+                if n > 0:
+                    # ⚠️ 按**已走帧数**切片，不是每次都从 0 铺满整条斜坡：块长可以小于
+                    # 20ms（Linux 的 `pw-cat` 泵实测 5ms/块），从 0 重铺就会让每个块边界
+                    # 把整条斜坡重来一遍（实测每块首帧 −0.65 dB、末帧 −11.95 dB，第 5 块
+                    # 才恒 −12）→ 听感是 ~200Hz 的泵动/锯齿。
+                    # 首块 ≥ 20ms 时 t = 0..n−1 与原来的 `linspace(from, to, n,
+                    # endpoint=False)` 逐步等价 —— 既有行为不变。
+                    t = np.arange(self._ramp_done_frames, self._ramp_done_frames + n,
+                                  dtype=np.float64)
+                    ramp = (self._ramp_from
+                            + (self._ramp_to - self._ramp_from) * (t / RAMP_FRAMES))
+                    gains[:n] = 10.0 ** (ramp / 20.0)
+                self._ramp_done_frames += frames
+                if self._ramp_done_frames >= RAMP_FRAMES:
+                    self._ramping = False
+                    self._ramp_done_frames = RAMP_FRAMES
+            else:
+                gains = np.full(frames, flat, dtype=np.float64)
+
+            out = _scale_and_limit(x, gains[:, None], self._cfg.ceiling_dbfs)
+            return out + tail if tail else out

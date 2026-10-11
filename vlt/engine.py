@@ -28,7 +28,7 @@ from .platform.base import LoopbackTarget
 from .output.chatbox import Chatbox, TokenBucket
 from .output.merger import Merger
 from .output.overlay import OverlayConfig
-from .output.level_match import LevelConfig, LevelMatcher, format_db
+from .output.level_match import LevelConfig, LevelMatcher, block_db, format_db
 from .output.level_match import MODE_OFF as LEVEL_MODE_OFF
 from .output.virtualmic import VirtualMic, pick_output_device, resample_24k_mono_to_48k_stereo
 from .session.base import SessionConfig, TextDelta, create_session
@@ -161,22 +161,15 @@ def chunk_level_db(chunk: bytes) -> float:
     用 **RMS** 而不是峰值：峰值只反映块里最响的那几个采样 —— 按键、咳嗽、音效
     的一个尖刺就能把峰值顶上来，但它不代表「这句话整体有多响」。远处玩家小声说话
     的块峰值可能偶发偏高、RMS 却一直很低，正是要拦的对象。
+
+    实现**只有一份**：委托给 `level_match.block_db`（本模块已经 import 它，engine →
+    output.level_match 是单向依赖，反向不成环）。以前两处各写一份同语义实现 ——
+    改一处忘另一处就是两个口径。
     """
-    if not chunk:
-        return LEVEL_FLOOR_DB
-    arr = np.frombuffer(chunk, dtype="<i2")
-    if arr.size == 0:
-        return LEVEL_FLOOR_DB
-    x = arr.astype(np.float64) / 32768.0
-    rms = float(np.sqrt(float(np.mean(x * x))))
-    if rms <= 0.0:
-        return LEVEL_FLOOR_DB
-    return max(LEVEL_FLOOR_DB, 20.0 * float(np.log10(rms)))
+    return block_db(chunk)
 
 
-# 注：`vlt/output/level_match.py` 里**刻意**另存了一份同语义的私有 `_block_db`。
-# 那边不能 import 本模块 —— engine 已经 import output.virtualmic，反向 import 就成环。
-# dB 读数的格式化则**只有一份**：`level_match.format_db`（本模块与 gui_proxy 都 import 它）。
+# dB 读数的格式化同样**只有一份**：`level_match.format_db`（本模块与 gui_proxy 都 import 它）。
 
 
 def input_gate_settings(base: dict | None) -> tuple[bool, float, float, int]:
@@ -730,7 +723,7 @@ class Engine:
             return                       # 稳态：增益几乎没动，不打（否则每句刷一行）
         self._level_logged_gain = gain
         print(f"[level] 译音音量：麦克风 {format_db(st.get('mic_db'))} dBFS | "
-              f"译音 {format_db(st.get('tts_db'))} dBFS | 增益 {gain:+.1f} dB | "
+              f"译音 {format_db(st.get('tts_db'))} dBFS | 增益 {format_db(gain)} dB | "
               f"峰值余量 {format_db(st.get('headroom_db'))} dB", flush=True)
 
     @property

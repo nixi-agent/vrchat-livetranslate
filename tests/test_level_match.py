@@ -5,16 +5,17 @@
 和 `tests/test_micproxy.py` 一样是**单文件脚本**：全绿打印 `ALL PASSED` 并退出 0。
 
 覆盖 .qoder-brief.md §3 的五组，外加评审后补的四组回归：
-  1. 块电平 `_block_db`（已知幅度正弦 / 全零静音）
+  1. 块电平 `block_db`（已知幅度正弦 / 全零静音；engine.chunk_level_db 委托到这里）
   2. `apply_gain_db`（0 dB 逐字节相等 / −6 dB / 正增益的天花板限幅）
   3. `MicReference`（中位数、样本门槛、有效期、抗尖峰、静音不得出结论）
   4. 增益计算（四档麦克风参考电平、峰值限幅把 +4 压到 +1.2、限速收敛）
   5. 参考取不到（保住上一次增益 / 从头到尾没拿到 → 回落固定增益）
   6. off→on：进 off 清斜坡状态、切回来**立刻**重算到新目标（不被限速）；fixed 清过期 fallback
-  7. 单一实现：「增益+限幅→字节」与 dB 读数格式各只有一份（两条路逐字节相同）
+  7. 单一实现：「增益+限幅→字节」/ 块电平 / dB 读数格式各只有一份（两条路逐字节相同）
   8. 配置层一致性：`vlt/config.py` 的默认值/区间 == `level_match` 的 `DEFAULT_*`/`RANGES`
      （靠测试钉，而不是让 config.py 反向 import output 包），以及 `_float_in_range` / `_str_choice`
-  9. `MicReference` 跨线程（泵线程 feed vs Tk 线程读数）无异常、不丢块
+  9. 跨线程（泵/音频线程 vs Tk 线程）：`MicReference` 无异常不丢块、`LevelMatcher` 互斥成立
+ 10. 句首斜坡在**短块**（< 20ms/块）下必须接着走，不许每个块边界重铺一遍
 """
 from __future__ import annotations
 
@@ -83,29 +84,29 @@ def _speech_like(rms_db: float, peak_db: float, seconds: float, *,
     return base.astype("<i2").tobytes()
 
 
-# ------------------------------------------------------- 1. 块电平 _block_db
+# ------------------------------------------------------- 1. 块电平 block_db
 
 def test_block_db_known_sine():
-    """已知幅度正弦 → `_block_db` 与解析值差 < 0.5 dB；全零 → LEVEL_FLOOR_DB。"""
+    """已知幅度正弦 → `block_db` 与解析值差 < 0.5 dB；全零 → LEVEL_FLOOR_DB。"""
     amp = 10000
     n = 1600                                            # 100ms @16k = 整数个 1kHz 周期
     pcm = _sine(amp, n)
-    got = LM._block_db(pcm)
+    got = LM.block_db(pcm)
     want = 20.0 * math.log10(amp / 32768.0 / math.sqrt(2.0))
     assert abs(got - want) < 0.5, f"块电平 {got:.2f} 与解析值 {want:.2f} 差太远"
 
-    assert LM._block_db(_silence(n)) == LEVEL_FLOOR_DB, "纯数字静音必须回落 LEVEL_FLOOR_DB"
-    assert LM._block_db(b"") == LEVEL_FLOOR_DB, "空块必须回落 LEVEL_FLOOR_DB"
+    assert LM.block_db(_silence(n)) == LEVEL_FLOOR_DB, "纯数字静音必须回落 LEVEL_FLOOR_DB"
+    assert LM.block_db(b"") == LEVEL_FLOOR_DB, "空块必须回落 LEVEL_FLOOR_DB"
 
     # 半幅度 → 正好低 6 dB（顺带钉住「dB 是 20·log10 而不是 10·log10」）
-    half = LM._block_db(_sine(amp / 2.0, n))
+    half = LM.block_db(_sine(amp / 2.0, n))
     assert abs((got - half) - 6.02) < 0.5, f"半幅度应低约 6 dB，实测差 {got - half:.2f}"
 
     peak = LM._peak_db(_sine(amp, n))
     want_peak = 20.0 * math.log10(amp / 32768.0)
     assert abs(peak - want_peak) < 0.5, f"峰值 {peak:.2f} 与解析值 {want_peak:.2f} 差太远"
     assert LM._peak_db(_silence(n)) == LEVEL_FLOOR_DB
-    print(f"  _block_db：正弦 {got:.2f} dBFS（解析 {want:.2f}）、静音回落 "
+    print(f"  block_db：正弦 {got:.2f} dBFS（解析 {want:.2f}）、静音回落 "
           f"{LEVEL_FLOOR_DB:g}、峰值 {peak:.2f} dBFS OK")
 
 
@@ -127,8 +128,8 @@ def test_apply_gain_db_minus_six():
     pcm = _sine(10000, n)
     out = apply_gain_db(pcm, -6.0)
     assert len(out) == len(pcm), f"输出字节数必须与输入一致：{len(out)} != {len(pcm)}"
-    before = LM._block_db(pcm)
-    after = LM._block_db(out)
+    before = LM.block_db(pcm)
+    after = LM.block_db(out)
     delta = before - after
     assert abs(delta - 6.0) < 0.1, f"−6 dB 应让 RMS 掉 6.0 dB，实测掉 {delta:.3f}"
     print(f"  apply_gain_db(−6 dB)：RMS {before:.2f} → {after:.2f}（差 {delta:.3f} dB）OK")
@@ -491,6 +492,47 @@ def test_apply_preserves_length_and_ramps():
           f"之后恒定 {mean:+.2f} dB（抖动 {spread:.3f}）OK")
 
 
+def test_ramp_continues_across_short_chunks():
+    """★ 首块短于 20ms 时，斜坡必须**接着走**，不许每块从 0 重铺一遍（实测回归）。
+
+    复现口径（末影猫用 5ms/块复现）：增益 0 → −12 dB 后按 5ms（240 帧）块喂。修复前每块
+    都从 −0.65 dB 重来、末帧 −11.95 dB（听感 ~200Hz 泵动/锯齿），第 5 块才恒 −12；
+    修复后增益沿斜坡**单调**走到 −12 并保持恒定。
+    """
+    m = LevelMatcher(LevelConfig(mode=MODE_FOLLOW_MIC, fixed_gain_db=0.0, max_step_db=12.0),
+                     mic_db=lambda: -30.0)
+    m.apply(_speech_like(-18.0, -2.2, 0.1))            # 首句（增益仍 0，短路）
+    g = m.note_sentence_end()
+    assert abs(g - (-12.0)) < 0.2, f"用例前提：先把增益推到 −12 dB，实际 {g:+.3f}"
+
+    short = _speech_like(-18.0, -2.2, 0.005)           # 5ms @48k 立体声 = 240 帧
+    frames = len(short) // 4
+    assert 0 < frames < LM.RAMP_FRAMES, \
+        f"用例前提：块要比 20ms 斜坡短（{frames} < {LM.RAMP_FRAMES}）"
+    src = np.frombuffer(short, dtype="<i2").astype(np.float64).reshape(-1, 2)[:, 0]
+    loud = np.abs(src) > 500
+
+    def _gain_of(pcm_out: bytes) -> float:
+        dst = np.frombuffer(pcm_out, dtype="<i2").astype(np.float64).reshape(-1, 2)[:, 0]
+        assert int(np.count_nonzero(loud)) > 10, "5ms 块里可比样本太少"
+        return float(np.mean(20.0 * np.log10(np.abs(dst[loud]) / np.abs(src[loud]))))
+
+    per_chunk = []
+    for _ in range(6):
+        out = m.apply(short)
+        assert len(out) == len(short), "输出字节数必须恒等于输入"
+        per_chunk.append(_gain_of(out))
+    readable = ["%+.2f" % x for x in per_chunk]
+
+    assert per_chunk[0] > -2.5, f"第一块应从上一次增益（0 dB）起步，实测 {per_chunk[0]:+.2f}"
+    for i in (1, 2, 3):
+        assert per_chunk[i] < per_chunk[i - 1] - 1.0, (
+            f"第 {i} 块的增益没有继续往下走 —— 斜坡被每个块边界重铺了一遍：{readable}")
+    assert all(abs(per_chunk[i] - (-12.0)) < 0.6 for i in (4, 5)), \
+        f"20ms 斜坡走完后（第 4 块起）必须恒定 −12 dB：{readable}"
+    print(f"  短块斜坡：5ms/块 6 块增益 {readable}（单调走低 → 恒定 −12）OK")
+
+
 def test_follow_mic_reference_unavailable():
     """参考取不到：保住上一次增益（不归零、不炸）；从头到尾没拿到 → 回落 fixed_gain_db。"""
     # A. 从来没拿到过参考 → 回落 fixed_gain_db，并置 fallback
@@ -733,6 +775,33 @@ def test_gain_and_ceiling_have_one_implementation():
           f"+12 dB 被限到 {got:+.2f} dBFS（无削波样本）OK")
 
 
+def test_block_level_has_one_implementation():
+    """★ 「块电平」只许有**一份**实现：`level_match.block_db`（engine.chunk_level_db 委托它）。
+
+    以前 engine.chunk_level_db 与 level_match 里那份各写一份同语义代码，注释给的理由是
+    「不能反向 import 成环」—— 但 engine **本来就** import level_match（单向），反向委托
+    并不成环。这里既钉源码形态（engine 那份只许是转发），也钉两条路数值一致。
+    """
+    import vlt.engine as engine_mod
+
+    root = Path(LM.__file__).resolve().parents[2]
+    lm_src = Path(LM.__file__).read_text(encoding="utf-8")
+    eng_src = (root / "vlt" / "engine.py").read_text(encoding="utf-8")
+    assert lm_src.count("def block_db") == 1, "块电平只该有一份实现"
+    assert "return block_db(chunk)" in eng_src, \
+        "engine.chunk_level_db 必须委托给 level_match.block_db"
+    assert 'np.frombuffer(chunk, dtype="<i2")' not in eng_src, \
+        "engine 里不该再有一份自己的块电平实现（那份已删）"
+
+    for amp, n in ((10000, 1600), (3000, 4800), (1, 480)):
+        pcm = _sine(amp, n)
+        a, b = engine_mod.chunk_level_db(pcm), LM.block_db(pcm)
+        assert a == b, f"两条路必须逐位一致：engine {a!r} vs level_match {b!r}"
+    assert engine_mod.chunk_level_db(b"") == LEVEL_FLOOR_DB
+    assert engine_mod.chunk_level_db(_silence(480)) == LEVEL_FLOOR_DB
+    print("  块电平单一实现：engine.chunk_level_db → level_match.block_db（源码形态 + 三档幅度逐位一致）OK")
+
+
 def test_format_db_is_the_only_formatter():
     """★ dB 读数格式只许有**一份**（`level_match.format_db`）；engine / gui_proxy 都 import 它。"""
     assert LM.format_db(None) == "—", "没有测量值必须是 —（不许拿 0.0 冒充「测到 0 dBFS」）"
@@ -748,8 +817,17 @@ def test_format_db_is_the_only_formatter():
     assert "format_db" in eng, "engine 必须改用共享的 format_db"
     assert "from .output.level_match import format_db" in gui, \
         "gui_proxy 必须从 level_match import format_db"
+    # 光删旧函数名抓不到**内联**的第二份实现：`f"{gain:+.1f} dB"` 照样能绕过上面两条断言
+    # （实测 engine.py:733 / gui_proxy.py:451 各留了一处）。所以把格式字面量本身当判据扫全仓。
+    hits = []
+    for path in sorted((root / "vlt").rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if "+.1f" in text:
+            hits.append(f"{path.relative_to(root).as_posix()} ×{text.count('+.1f')}")
+    assert hits == ["vlt/output/level_match.py ×1"], \
+        f"`+.1f` 只许出现在 level_match.format_db 这一处，实际：{hits}"
     print("  format_db：None → —、0.0 → +0.0、一位小数；engine/gui_proxy 各自的重复实现已删，"
-          "两处都 import 同一份 OK")
+          "两处都 import 同一份，且全仓再无内联 `+.1f` OK")
 
 
 # ------------------------------------- 6. 配置层与 level_match 的口径一致性（#8）
@@ -946,7 +1024,7 @@ def test_config_float_in_range_and_str_choice():
           "ceiling_dbfs 开区间拒 0 收 −0.01，YAML `off`→False 已还原（端到端读回字符串 'off'）OK")
 
 
-# ------------------------------------------------- 7. MicReference 线程安全（#10）
+# --------------------------------- 7. 跨线程 / 单一实现 / 离线约束（#8 #10 + 复审）
 
 def test_mic_reference_is_thread_safe():
     """★ `feed` 跑在代理的麦克风泵线程，`db`/`valid`/`count` 跑在 Tk 线程（500ms 读数 tick）。
@@ -1025,6 +1103,92 @@ def test_mic_reference_is_thread_safe():
           "db() 不改队列 OK")
 
 
+def test_level_matcher_is_thread_safe():
+    """★ `LevelMatcher` 的共享态也要互斥：`apply()` 有**两个**调用者。
+
+    说话译音走 `Engine._on_audio`（事件循环线程），打字译音走 `Engine._speak_stream`
+    （`asyncio.to_thread` 的工作线程）——而 `_speak_lock` 只串行化两条「打字」路径，管不到
+    说话那条腿。两句重叠时 `_tts._sumsq/_n/_peak`（`+=` 会丢更新）与
+    `_ramping/_ramp_done_frames` 会被交错读改写：句子电平互相污染、句首斜坡丢帧。
+
+    这条用例**钉的是互斥本身**，不是「恰好没抛异常」：把一个记录并发进入次数的
+    `TranslatedLevel` 换进 `_tts`，只要两线程能同时进 `apply()`，`feed` 就会被并发进入
+    （修复前实测会 ≥2）——「全绿」区分不出空转的用例和有效的用例，所以判据必须是
+    「互斥成立」这种**去掉锁就必然变红**的性质。
+    """
+    import threading
+    import time
+
+    m = LevelMatcher(LevelConfig(mode=MODE_FIXED, fixed_gain_db=-6.0))
+    lock = getattr(m, "_lock", None)
+    assert lock is not None and hasattr(lock, "acquire") and hasattr(lock, "release"), \
+        "LevelMatcher 必须自带一把锁（_cfg/_gain_db/_ramping/_ramp_*/_tts 都是共享态）"
+    assert "_lock" in LevelMatcher.__slots__, "__slots__ 里漏了 _lock"
+
+    class _OverlapWatch(TranslatedLevel):
+        """只多一个「同一时刻有几个人在 feed 里」的计数器，其余是真实现。"""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._inside = 0
+            self.max_inside = 0
+            self._guard = threading.Lock()
+
+        def feed(self, pcm_s16: bytes) -> None:
+            with self._guard:
+                self._inside += 1
+                self.max_inside = max(self.max_inside, self._inside)
+            time.sleep(0.002)               # 放大窗口：2ms 足够让另一个线程挤进来
+            try:
+                super().feed(pcm_s16)
+            finally:
+                with self._guard:
+                    self._inside -= 1
+
+    watch = _OverlapWatch()
+    m._tts = watch                          # 只替换累积器；apply 的其余逻辑走真实现
+    block = _speech_like(-18.0, -2.2, 0.1)
+    errors: list[Exception] = []
+    stop = threading.Event()
+
+    def _audio_thread() -> None:
+        try:
+            for _ in range(60):
+                out = m.apply(block)
+                assert len(out) == len(block), "输出字节数必须恒等于输入"
+        except Exception as exc:                            # noqa: BLE001
+            errors.append(exc)
+
+    def _ui_thread() -> None:
+        try:
+            while not stop.is_set():
+                m.status()
+                m.gain_db()
+                m.mic_db()
+                m.cfg
+                m.set_config(LevelConfig(mode=MODE_FIXED, fixed_gain_db=-6.0))
+        except Exception as exc:                            # noqa: BLE001
+            errors.append(exc)
+
+    audio = [threading.Thread(target=_audio_thread, daemon=True) for _ in range(3)]
+    ui = threading.Thread(target=_ui_thread, daemon=True)
+    ui.start()
+    for th in audio:
+        th.start()
+    for th in audio:
+        th.join(timeout=30.0)
+    stop.set()
+    ui.join(timeout=10.0)
+
+    assert not errors, f"并发下抛异常了：{errors[:3]}"
+    assert not any(th.is_alive() for th in audio + [ui]), "有线程没退（锁没放？）"
+    assert watch.max_inside == 1, (
+        f"{watch.max_inside} 个线程同时进了 apply()（_tts.feed 被并发进入）—— "
+        "斜坡推进与电平累积会丢更新，必须全部进 _lock")
+    print(f"  线程安全（LevelMatcher）：3 音频线程 × 60 块 + 1 界面线程并发无异常；"
+          f"_tts.feed 最大并发进入 = {watch.max_inside}（互斥成立）OK")
+
+
 def test_module_has_no_device_or_engine_dependency():
     """本模块必须**离线**：不 import engine（会成环）、不 import 任何音频设备库。
 
@@ -1095,6 +1259,7 @@ if __name__ == "__main__":
     test_follow_mic_tracks_reference_levels()
     test_follow_mic_offset_and_limits()
     test_apply_preserves_length_and_ramps()
+    test_ramp_continues_across_short_chunks()
     test_follow_mic_reference_unavailable()
     test_first_sentence_uses_prev_gain_no_buffering()
     test_set_config_hot_update()
@@ -1102,10 +1267,12 @@ if __name__ == "__main__":
     test_off_to_on_clears_ramp_and_recomputes_at_once()
     test_fixed_mode_clears_stale_fallback()
     test_gain_and_ceiling_have_one_implementation()
+    test_block_level_has_one_implementation()
     test_format_db_is_the_only_formatter()
     test_config_layer_matches_level_match()
     test_config_float_in_range_and_str_choice()
     test_load_level_hermetic_against_saved_key()
     test_mic_reference_is_thread_safe()
+    test_level_matcher_is_thread_safe()
     test_module_has_no_device_or_engine_dependency()
     print("ALL PASSED")

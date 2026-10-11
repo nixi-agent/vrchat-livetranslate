@@ -448,7 +448,7 @@ class ProxyMethods:
         lbl = getattr(self, "_level_gain_lbl", None)
         if lbl is not None:
             try:
-                lbl.configure(text="—" if gain is None else f"{float(gain):+.1f} dB")
+                lbl.configure(text="—" if gain is None else f"{format_db(gain)} dB")
             except Exception:                        # noqa: BLE001
                 pass
         line = getattr(self, "_level_readout_lbl", None)
@@ -493,6 +493,29 @@ class ProxyMethods:
                 except Exception:                    # noqa: BLE001
                     mic = None
         return mic, tts, gain
+
+    def _cancel_level_tick(self, _event=None) -> None:  # noqa: ANN001
+        """取消挂起的 500ms 读数 tick（幂等）。设置窗 / 根窗被**销毁**时调用。
+
+        为什么不走 `_refresh_level_readout()` 的「不可见就停」那条路：它得先问一句
+        「窗口可见吗」才发现自己该停，而窗口已经销毁时连 `winfo_viewable()` 都要靠异常兜；
+        更要紧的是**挂起的 `after` 还挂在 root 上**，Tk 收尾时会带着一个已经死掉的命令名
+        到点，打一行 `invalid command name "..._refresh_level_readout"`（这是末影猫 L5 报的
+        收尾噪音）。`<Destroy>` 事件在「关程序销毁根窗」时也会传到设置窗上，所以这一处绑定
+        把两种收尾（销毁设置窗 / 销毁根窗）都盖到。
+
+        绑在设置窗上还有一个好处：生产路径（`withdraw`）**不销毁**窗口，所以这条绑定在
+        正常使用中一次都不会触发，纯兜底。
+        """
+        job = getattr(self, "_level_readout_job", None)
+        self._level_readout_job = None
+        root = getattr(self, "_root", None)
+        if job is None or root is None:
+            return
+        try:
+            root.after_cancel(job)
+        except Exception:                            # noqa: BLE001 — 收尾路径绝不抛
+            pass
 
     def _settings_win_viewable(self) -> bool:
         """设置窗此刻是不是真看得见（withdrawn / 已销毁都算看不见）。"""

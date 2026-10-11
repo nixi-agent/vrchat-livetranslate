@@ -206,12 +206,13 @@ def _gui(body: str):
         yield gui, cfg_path
     finally:
         if gui is not None:
-            try:
-                gui._stop_gate_probe()                 # noqa: SLF001
-                gui._close_settings()                  # noqa: SLF001
-                gui._root.destroy()                    # noqa: SLF001
-            except Exception:                          # noqa: BLE001
-                pass
+            # 逐步兜：某一步失败（例：用例自己把设置窗**销毁**过，`withdraw()` 会 TclError）
+            # 不该把后面的收尾一起跳过 —— 少一步销毁根窗就会把窗口/解释器留在进程里。
+            for step in (gui._stop_gate_probe, gui._close_settings, gui._root.destroy):
+                try:
+                    step()
+                except Exception:                      # noqa: BLE001
+                    pass
         (config_mod.DEFAULT_CONFIG, gui_mod.DEFAULT_CONFIG,
          gui_audio_mod.LevelProbe, gui_mod.LevelProbe) = saved
         for k, v in saved_env.items():
@@ -526,6 +527,50 @@ def test_readout_tick_only_while_settings_visible() -> None:
           "关窗→取消且不再爬起来")
 
 
+def test_readout_tick_cancelled_on_window_destroy() -> None:
+    """★ 设置窗 / 根窗被**销毁**（而不是走 `close_settings`）时，挂起的读数 tick 必须一起取消。
+
+    末影猫的 L5：`open_settings` 无条件排 500ms tick，收尾若不走 `close_settings`，那个
+    `after` 就带着一个已经死掉的命令名到点 —— Tk 收尾时打一行
+    `invalid command name "..._refresh_level_readout"`。
+
+    判据用**状态**（`_level_readout_job` 还挂不挂着）而不是去抓那行 stderr：本机（Windows）
+    三种收尾方式都没复现出那行（见 PR 说明），所以能被稳定验证的是「挂起的 tick 有没有被
+    取消」—— 取消了，那条噪音在原理上就不可能再出现。
+    """
+    with _gui(_CFG_WITH_LEVEL) as (gui, _cfg_path):
+        assert "<Destroy>" in gui._settings_win.bind(), \
+            "build_settings_dialog 必须把 <Destroy> 绑到取消读数 tick 上"  # noqa: SLF001
+        with _quiet():
+            gui._open_settings()                                    # noqa: SLF001
+            gui._root.update()                                      # noqa: SLF001
+        assert gui._level_readout_job is not None, "前提：打开设置窗后应挂起读数 tick"  # noqa: SLF001
+
+        gui._settings_win.destroy()                                 # 不给 close_settings 机会
+        assert gui._level_readout_job is None, \
+            "设置窗被销毁后必须取消挂起的 tick（否则到点就是 invalid command name）"
+        with _quiet():
+            _pump(gui, 0.3)
+        assert gui._level_readout_job is None, "销毁后不许自己爬起来"   # noqa: SLF001
+        with _quiet():
+            gui._refresh_level_readout()                            # noqa: SLF001
+        assert gui._level_readout_job is None, "窗口已销毁时也不许再排 tick"   # noqa: SLF001
+
+    # 反向：正常收尾（close_settings 后再销毁根窗）仍只留一行「取消」语义，且幂等
+    with _gui(_CFG_WITH_LEVEL) as (gui, _cfg_path):
+        with _quiet():
+            gui._open_settings()                                    # noqa: SLF001
+            gui._root.update()                                      # noqa: SLF001
+        assert gui._level_readout_job is not None                    # noqa: SLF001
+        gui._cancel_level_tick()                                     # noqa: SLF001
+        gui._cancel_level_tick()                                     # 幂等：第二次不许抛
+        assert gui._level_readout_job is None                        # noqa: SLF001
+        with _quiet():
+            gui._close_settings()                                   # noqa: SLF001
+    print("  ✓ 读数 tick：设置窗被销毁（不走 close_settings）→ 挂起的 tick 被取消且不再续期；"
+          "取消本身幂等")
+
+
 # ---------------------------------------------------------------- 入口
 
 
@@ -537,6 +582,7 @@ def main() -> int:
         test_apply_level_config_leaves_trace_and_never_raises,
         test_sync_level_controls_state_follows_mode,
         test_readout_tick_only_while_settings_visible,
+        test_readout_tick_cancelled_on_window_destroy,
     ]
     print("test_level_gui:")
     failed = 0

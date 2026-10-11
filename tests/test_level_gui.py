@@ -607,6 +607,36 @@ def test_child_widget_destroy_does_not_cancel_readout_tick() -> None:
           "（<Destroy> 已按 e.widget is win 过滤）")
 
 
+def test_readout_tick_cancelled_when_root_destroyed() -> None:
+    """★ 关程序那条路径：销毁**根窗**时，设置窗上的 `<Destroy>` 仍必须取消挂起的读数 tick。
+
+    这是那个绑定的**原始目的**（末影猫 L5：收尾时那个 `after` 带着已经死掉的命令名到点，
+    Tk 打一行 `invalid command name "..._refresh_level_readout"`），但 #91 的两条用例
+    只覆盖了「销毁设置窗本身」与「销毁子控件」——「关程序 → 根窗连带销毁设置窗」这条
+    **没人守**。#91 给绑定加了 `e.widget is win` 过滤：这条路径上 `e.widget` 必须仍是
+    设置窗自己，否则过滤会把收尾保障一起丢掉，而现象上完全看不出来（本机三种收尾
+    都不打那行噪音，见上一个用例的注脚）。
+
+    判据只能是**状态**（`_level_readout_job`）：根窗销毁后 tick 必须被取消、且不许再爬起来。
+    去掉 `build_settings_dialog` 里那条 `<Destroy>` 绑定、或把过滤写成永不命中，这条都变红。
+    """
+    with _gui(_CFG_WITH_LEVEL) as (gui, _cfg_path):
+        with _quiet():
+            gui._open_settings()                                    # noqa: SLF001
+            gui._root.update()                                      # noqa: SLF001
+        assert gui._settings_win_viewable(), "前提：设置窗此刻应可见"   # noqa: SLF001
+        assert gui._level_readout_job is not None, "前提：打开设置窗后应挂起读数 tick"  # noqa: SLF001
+
+        gui._root.destroy()          # 关程序：根窗销毁连带销毁设置窗（**不走** close_settings）
+        assert gui._level_readout_job is None, \
+            "销毁根窗时设置窗仍须取消挂起的读数 tick（<Destroy> 的 e.widget 过滤不许把它挡掉）"  # noqa: SLF001
+
+        gui._refresh_level_readout()                            # 根窗已死 → 不许再排 tick  # noqa: SLF001
+        assert gui._level_readout_job is None, "根窗已销毁时不许再排 tick"   # noqa: SLF001
+    print("  ✓ 读数 tick：销毁**根窗**（关程序路径，不走 close_settings）→ 设置窗上的 "
+          "<Destroy> 仍取消挂起的 tick，且不再续期")
+
+
 # ---------------------------------------------------------------- 入口
 
 
@@ -620,6 +650,7 @@ def main() -> int:
         test_readout_tick_only_while_settings_visible,
         test_readout_tick_cancelled_on_window_destroy,
         test_child_widget_destroy_does_not_cancel_readout_tick,
+        test_readout_tick_cancelled_when_root_destroyed,
     ]
     print("test_level_gui:")
     failed = 0

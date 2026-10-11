@@ -152,18 +152,20 @@ def test_live_instance_is_reused_not_rebuilt() -> None:
 
 
 # ------------------------------------------------------------------ ②③ 失败要留真因 + 不残留
-def _install_fake_openvr_with_bad_anchor() -> None:
-    """假 openvr：锚点设备没被追踪 —— 复刻真机 `OverlayError_InvalidTrackedDevice`。
+def _install_fake_openvr_with_bad_anchor(err: str = "OverlayError_InvalidTrackedDevice: ") -> None:
+    """假 openvr：应用变换时抛错 —— 复刻真机 `OverlayError_InvalidTrackedDevice`。
 
     真机形态（本机真 SteamVR + null 驱动、无控制器，用户配置 `anchor: right_hand`）：
-        [overlay] ⚠️ 创建 overlay 失败，已禁用（其他输出不受影响）：OverlayError_InvalidTrackedDevice:
-    而 `createOverlay()` 在那之前**已经成功**了 → 旧写法把 overlay 对象留在 SteamVR 里。
+        [overlay] ⚠️ 锚点设备（right_hand）还没被 SteamVR 追踪：面板先留着，每 1s 自动重试
+    而 `createOverlay()` 在那之前**已经成功**了。
+
+    `err` 换一个非锚点类错误（如 `OverlayError_RequestFailed`）时用来验「其它错误照旧判失败」。
     """
     def _factory():  # noqa: ANN202
         ov = fakeov._FakeIVROverlay()
 
         def _boom(handle, device, mat):  # noqa: ANN001, ANN202
-            raise RuntimeError("OverlayError_InvalidTrackedDevice: ")
+            raise RuntimeError(err)
 
         ov.setOverlayTransformTrackedDeviceRelative = _boom
         return ov
@@ -171,9 +173,14 @@ def _install_fake_openvr_with_bad_anchor() -> None:
     fakeov._install_fake_openvr(overlay_factory=_factory)
 
 
-def test_failed_start_destroys_overlay_and_names_the_real_reason() -> None:
-    """start() 失败：① 必须销毁已创建的 overlay（否则留下 KeyInUse 残留）；② 必须报出真因码。"""
-    from vlt.output.overlay import OVERLAY_ERR_ANCHOR, OverlayConfig
+def test_anchor_not_tracked_keeps_panel_for_retry() -> None:
+    """锚点设备没被追踪 → **留住面板**（不许判失败、不许销毁 handle），等 tick 重试贴上去。
+
+    这是用户报的「非翻译模式下勾选手腕屏打不开」的正面修复：旧写法让 start() 返回 False →
+    界面把勾选退回 + 一句「先把 SteamVR 打开」，而用户照着重试永远是白费力气（面板其实
+    建得出来，差的只是「贴到哪台设备上」）。见 `openvr_overlay._maybe_apply_anchor`。
+    """
+    from vlt.output.overlay import OverlayConfig
 
     fakeov.CALLS.clear()
     _install_fake_openvr_with_bad_anchor()
@@ -183,14 +190,35 @@ def test_failed_start_destroys_overlay_and_names_the_real_reason() -> None:
         ok = ov.start()
     out = buf.getvalue()
 
-    assert ok is False, "锚点设备无效时 start() 应返回 False"
+    assert ok is True, "锚点设备没被追踪**不该**让 start() 判失败（用户报的就是这条）"
+    assert ov.pending_anchor is True, "应进入「等锚点」状态（由 tick 重试）"
+    assert ov.available is True and ov.alive is True, "面板必须仍然活着"
+    assert "createOverlay" in [c[0] for c in fakeov.CALLS], "前置条件：createOverlay 应已成功"
+    assert "destroyOverlay" not in [c[0] for c in fakeov.CALLS], (
+        f"不许销毁刚建好的面板（会留成 SteamVR 里的残留 → 下次撞 KeyInUse）：\n{out}")
+    assert "追踪" in out and "重试" in out, f"日志里没写清「面板留着 + 会自动重试」：\n{out}"
+    print("  锚点没被追踪 → 面板留着 + 自动重试（不退回勾选）OK")
+
+
+def test_other_start_failure_destroys_overlay_and_names_the_real_reason() -> None:
+    """非锚点类失败（贴图 / 句柄…）：start() 判失败 → 必须销毁 overlay + 报出真因码。"""
+    from vlt.output.overlay import OVERLAY_ERR_OTHER, OverlayConfig
+
+    fakeov.CALLS.clear()
+    _install_fake_openvr_with_bad_anchor("OverlayError_RequestFailed: ")
+    ov = _RealWristOverlay(OverlayConfig())
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ok = ov.start()
+    out = buf.getvalue()
+
+    assert ok is False, "非锚点类错误必须照旧判失败（别被锚点容错顺手放过）"
     assert "createOverlay" in [c[0] for c in fakeov.CALLS], "前置条件：createOverlay 应已成功"
     assert "destroyOverlay" in [c[0] for c in fakeov.CALLS], (
         f"start() 失败后没有销毁已创建的 overlay（会留成 SteamVR 里的残留 → 下次撞 KeyInUse）：\n{out}")
-    assert ov.last_error == OVERLAY_ERR_ANCHOR, (
-        f"没把真因报成「锚点设备」：{ov.last_error!r}\n{out}")
-    assert "锚点" in out and "追踪" in out, f"日志里没有锚点设备的可行动解释：\n{out}"
-    print("  start() 失败 → 销毁残留 overlay + 报出真因码 OK")
+    assert ov.last_error == OVERLAY_ERR_OTHER, (
+        f"没把真因报成「其它（非锚点）」：{ov.last_error!r}\n{out}")
+    print("  非锚点类失败 → 销毁残留 overlay + 报出真因码 OK")
 
 
 def test_toggle_failure_shows_real_reason_in_status_bar() -> None:
@@ -350,7 +378,8 @@ if __name__ == "__main__":
     print("test_wrist_force_open:")
     test_dead_instance_is_rebuilt_instead_of_silently_returning_true()
     test_live_instance_is_reused_not_rebuilt()
-    test_failed_start_destroys_overlay_and_names_the_real_reason()
+    test_anchor_not_tracked_keeps_panel_for_retry()
+    test_other_start_failure_destroys_overlay_and_names_the_real_reason()
     test_toggle_failure_shows_real_reason_in_status_bar()
     test_not_available_instance_self_heals_on_tick()
     test_reason_codes_cover_the_real_failure_shapes()

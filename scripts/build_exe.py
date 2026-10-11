@@ -51,6 +51,10 @@ HIDDEN = [
     "vlt", "vlt.paths", "vlt.version", "vlt.config", "vlt.credentials", "vlt.crashlog",
     "vlt.devices", "vlt.engine", "vlt.audio_dsp", "vlt.gui", "vlt.app",
     "vlt.session", "vlt.session.base", "vlt.session.qwen38", "vlt.session.qwen35",
+    # 界面语言词表：vlt/i18n.py 用 importlib.import_module(f".locales.{lang}") 按语言码
+    # **动态**加载，静态分析看不到 —— 不列进来的后果不是崩，而是非中文系统的用户界面
+    # **静默回落中文**（exe 无控制台，那行告警谁也看不见）。Linux 侧的 HIDDEN 一直列着。
+    "vlt.locales", "vlt.locales.en", "vlt.locales.ja", "vlt.locales.ko", "vlt.locales.ru",
     "vlt.output", "vlt.output.chatbox", "vlt.output.overlay", "vlt.output.virtualmic",
     "vlt.output.openvr_overlay",        # Windows/SteamVR 手腕屏后端（Linux 产物里没有它）
     "vlt.output.win_d3d11",             # 持久 D3D11 贴图（SetOverlayTexture 上传；Windows 独占）

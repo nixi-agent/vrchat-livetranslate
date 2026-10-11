@@ -209,7 +209,11 @@ def reconcile_modules(exe: Path) -> None:
     # HIDDEN 是「明确要求收进去」的承诺，不许被 allowed_missing 豁免掉：同一个模块
     # 既在 HIDDEN 又在 EXCLUDE_WIN 就是配置自相矛盾（PyInstaller 那边只是各让一步，
     # 结果是「排掉了、对账也过了」，谁都没发现承诺被吞）。
-    both = sorted(allowed_missing & {h for h in HIDDEN if h.startswith("vlt")})
+    # ⚠️ 口径与 allowed_missing 的**前缀**豁免一致（否则 HIDDEN 放 `x.sub` + EXCLUDE_WIN 放 `x`
+    #    时会漏网，而离线用例 test_hidden_is_never_exempted 用前缀语义能抓到 —— 两处口径必须同源）。
+    hidden_vlt = {h for h in HIDDEN if h.startswith("vlt")}
+    both = sorted(h for h in hidden_vlt
+                  if any(h == a or h.startswith(a + ".") for a in allowed_missing))
     if both:
         raise SystemExit(
             f"❌ 这些模块同时出现在 HIDDEN（要求收进产物）与 EXCLUDE_WIN（要求排掉）："

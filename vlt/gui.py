@@ -372,7 +372,14 @@ class TranslationGUI(ProxyMethods):
         self._sync_engine_ctx(); r = gui_engine.start_overlay(self._engine_ctx, force=force); self._overlay_out = self._engine_ctx.overlay_out; self._unsync_engine_ctx(); return r
     def _on_overlay_toggle(self):
         if self._overlay_var.get():
-            if self._start_overlay(force=True): self._set_status("info", t("手腕屏已开启（位置 / 字号等见「设置 → 手腕屏」）"))
+            if self._start_overlay(force=True):
+                # 面板起来了，但锚点设备**还没被追踪**（手柄没醒 / 头显没戴 —— 真机实测那种
+                # `OverlayError_InvalidTrackedDevice`）→ 如实说清：面板留在那儿，设备一被追踪
+                # 它自己会出现，不需要再勾一次（见 openvr_overlay._maybe_apply_anchor）。
+                if getattr(self._overlay_out, "pending_anchor", False):
+                    self._set_status("warn", t("手腕屏已开启，但锚点设备（手柄 / tracker）还没被追踪：唤醒它面板会自动出现（不用重新勾选）"))
+                else:
+                    self._set_status("info", t("手腕屏已开启（位置 / 字号等见「设置 → 手腕屏」）"))
             else:
                 # 退回勾选时把**真因**写进状态栏：旧文案一律说「先把 SteamVR 打开」，
                 # 而真因可能是「锚点手柄没被追踪 / 没头显」（用户照那句话重试是白费力气）。

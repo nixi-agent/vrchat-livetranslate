@@ -408,6 +408,9 @@ STRINGS: dict[str, str] = {
         "\"Settings → Wrist Overlay\"",
     "手腕屏没启动起来，已自动取消勾选：{reason}":
         "The wrist overlay could not start, so the tick was reverted: {reason}",
+    "手腕屏已开启，但锚点设备（手柄 / tracker）还没被追踪：唤醒它面板会自动出现（不用重新勾选）":
+        "The wrist overlay is on, but the anchor device (controller / tracker) is not tracked yet: "
+        "wake it and the panel will appear by itself (no need to tick it again)",
     # ---- 手腕屏起不来的真因（进状态栏；真因不同解药完全不同，别混成一句「先把 SteamVR 打开」）----
     "SteamVR 没在运行或不可用：先启动 SteamVR，再勾一次":
         "SteamVR is not running or not reachable — start it, then tick again",

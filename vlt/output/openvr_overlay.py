@@ -189,6 +189,13 @@ class WristOverlay:
     #: 屏再也不出现，只能重启程序）。见 `_maybe_heal`。
     HEAL_RETRY_S = 15.0
 
+    #: 锚点设备（手柄 / tracker）还没被追踪时，每隔这么久重试一次「应用变换」。
+    #: 只跑在 `tick()` 里（见 `_maybe_apply_anchor`）：面板已经建好、内容也照常刷，
+    #: 差的只是「贴到哪台设备上」—— 设备一就绪面板自己出现，不需要用户再勾一次。
+    ANCHOR_RETRY_S = 1.0
+    #: 每多少次重试才留一行痕（禁静默 + 不淹日志）。
+    ANCHOR_RETRY_LOG_EVERY = 30
+
     def __init__(self, cfg: OverlayConfig, config_path: Path | None = None, dry_run: bool = False) -> None:
         self.cfg = cfg
         self.config_path = config_path
@@ -225,6 +232,12 @@ class WristOverlay:
         self.last_error = ""
         self._closed = False               # close() 过：绝不参与自愈（否则取消勾选后屏会自己回来）
         self._heal_at: float | None = None  # available=False 之后的下一次自愈时间点（见 _maybe_heal）
+        #: 锚点设备（手柄 / tracker）还没被追踪 → **面板留着**，由 tick 里的
+        #: `_maybe_apply_anchor` 定期重试应用变换。见 `start()` 里那段说明：
+        #: 旧写法会让「不戴设备时勾选手腕屏」直接失败并把勾选退回（用户实测报的就是它）。
+        self.pending_anchor = False
+        self._anchor_retry_at = 0.0        # 下一次重试应用变换的时间点（monotonic）
+        self._anchor_tries = 0             # 已重试次数（留痕降噪用）
         self.frames_updated = 0
 
     @property
@@ -302,7 +315,23 @@ class WristOverlay:
             # `if not self.available: return`，否则「创建时应用变换」这一步等于没做
             # （面板会出现但停在默认位置）。
             self.available = True
-            self._apply_transform()
+            # ⚠️ 锚点设备（手柄 / tracker）没被追踪时，`setOverlayTransformTrackedDeviceRelative`
+            #    会抛 `OverlayError_InvalidTrackedDevice`（本机真 SteamVR 实测：SteamVR 明明在跑，
+            #    但没头显 / 手柄没醒）。旧写法让整个 start() 失败 → 界面把勾选退回、还只给一句
+            #    「先把 SteamVR 打开」——用户照它重试纯属白费力气（人在桌面前、手柄就是没醒，
+            #    这正是他报的「非翻译模式下强制打开手腕屏不行」最可能的形态）。
+            #    现在：**面板留着**，进「等锚点」状态，由 `tick()` 的 `_maybe_apply_anchor`
+            #    每 ANCHOR_RETRY_S 重试一次，设备一被追踪面板就自己出现（不用再勾一次）。
+            try:
+                self._apply_transform()
+            except Exception as exc:  # noqa: BLE001
+                if _reason_code(f"{type(exc).__name__}{exc}") != OVERLAY_ERR_ANCHOR:
+                    raise                       # 其它错（句柄/贴图类）照旧判失败，别把真问题掩盖掉
+                self.pending_anchor = True
+                self._anchor_retry_at = time.monotonic() + self.ANCHOR_RETRY_S
+                print(f"[overlay] ⚠️ 锚点设备（{self.cfg.anchor}）还没被 SteamVR 追踪："
+                      f"面板先留着，每 {self.ANCHOR_RETRY_S:.0f}s 自动重试 —— 唤醒手柄 / tracker"
+                      f"（或戴上头显）后它会自己出现，不需要重新勾选", flush=True)
             self._overlay.showOverlay(self._handle)
             # overlay 建好、变换应用完之后，尝试切到「持久 D3D11 贴图 + SetOverlayTexture」路。
             # 这一步**绝不许抛异常**（内部全 try 住）：建不起来就留一行痕、继续用旧的 setOverlayRaw。
@@ -327,8 +356,13 @@ class WristOverlay:
             self._release_handle()
             self.available = False
             return False
-        print(f"[overlay] ✅ 已挂到 {self.cfg.anchor}（device={self._device}），"
-              f"宽 {self.cfg.width_m}m，位置 {self.cfg.pos}")
+        if self.pending_anchor:
+            # 不许打「✅ 已挂到 …」：这会儿锚点还没就绪，面板并没有真的贴到设备上
+            print(f"[overlay] 面板已建好，但锚点 {self.cfg.anchor} 还没被追踪（见上一行）"
+                  f"—— 设备就绪后会自动贴上去", flush=True)
+        else:
+            print(f"[overlay] ✅ 已挂到 {self.cfg.anchor}（device={self._device}），"
+                  f"宽 {self.cfg.width_m}m，位置 {self.cfg.pos}")
         return True
 
     def _anchor_hint(self) -> str:
@@ -827,6 +861,35 @@ class WristOverlay:
                 print(f"[overlay]   showOverlay 失败：{type(exc).__name__}: {exc}")
 
     # ---------- 周期任务：热重载 + 淡出 ----------
+    def _maybe_apply_anchor(self) -> None:
+        """锚点设备还没被追踪 → 定期重试「应用变换」；面板一直留着，设备一就绪就出现。
+
+        为什么必须有它（而不是让 `start()` 直接失败、让用户重勾）：`start()` 那一刻设备往往
+        还没醒（人在桌面前、手柄没拿起来 / 头显没戴），而「设备什么时候被追踪」只有 SteamVR
+        知道。旧写法让勾选被退回，用户按「先把 SteamVR 打开」重试永远是白费力气 —— 面板本身
+        其实建得出来，差的只是「贴到哪台设备上」。见 `start()` 里那段说明。
+
+        ⚠️ 与 `_maybe_heal` 同一套纪律：只跑在 `tick()` 里，`close()` 过的实例绝不复活
+        （否则用户取消勾选后屏会自己回来）；留痕降噪但**绝不静默**。
+        """
+        if not self.pending_anchor or self._closed or not self.available:
+            return
+        now = time.monotonic()
+        if now < self._anchor_retry_at:
+            return
+        self._anchor_tries += 1
+        self._anchor_retry_at = now + self.ANCHOR_RETRY_S
+        try:
+            self._apply_transform()
+        except Exception as exc:  # noqa: BLE001
+            if self._anchor_tries == 1 or self._anchor_tries % self.ANCHOR_RETRY_LOG_EVERY == 0:
+                print(f"[overlay] 锚点 {self.cfg.anchor} 仍未就绪（第 {self._anchor_tries} 次重试）："
+                      f"{type(exc).__name__}（面板留着，不会退回勾选）", flush=True)
+            return
+        self.pending_anchor = False
+        print(f"[overlay] ✅ 锚点 {self.cfg.anchor} 已就绪（重试 {self._anchor_tries} 次）"
+              f"→ 手腕屏面板已出现在该设备上", flush=True)
+
     def _maybe_heal(self) -> None:
         """`available=False` 时**定期**重试接管 SteamVR —— 否则面板再也救不回来（死角）。
 
@@ -851,6 +914,7 @@ class WristOverlay:
         if self.dry_run:
             return
         self._maybe_heal()                 # available=False → 定期重试接管（否则是死角）
+        self._maybe_apply_anchor()         # 锚点设备还没被追踪 → 定期重试贴上去（面板先留着）
         self._maybe_retry_tex_path()       # D3D 路曾不可用 → 到点再试一次（不依赖上传失败）
         if self.config_path and self.config_path.exists():
             mtime = self.config_path.stat().st_mtime
@@ -945,6 +1009,7 @@ class WristOverlay:
 
     def close(self) -> None:
         self._closed = True                # 之后 `alive` 恒为假 + 不再自愈（见 _maybe_heal）
+        self.pending_anchor = False        # 取消勾选后不许「自己出现」（见 _maybe_apply_anchor）
         if self._overlay is not None and self._handle is not None:
             try:
                 self._overlay.destroyOverlay(self._handle)

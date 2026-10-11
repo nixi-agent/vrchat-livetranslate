@@ -18,8 +18,10 @@
     It's really only useful for things you're not going to update more than once... make your own
     graphics device, get the data into a texture, and call SetOverlayTexture."
   · 实测（用户机器，2026-10-11）：旧路连刷 260 次，**第 202 次开始 `OverlayError_RequestFailed`**
-    （与 openvr#1565 的 ~200 次一致）；同机本路（持久贴图 + SetOverlayTexture）连刷 **600 次零失败**
-    （单次 0.44ms，p95 0.78ms）。用户可感知症状：每 ~2.3 分钟手腕屏僵住 4~6 秒。
+    （与 openvr#1565 的 ~200 次一致）。用户可感知症状：每 ~2.3 分钟手腕屏僵住 4~6 秒。
+  · 本路（持久贴图 + SetOverlayTexture）连刷 **700 次零失败**：本机真 SteamVR 用**生产代码**
+    （`scripts/verify_overlay_texture.py --steamvr`）单次 mean **1.52ms**，`IsOverlayVisible` 全程为真；
+    纯 D3D11 上传（`--offline`）单次 mean **0.907ms**。
 
 做法：**自建 D3D11 设备 + 一张只建一次的 `MISC_SHARED` 纹理**，每次刷新只更新它的内容，再把
 **DXGI 共享句柄**交给 `SetOverlayTexture`。没有「每次新分配贴图」，200 次上限与闪烁一起消失。
@@ -57,6 +59,20 @@ render targets`。**注意**：用户机器上 `eType=0` 那几种是**静默不
          D3D11_BIND_SHADER_RESOURCE=8；D3D11_CPU_ACCESS_READ=0x20000；D3D11_MAP_READ=1
          D3D11_SDK_VERSION=7；DRIVER_HARDWARE=1 / WARP=5
          D3D_FEATURE_LEVEL_11_1=0xB100 / 11_0=0xB000
+
+## ⚠️ 已知边界 / 取舍（真机覆盖不到的，写清楚别让人猜）
+
+  1. **混合显卡笔记本**：`D3D11CreateDevice(HARDWARE, pAdapter=None)` 选到的适配器**不保证**
+     等于 SteamVR 合成器渲染用的那块（本机是 i5-12400F 无核显，天然覆盖不到这条路径）。
+     跨适配器打不开共享句柄时预期落成 `OverlayError_InvalidTexture` → 上层永久降级回
+     `setOverlayRaw`（等于把本模块要修的老问题带回来）。**未验**，暂时接受；要彻底解需要
+     按 SteamVR 的适配器 LUID 建同一块设备（`IVRSystem::GetOutputDevice`）。
+  2. **`MISC_SHARED`（非 KeyedMutex）没有生产者/消费者同步**：我们写、合成器读之间无互斥，
+     理论上可能撕裂。面板内容低频（1~2 Hz）、实测未见 → **已知取舍**；要更强保证得换
+     `MISC_SHARED_KEYEDMUTEX` + 双方 AcquireSync。
+  3. **硬重启（`openvr.shutdown()` → `init()`）之后共享句柄重新绑定的真实行为没有真机验证**：
+     单测只断言「重建后又调了一次 `setOverlayTexture`」。旧路上硬重启是救场手段，新路下是否
+     仍有效待真机复核。
 
 ## ⚠️ close() 的两条铁律（血泪坑）
 
@@ -148,8 +164,11 @@ class D3D11Texture:
         self._closed = False
         if base is not None:
             # 复用同一个设备/上下文：只搬方法绑定与句柄，close 时**绝不**释放共享的 device/ctx。
+            # ⚠️ 这里列的是**实际绑定过的东西**：本模块刻意不绑 UpdateSubresource
+            #    （共享纹理不能直写，见 upload），所以不能把 "_update" 放进来 —— 放了必炸
+            #    AttributeError（base= 复用路径一用就挂，实测）。
             for attr in ("driver", "feature_level", "device", "ctx", "_create_texture2d",
-                         "_create_srv", "_update", "_copy", "_map", "_unmap", "_reason"):
+                         "_create_srv", "_copy", "_map", "_unmap", "_reason"):
                 setattr(self, attr, getattr(base, attr))
             self._make_shared_pair(fmt)
             self._owns_device = False

@@ -345,19 +345,24 @@ class WristOverlay:
     def _upload_texture(self, img: Image.Image) -> None:
         """新路：只更新持久 D3D11 纹理的内容，再把它交给 `setOverlayTexture`（不新建任何贴图）。"""
         w, h = img.size
-        try:
-            self._d3d.upload(img.convert("RGBA").tobytes())
-            self._set_overlay_texture()
-        except Exception as exc:  # noqa: BLE001
-            # 「不支持 / InvalidTexture」类错误 = 这条路在这台机器/这个 SteamVR 上根本走不通，
-            # 重试没意义 → **永久回退** setOverlayRaw（只留痕一次），并立刻用旧路补上这一帧。
-            if self._is_texture_unsupported(exc):
-                self._fallback_to_raw_permanently(exc)
-                self._upload_raw(img)
+        # D3D11 上传与 overlay 提交是**两类**问题，必须分开 try：合并成一段时，D3D 侧的
+        # `Map(源纹理) 失败 hr=0x887A0005` 会被报成「setOverlayTexture 失败」，排障方向被带偏
+        # （实测踩过）。op 名进日志，`_on_upload_failure` 才能报出真实那一步。
+        steps = (("D3D11 upload", lambda: self._d3d.upload(img.convert("RGBA").tobytes())),
+                 ("setOverlayTexture", self._set_overlay_texture))
+        for op, call in steps:
+            try:
+                call()
+            except Exception as exc:  # noqa: BLE001
+                # 「不支持 / InvalidTexture」类错误 = 这条路在这台机器/这个 SteamVR 上根本走不通，
+                # 重试没意义 → **永久回退** setOverlayRaw（只留痕一次），并立刻用旧路补上这一帧。
+                if self._is_texture_unsupported(exc):
+                    self._fallback_to_raw_permanently(exc)
+                    self._upload_raw(img)
+                    return
+                # 其它错误（设备丢失 / RequestFailed 等）按现有自愈阶梯走。
+                self._on_upload_failure(exc, op)
                 return
-            # 其它错误（设备丢失 / RequestFailed 等）按现有自愈阶梯走。
-            self._on_upload_failure(exc, "setOverlayTexture")
-            return
         self._on_upload_success(w, h)
 
     def _on_upload_failure(self, exc: Exception, op: str) -> None:
@@ -521,6 +526,18 @@ class WristOverlay:
             return
         if self._fails_in_stage < 3:
             return
+        # D3D11 侧先自检：**设备丢失**（TDR / 驱动重置 / 适配器移除）只有重建「持久纹理」救得回来，
+        # 而下面两级都只修 SteamVR 一侧 —— 不补这道，坏设备会一直挂着：连失败只让
+        # `_recreate_overlay`/`_hard_reinit` 反复重建 SteamVR 侧（还会 shutdown+init openvr），
+        # 面板永远回不来（实测：20 帧后 _d3d 还是那个坏设备，硬重启计数却在涨）。
+        # 只在 none 阶段试一次（成功则计数器由下一次上传结果重置；失败则交给下面两级），避免重建风暴。
+        if (self._d3d is not None and self._recover_stage == "none"
+                and not self._d3d.healthy()):
+            print("[overlay] ♻️ D3D11 设备已丢失 → 重建持久纹理")
+            self._rebuild_d3d()
+            self._recover_stage = "rebuild"    # 再失败就走硬重启那级
+            self._fails_in_stage = 0
+            return
         if self._recover_stage == "none":
             print(f"[overlay] ♻️ 贴图连续失败 {self._upload_fails} 次 → 重建 overlay")
             self._recreate_overlay()
@@ -559,7 +576,11 @@ class WristOverlay:
             self.available = True
             self._apply_transform()
             self._overlay.showOverlay(self._handle)
-            self._set_overlay_texture()      # 新 handle 上没有任何贴图，D3D 路径要重新绑一次
+            if self._d3d is not None and not self._d3d.healthy():
+                print("[overlay]   硬重启：D3D11 设备同样已丢失 → 一并重建持久纹理")
+                self._rebuild_d3d()          # 内部会把新纹理重新绑到新 handle
+            else:
+                self._set_overlay_texture()  # 新 handle 上没有任何贴图，D3D 路径要重新绑一次
         except Exception as exc:  # noqa: BLE001
             print(f"[overlay] ⚠️ 硬重启 openvr 失败（下轮失败时再试）："
                   f"{type(exc).__name__}: {exc}")

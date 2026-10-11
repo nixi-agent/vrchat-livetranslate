@@ -3,15 +3,21 @@
 ## 为什么要有这个测试
 
 `vlt/output/openvr_overlay.py` 新增了一条上传路：自建 D3D11 设备 + 一张只建一次的持久纹理，
-每帧只 `UpdateSubresource` 更新内容再 `SetOverlayTexture`，用来替掉每帧新建贴图、约 200 次就
-撞墙的 `setOverlayRaw`（详见 `vlt/output/win_d3d11.py` 的模块 docstring）。真机出屏与 600 次
-连刷已由用户侧 spike 验过；本测试只负责**接线正确性**，全部用假对象注入，绝不碰真实 D3D/SteamVR：
+每帧更新它的内容再 `SetOverlayTexture`，用来替掉每帧新建贴图、约 200 次就撞墙的 `setOverlayRaw`
+（详见 `vlt/output/win_d3d11.py` 的模块 docstring）。
+
+⚠️ 内容更新走的是 `DYNAMIC + CPU_ACCESS_WRITE` 源纹理 → `Map(WRITE_DISCARD)` → `CopyResource`，
+**不是** `UpdateSubresource`（对共享纹理直写会把它弄坏、之后永久 `InvalidTexture`）。
+真机出屏与 700 次连刷已验（`scripts/verify_overlay_texture.py`）；本测试只负责**接线正确性**，
+全部用假对象注入，绝不碰真实 D3D/SteamVR：
 
   · 有 D3D 层（假对象注入）→ `_upload` 走 `setOverlayTexture`，且**不**调用 `setOverlayRaw`；
   · D3D 建不起来 → 降级走 `setOverlayRaw`，且有一行降级留痕；
   · `setOverlayTexture` 报「不支持 / InvalidTexture」→ **永久回退**且**只留痕一次**；
   · 重建 / 硬重启后 → `setOverlayTexture` 被重新调用（新 handle 上没有任何贴图）；
-  · `size_px` 变化后 → D3D 纹理被**重建**以匹配新尺寸。
+  · `size_px` 变化后 → D3D 纹理被**重建**以匹配新尺寸；
+  · **D3D11 设备丢失**（TDR / 驱动重置 / 适配器移除，`healthy()` 为假）→ 重建持久纹理，
+    而不是一直挂在坏设备上（只重建 SteamVR 一侧是救不回来的）。
 
 注入手法：把 `vlt.output.openvr_overlay.D3D11Texture` 换成假类（`_init_texture_path` /
 `_rebuild_d3d` 在调用时才查这个名字），再装一个**带 `setOverlayTexture` 的假 openvr**。
@@ -303,6 +309,93 @@ def test_size_change_rebuilds_texture() -> None:
     print("  size_px 变化 → D3D 纹理重建 OK")
 
 
+def test_d3d_device_loss_rebuilds_texture() -> None:
+    """D3D11 设备丢失（TDR / 驱动重置 / 适配器移除）→ 必须重建**持久纹理**。
+
+    实测过不补这道时的形态：坏设备一直挂着 —— 连失败只让 `_recreate_overlay`/`_hard_reinit`
+    反复重建 SteamVR 一侧（还会 shutdown+init openvr），面板永远回不来。
+    判据不是「没抛异常」，而是**建出了新的纹理实例**、且后续帧重新走新纹理 + `setOverlayTexture`。
+    """
+    oo = _fresh(FakeD3D)
+    ov = oo.WristOverlay(_cfg())
+    assert ov.start() is True
+    dead = FakeD3D.instances[0]
+
+    def _boom(_data: bytes) -> None:
+        raise RuntimeError("Map(源纹理) 失败 hr=0x887A0005")     # DEVICE_REMOVED
+
+    dead.upload = _boom                       # type: ignore[method-assign]
+    dead.healthy = lambda: False              # type: ignore[method-assign]
+
+    CALLS.clear()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):     # 顺便钉住「日志报的是真实那一步」
+        for _ in range(5):                    # 连续失败到触发自愈阶梯
+            ov.update_entries([("theirs", "Hello", "你好")], force=True)
+    out = buf.getvalue()
+    assert "D3D11 upload 失败" in out, f"失败日志应报出真实的操作（D3D11 upload）：{out[-400:]}"
+    assert "setOverlayTexture 失败" not in out, (
+        f"D3D 侧失败被报成了 overlay 接口失败（排障方向会被带偏）：{out[-400:]}")
+
+    assert len(FakeD3D.instances) >= 2, (
+        f"D3D11 设备丢失后应重建出**新的**纹理实例（现在只有 {len(FakeD3D.instances)} 个）")
+    fresh = FakeD3D.instances[-1]
+    assert fresh is not dead and fresh.closed is False, "新纹理不该是坏的那个、也不该被关掉"
+    assert fresh.uploads >= 1, "重建后应继续用**新**纹理上传（坏设备不该再被喂数据）"
+    assert dead.uploads == 0, "坏设备不该再收到 upload"
+    assert "setOverlayTexture" in _names(), f"重建后应重新绑定贴图：{_names()}"
+    # 关键判据：设备丢失时**不该**走破坏性的 openvr 硬重启 —— 问题在 D3D 一侧，重建纹理就够了。
+    # （踩过：只靠下面那条硬重启顺带重建，也会「碰巧」建出新纹理，用例就守不住第一级修复了。）
+    assert "D3D11 设备已丢失" in out, f"没有走「设备丢失 → 重建纹理」这条修复：{out[-400:]}"
+    assert not [c for c in CALLS if c[0] == "shutdown"], (
+        f"D3D 设备丢失却去 shutdown+init 了整个 openvr 连接（破坏性，且救不回来）：{_names()}")
+    ov.close()
+    print("  D3D11 设备丢失 → 重建持久纹理 OK")
+
+
+def test_base_reuse_copy_list_only_names_the_class_sets() -> None:
+    """`base=` 复用路径的拷贝表里，每个名字都必须是**类里真的会设置**的属性。
+
+    实测踩过：表里留了 `_update`，而本模块刻意不绑 `UpdateSubresource`（共享纹理不能直写）
+    → 任何 `D3D11Texture(..., base=...)` 必抛 `AttributeError`，而生产路径不用 base=，
+    会被上层 `except` 吞掉静默降级回 raw —— 一用就炸却没人发现（色空间比对就是唯一用户）。
+    这条守卫是静态的（AST 读源码，不开设备）：新增/改名时不至于再漏。
+    """
+    import ast
+    import pathlib
+    import sys
+
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    import vlt.output.win_d3d11 as _wd          # 只读源码做静态检查，不构造 D3D 设备
+
+    src = pathlib.Path(_wd.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "D3D11Texture")
+    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+
+    copied: list[str] = []
+    for node in ast.walk(init):
+        if isinstance(node, ast.For) and isinstance(node.iter, (ast.Tuple, ast.List)):
+            copied += [e.value for e in node.iter.elts
+                       if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+    assert copied, "没解析出 __init__ 里的拷贝表（for attr in (...)）"
+
+    assigned: set[str] = set()
+    for node in ast.walk(cls):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:                      # 元组赋值（self.a, self.b = ...）也要算
+            for t in ast.walk(target):
+                if (isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
+                        and t.value.id == "self"):
+                    assigned.add(t.attr)
+    missing = sorted(set(copied) - assigned)
+    assert not missing, (
+        f"拷贝表里的这些名字类里根本不会设置（base= 复用路径必炸）：{missing}；"
+        f"类里实际会设置的：{sorted(assigned)}")
+    print(f"  base= 拷贝表与实例属性一致（{len(set(copied))} 项）OK")
+
+
 if __name__ == "__main__":
     print("test_overlay_texture_path:")
     test_texture_path_uses_setoverlaytexture()
@@ -310,4 +403,6 @@ if __name__ == "__main__":
     test_unsupported_texture_permanent_fallback_logs_once()
     test_recreate_and_reinit_rebind_texture()
     test_size_change_rebuilds_texture()
+    test_d3d_device_loss_rebuilds_texture()
+    test_base_reuse_copy_list_only_names_the_class_sets()
     print("ALL PASSED")

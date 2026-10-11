@@ -322,7 +322,9 @@ from PyInstaller.archive.readers import pkg_archive_contents
 exe, vlt_dir = sys.argv[1], pathlib.Path(sys.argv[2])
 names = set(pkg_archive_contents(exe))
 
-forbidden = {"vlt.platform.win", "vlt.output.openvr_overlay"}
+# ⚠️ 这份集合与上面的 EXCLUDES 是**两份**清单，加新的平台独占模块时必须同时改；
+#    tests/test_platform_purity.py 现在会断言两份的 vlt.* 集合一致（漏改即红）。
+forbidden = {"vlt.platform.win", "vlt.output.openvr_overlay", "vlt.output.win_d3d11"}
 bad = sorted(n for n in names if any(n == f or n.startswith(f + ".") for f in forbidden))
 assert not bad, f"包里混进了 Windows 独占模块：{bad}"
 

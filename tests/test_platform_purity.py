@@ -119,7 +119,18 @@ def test_forbidden_lists_match_build_excludes() -> None:
     for mod in C.FORBIDDEN["linux"]["modules"]:
         assert mod in excludes, (f"{mod} 在 FORBIDDEN[linux] 里，"
                                  f"却没进 build_appimage.sh 的 EXCLUDES：{excludes}")
-    print("  ✓ 禁列清单与两侧构建排除清单同步")
+    # ⚠️ build_appimage.sh 里还有**第二份**内联清单（heredoc 里的 forbidden = {...}），
+    # 它参与「磁盘上有、包里没有」的模块对账。只查 EXCLUDES 会漏掉它 —— 实测踩过：
+    # win_d3d11 加进了 EXCLUDES、漏了内联集 → 本机用例全绿、CI 的 appimage 腿红。
+    m2 = re.search(r"forbidden = \{([^}]*)\}", sh)
+    assert m2, "没解析出 build_appimage.sh 里 heredoc 的内联禁列集合（forbidden = {...}）"
+    inline = set(re.findall(r'"([\w.]+)"', m2.group(1)))
+    vlt_excl = {m for m in excludes if m.startswith("vlt.")}
+    vlt_inline = {m for m in inline if m.startswith("vlt.")}
+    assert vlt_excl == vlt_inline, (
+        f"build_appimage.sh 里两份 vlt 禁列清单不一致（加平台独占模块时必须同时改两处）："
+        f"EXCLUDES={sorted(vlt_excl)} / 内联={sorted(vlt_inline)}")
+    print("  ✓ 禁列清单与两侧构建排除清单同步（含 heredoc 内联集合）")
 
 
 if __name__ == "__main__":

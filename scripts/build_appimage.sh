@@ -337,7 +337,11 @@ for p in vlt_dir.rglob("*.py"):
     if name not in forbidden:
         disk.add(name)
 missing = sorted(disk - names)
-assert not missing, f"磁盘上有、包里没有的 vlt 模块（用户拿到手就是 ImportError）：{missing}"
+assert not missing, (
+    f"磁盘上有、包里没有的 vlt 模块：{missing}\n"
+    "    修法：在函数里**按需导入**（importlib / 函数体内 import）的模块 → 加进上面的 HIDDEN；\n"
+    "    如果是故意排除的**平台独占**模块（Windows 才该有）→ 加进 EXCLUDES\n"
+    "    （并同步 scripts/check_platform_purity.py 的 FORBIDDEN[linux]，以及 heredoc 里的 forbidden 集合）")
 
 # 第三方里「靠运行时环境动态挑」的模块，PyInstaller 的 hook 覆盖不全 —— 单独钉住。
 # 加新项时写清「为什么静态分析看不到」。

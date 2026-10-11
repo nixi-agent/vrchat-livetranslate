@@ -21,6 +21,14 @@
 单文件 exe 冷启动会解包到临时目录，很多问题（缺数据文件、路径指向临时目录）
 只有真跑起来才暴露。所以默认会拿 `--self-test` 跑一次，并从 exe 旁的
 `logs/` 日志里确认结果 —— 而不是只看"构建成功"。
+
+## 打完之后还有一道**静态**对账（不受 --no-verify 影响）
+
+`reconcile_modules()` 比对「磁盘上的 vlt 模块」与「产物里收录的条目」：在函数里
+按需导入（importlib / 函数体内 import）的模块，PyInstaller 的静态分析看不到，
+漏加 `HIDDEN` **不会在构建时炸**，只会在用户机器上 `ModuleNotFoundError`。
+`--no-verify` 只跳上面那次真跑自检，这道对账永远跑（CI 的 package job 正是带
+`--no-verify` 的）。Linux 侧的同语义对账在 `scripts/build_appimage.sh` 第 3 步。
 """
 from __future__ import annotations
 
@@ -164,6 +172,62 @@ def build() -> Path:
     return exe
 
 
+def missing_vlt_modules(archive_names: set[str], vlt_dir: Path,
+                        allowed_missing: set[str]) -> list[str]:
+    """「磁盘上有、包里没有」的 `vlt` 模块名（`allowed_missing` 及其子模块除外）。
+
+    纯函数（不读产物、不碰全局），所以 `tests/test_build_exe_modules.py` 能拿临时目录
+    直接构造用例。与 `scripts/build_appimage.sh` 第 3 步的模块对账同语义 —— Linux 侧
+    一直有这道网，Windows 侧以前没有：**在函数里按需导入**的模块 PyInstaller 的静态
+    分析看不到，漏加 `HIDDEN` 不会在构建时炸，只会在用户机器上 `ModuleNotFoundError`。
+    """
+    disk: set[str] = set()
+    for p in sorted(vlt_dir.rglob("*.py")):
+        rel = p.relative_to(vlt_dir.parent).with_suffix("")
+        if rel.name == "__init__":
+            rel = rel.parent
+        disk.add(".".join(rel.parts))
+    return sorted(m for m in disk - set(archive_names)
+                  if not any(m == a or m.startswith(a + ".") for a in allowed_missing))
+
+
+def reconcile_modules(exe: Path) -> None:
+    """打包后的模块对账：磁盘上的 `vlt` 模块必须都在包里（除非被 `EXCLUDE_WIN` 排掉）。
+
+    ⚠️ 这道对账**不受 `--no-verify` 影响**：那个开关只跳「真跑一次 `--self-test`」，
+    而模块对账是纯静态的（读产物目录表，秒级、不需要真启动）。CI 的 package job 正是
+    带 `--no-verify` 跑的 —— 放到 `--no-verify` 后面等于这道网在 CI 里从来不跑。
+    """
+    from PyInstaller.archive.readers import pkg_archive_contents
+
+    names = set(pkg_archive_contents(str(exe)))
+    # ⚠️ allowed_missing **只能**从 EXCLUDE_WIN 派生：再抄第二份清单就是 #93 的教训
+    #    （两份必然漂移，漂了以后「排除了但没人验证」）。tests/test_build_exe_modules.py
+    #    有一条 AST 静态检查盯着这一行，写死成集合字面量会直接判红。
+    allowed_missing = {m for m in EXCLUDE_WIN if m.startswith("vlt.")}
+
+    # HIDDEN 是「明确要求收进去」的承诺，不许被 allowed_missing 豁免掉：同一个模块
+    # 既在 HIDDEN 又在 EXCLUDE_WIN 就是配置自相矛盾（PyInstaller 那边只是各让一步，
+    # 结果是「排掉了、对账也过了」，谁都没发现承诺被吞）。
+    both = sorted(allowed_missing & {h for h in HIDDEN if h.startswith("vlt")})
+    if both:
+        raise SystemExit(
+            f"❌ 这些模块同时出现在 HIDDEN（要求收进产物）与 EXCLUDE_WIN（要求排掉）："
+            f"{both}\n   按需导入的留 HIDDEN；平台独占的留 EXCLUDE_WIN —— 二选一。")
+
+    missing = missing_vlt_modules(names, REPO / "vlt", allowed_missing)
+    if missing:
+        raise SystemExit(
+            "❌ 磁盘上有、包里没有的 vlt 模块（漏收 = 用户机器上 ModuleNotFoundError）：\n   "
+            + "\n   ".join(missing)
+            + "\n   修法：在函数里**按需导入**（importlib / 函数体内 import）的模块 → 加进本文件的 HIDDEN；"
+              "\n         **平台独占**（只有 Linux 该有）的模块 → 加进 EXCLUDE_WIN"
+              "（并同步 scripts/check_platform_purity.py 的 FORBIDDEN[\"windows\"]）。")
+    print(f"✅ 模块对账通过：产物收录 {len(names)} 个条目，"
+          f"磁盘上的 vlt 模块一个不少（{len(allowed_missing)} 个平台独占模块按 EXCLUDE_WIN 排除）",
+          flush=True)
+
+
 def frozen_app_dir(exe: Path) -> Path:
     """打包后的**可写目录**：`%APPDATA%\\vrchat-livetranslate`。
 
@@ -223,6 +287,9 @@ def main() -> int:
     print(f"   配置与日志写在：{frozen_app_dir(exe)}"
           "（exe 放在只读目录也能跑；想改成绿色版——配置跟 exe 走——"
           "在 exe 旁边放一个 portable.txt 即可）", flush=True)
+
+    # 模块对账是静态的，**不受 --no-verify 影响**（理由见 reconcile_modules 的 docstring）
+    reconcile_modules(exe)
 
     if args.no_verify:
         return 0

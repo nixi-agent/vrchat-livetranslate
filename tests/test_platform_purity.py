@@ -13,7 +13,9 @@ package 阶段跑。等它红的时候，往往是「已经构建完了才发现
 `FORBIDDEN` 里写了「Windows 不该有 `vlt.output.openxr_overlay`」，而
 `scripts/build_exe.py` 的 `EXCLUDE_WIN` 才真正把它排掉 —— 两处**只改一边**就会出现
 「断言了一条永远不为真的规则」（禁列写了但没排除 → 打包才炸）或者
-「排除了但没人验证」。所以这里做一致性检查。
+「排除了但没人验证」。所以这里做**双向**一致性检查：只查「禁列 ⊆ 排除清单」的话，
+「新模块进了排除清单、忘了登记禁列」会静默通过 —— 隔离事实上发生了，产物级断言
+却对它视而不见（#94）。
 """
 from __future__ import annotations
 
@@ -105,6 +107,19 @@ def test_forbidden_lists_match_build_excludes() -> None:
         if mod.startswith("vlt."):
             assert mod in exclude_win, (f"{mod} 在 FORBIDDEN[windows] 里，"
                                         f"却没进 build_exe.py 的 EXCLUDE_WIN：{exclude_win}")
+    # ★ 反向也要查（#94）：EXCLUDE_WIN 里的 vlt.* 必须**都登记进** FORBIDDEN。
+    #   只查一个方向会漏掉这条触发序列：新加 vlt/output/foo_linux.py → 进了 EXCLUDE_WIN
+    #   → **忘了**进 FORBIDDEN ⇒ 隔离事实上发生了，但 check_platform_purity.py 的产物级
+    #   断言对这个模块**视而不见** —— 用例全绿，却没有任何断言证明它真被排掉了
+    #   （哪天有人把它从 EXCLUDE_WIN 里删掉，也没有网会红）。
+    unregistered_win = sorted(m for m in exclude_win if m.startswith("vlt.")
+                              and m not in C.FORBIDDEN["windows"]["modules"])
+    assert not unregistered_win, (
+        f"这些模块进了 build_exe.py 的 EXCLUDE_WIN，却没登记进 "
+        f"check_platform_purity.py 的 FORBIDDEN[windows][modules]：{unregistered_win}\n"
+        f"  后果：产物级断言会对它们**视而不见**（新模块忘登记）—— 排除生效了没人证明，"
+        f"哪天被误删也没人会红。\n"
+        f"  修法：把它们加进 FORBIDDEN[windows][modules]（并补上对应的禁列字样）。")
 
     # Linux：build_appimage.sh 的 --exclude-module 清单必须覆盖 FORBIDDEN["linux"]["modules"]。
     # （PyInstaller 路线是「分析期排除」，不再有旧路线那种「AppDir 里反向删 .py」，
@@ -119,6 +134,17 @@ def test_forbidden_lists_match_build_excludes() -> None:
     for mod in C.FORBIDDEN["linux"]["modules"]:
         assert mod in excludes, (f"{mod} 在 FORBIDDEN[linux] 里，"
                                  f"却没进 build_appimage.sh 的 EXCLUDES：{excludes}")
+    # ★ 反向同理（#94）：EXCLUDES 里的 vlt.* 必须都登记进 FORBIDDEN[linux]，
+    #   否则「排除了但产物级断言不看它」—— 见上面 Windows 侧那段说明。
+    #   只查 vlt.*：第三方（sounddevice 这类）是否登记是另一码事，不在本条断言的口径里。
+    unregistered_linux = sorted(m for m in excludes if m.startswith("vlt.")
+                                and m not in C.FORBIDDEN["linux"]["modules"])
+    assert not unregistered_linux, (
+        f"这些模块进了 build_appimage.sh 的 EXCLUDES，却没登记进 "
+        f"check_platform_purity.py 的 FORBIDDEN[linux][modules]：{unregistered_linux}\n"
+        f"  后果：产物级断言会对它们**视而不见**（新模块忘登记）—— 排除生效了没人证明，"
+        f"哪天被误删也没人会红。\n"
+        f"  修法：把它们加进 FORBIDDEN[linux][modules]（并补上对应的禁列字样）。")
     # ⚠️ build_appimage.sh 里还有**第二份**内联清单（heredoc 里的 forbidden = {...}），
     # 它参与「磁盘上有、包里没有」的模块对账。只查 EXCLUDES 会漏掉它 —— 实测踩过：
     # win_d3d11 加进了 EXCLUDES、漏了内联集 → 本机用例全绿、CI 的 appimage 腿红。

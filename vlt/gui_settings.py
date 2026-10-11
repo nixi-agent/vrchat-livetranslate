@@ -136,7 +136,12 @@ def build_settings_dialog(gui) -> None:
     # 窗口被销毁（关程序时根窗会连带销毁子窗）→ 把挂起的读数 tick 一起取消。
     # 不取消的话那个 `after` 会带着已经死掉的命令名到点，Tk 收尾打一行
     # `invalid command name "..._refresh_level_readout"`（末影猫 L5 报的收尾噪音）。
-    win.bind("<Destroy>", gui._cancel_level_tick, add="+")
+    # ⚠️ 必须按 `e.widget is win` 过滤：Tk 默认 bindtags 是 (widget, class, toplevel, "all")，
+    # 绑在设置窗 Toplevel 上的 `<Destroy>` **也会被子控件销毁命中**（实测）。不过滤的话，
+    # 以后有人动态重建设置页，就会在窗口**仍可见**时把读数 tick 悄悄取消（读数从此不再刷新、
+    # 且没有任何提示）。见 issue #89。
+    win.bind("<Destroy>",
+             lambda e: gui._cancel_level_tick() if e.widget is win else None, add="+")
     for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
         win.bind(seq, lambda e: on_settings_wheel(gui, e))
     gui._settings_win = win

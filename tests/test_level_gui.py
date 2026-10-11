@@ -571,6 +571,42 @@ def test_readout_tick_cancelled_on_window_destroy() -> None:
           "取消本身幂等")
 
 
+def test_child_widget_destroy_does_not_cancel_readout_tick() -> None:
+    """★ 设置窗的**子控件**被销毁，不许取消读数 tick（issue #89）。
+
+    Tk 的默认 bindtags 是 `(widget, class, toplevel, "all")`，所以绑在设置窗 Toplevel 上的
+    `<Destroy>` **也会被子控件销毁触发**（实测 `child.destroy()` → 回调收到
+    `e.widget == '.!toplevel.!frame'`）。不加 `e.widget is win` 过滤时：一旦以后有人动态
+    重建设置页，窗口**仍可见**的读数 tick 就会被悄悄取消 —— 读数从此不再刷新、且没有任何提示。
+
+    判据用**状态**（`_level_readout_job` 还挂不挂着），不是去抓某行 stderr：过滤正确时
+    子控件销毁前后 job 都在；把过滤去掉（不再按 `e.widget` 判），这条立刻变红。
+    """
+    import tkinter as tk
+    with _gui(_CFG_WITH_LEVEL) as (gui, _cfg_path):
+        with _quiet():
+            gui._open_settings()                                    # noqa: SLF001
+            gui._root.update()                                      # noqa: SLF001
+        assert gui._level_readout_job is not None, "前提：打开设置窗后应挂起读数 tick"  # noqa: SLF001
+
+        # 造一个子控件再销毁它（模拟动态重建设置页 / 某控件内部销毁子件）
+        child = tk.Frame(gui._settings_win)                         # noqa: SLF001
+        child.pack()
+        gui._root.update()                                          # noqa: SLF001
+        child.destroy()
+        gui._root.update()                                          # noqa: SLF001
+        assert gui._level_readout_job is not None, \
+            "销毁设置窗的**子控件**不该取消读数 tick（<Destroy> 须按 e.widget is win 过滤）"  # noqa: SLF001
+        with _quiet():
+            _pump(gui, 0.3)
+        assert gui._level_readout_job is not None, "子控件销毁后读数 tick 仍应活着"   # noqa: SLF001
+
+        with _quiet():
+            gui._close_settings()
+    print("  ✓ 读数 tick：销毁设置窗的**子控件**（非窗口本身）→ 挂起的 tick 不被取消"
+          "（<Destroy> 已按 e.widget is win 过滤）")
+
+
 # ---------------------------------------------------------------- 入口
 
 
@@ -583,6 +619,7 @@ def main() -> int:
         test_sync_level_controls_state_follows_mode,
         test_readout_tick_only_while_settings_visible,
         test_readout_tick_cancelled_on_window_destroy,
+        test_child_widget_destroy_does_not_cancel_readout_tick,
     ]
     print("test_level_gui:")
     failed = 0

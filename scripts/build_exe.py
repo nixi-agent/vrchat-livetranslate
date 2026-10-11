@@ -53,6 +53,7 @@ HIDDEN = [
     "vlt.session", "vlt.session.base", "vlt.session.qwen38", "vlt.session.qwen35",
     "vlt.output", "vlt.output.chatbox", "vlt.output.overlay", "vlt.output.virtualmic",
     "vlt.output.openvr_overlay",        # Windows/SteamVR 手腕屏后端（Linux 产物里没有它）
+    "vlt.output.win_d3d11",             # 持久 D3D11 贴图（SetOverlayTexture 上传；Windows 独占）
     "vlt.platform", "vlt.platform.base", "vlt.platform.win",
 ]
 # 带二进制/数据文件的库 → 连数据一起收

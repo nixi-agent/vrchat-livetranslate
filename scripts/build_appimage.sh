@@ -270,7 +270,7 @@ HIDDEN=(
 # 带二进制/数据文件的库 → 连数据一起收
 COLLECT_ALL=(xr pythonosc)
 # Linux 产物里**不允许**出现 Windows 独占实现（与 build_exe.py 的 EXCLUDE_WIN 镜像）
-EXCLUDES=(vlt.platform.win vlt.output.openvr_overlay openvr pyaudiowpatch pycaw comtypes sounddevice)
+EXCLUDES=(vlt.platform.win vlt.output.openvr_overlay vlt.output.win_d3d11 openvr pyaudiowpatch pycaw comtypes sounddevice)
 
 PYI_ARGS=(
     --noconfirm --clean --noupx --onedir

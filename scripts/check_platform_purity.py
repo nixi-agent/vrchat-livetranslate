@@ -90,6 +90,7 @@ FORBIDDEN: dict[str, dict[str, list[str]]] = {
         "modules": [
             "vlt.platform.win",            # WASAPI / pyaudiowpatch 那套
             "vlt.output.openvr_overlay",   # SteamVR 手腕屏后端（Windows 独占）
+            "vlt.output.win_d3d11",        # 持久 D3D11 贴图（SetOverlayTexture 上传；上一条的依赖）
             "openvr",                      # SteamVR 接口本体（上一条的依赖）
             "pyaudiowpatch",
             "pycaw",
@@ -107,6 +108,7 @@ FORBIDDEN: dict[str, dict[str, list[str]]] = {
             b"IVROverlay",
             b"VRApplication_Background",
             b"HmdMatrix34_t",
+            b"D3D11CreateDevice",          # 持久 D3D11 贴图后端（win_d3d11）的实现标记
         ],
     },
 }

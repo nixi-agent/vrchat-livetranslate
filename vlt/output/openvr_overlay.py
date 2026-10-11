@@ -25,6 +25,34 @@ from PIL import Image
 
 from ..paths import APP_DIR as ROOT
 from .overlay import OverlayConfig, _unpack_entry, render_conversation, render_panel
+from .win_d3d11 import D3D11Texture
+
+# 交给 SteamVR 的贴图色空间（OpenVR 的 EColorSpace）。Auto(=0) 实测可用；Linear 会被 SteamVR
+# 拒（OverlayError_InvalidTexture），**别用**。Auto vs Gamma 的外观取舍仍等用户肉眼结论 ——
+# 想试 Gamma 就把这里改成 1（openvr.ColorSpace_Gamma），改这一处即可。
+# ⚠️ 前提：内容必须按 sRGB 编码进纹理（我们的渲染就是），且这块不做「线性化再输出」，
+#    否则 50% 灰会明显发灰。
+OVERLAY_COLOR_SPACE = 0
+
+
+def _make_texture_t(shared_handle: int):
+    """构造 OpenVR 的 `Texture_t`：handle = **DXGI 共享句柄**，eType = DXGISharedHandle。
+
+    ⚠️ 为什么不是 `TextureType_DirectX(0)` + 纹理指针：本机真 SteamVR 逐项实测（矩阵脚本
+    `out/spike_openvr_texture.py --probe-matrix`）—— `eType=0` 配纹理指针 / SRV / 共享纹理
+    **一律** `OverlayError_InvalidTexture`；**只有** `MISC_SHARED` 纹理的 DXGI 共享句柄配
+    `eType=TextureType_DXGISharedHandle(5)` 被接受（openvr.h：该类型 "only supported for
+    **Overlay** render targets"）。用户机器上 `eType=0` 表现为「不报错但屏幕上什么都不画」，
+    所以**绝不能**把「调用没抛异常」当成「用户看得见」。
+    """
+    import openvr
+
+    t = openvr.Texture_t()
+    t.handle = ctypes.c_void_p(shared_handle)
+    t.eType = openvr.TextureType_DXGISharedHandle   # =5（handle 是 IDXGIResource 的共享句柄）
+    t.eColorSpace = OVERLAY_COLOR_SPACE
+    return t
+
 
 def build_matrix(pos: tuple[float, float, float], rot_deg: tuple[float, float, float]):
     """构造 OpenVR 的 3x4 位姿矩阵（行主序）。需要 openvr 才能返回其 ctypes 类型。"""
@@ -114,6 +142,10 @@ class WristOverlay:
         self._last_render: tuple[str, str] | None = None
         self._last_entries: tuple | None = None
         self._upload_fails = 0             # 贴图连续上传失败次数（用于降噪 + 触发重建）
+        # ---- D3D11 持久贴图 + SetOverlayTexture 上传路径（见 _init_texture_path）----
+        self._d3d = None                   # win_d3d11.D3D11Texture；None = 走旧的 setOverlayRaw
+        self._tex_disabled = False         # setOverlayTexture 报「不支持」后置真 → 永久回退旧路
+        self._tex_fallback_logged = False  # 永久回退只留痕一次（别每帧刷）
         self._last_cfg_mtime = 0.0
         self._last_text_at = 0.0
         # ---- 自愈状态机 + 诊断（用户实测「手腕屏隔一阵就消失」，见 _upload 的注释）----
@@ -189,6 +221,9 @@ class WristOverlay:
             self.available = True
             self._apply_transform()
             self._overlay.showOverlay(self._handle)
+            # overlay 建好、变换应用完之后，尝试切到「持久 D3D11 贴图 + SetOverlayTexture」路。
+            # 这一步**绝不许抛异常**（内部全 try 住）：建不起来就留一行痕、继续用旧的 setOverlayRaw。
+            self._init_texture_path()
         except Exception as exc:  # noqa: BLE001
             print(f"[overlay] ⚠️ 创建 overlay 失败，已禁用（其他输出不受影响）："
                   f"{type(exc).__name__}: {exc}")
@@ -285,26 +320,62 @@ class WristOverlay:
         self._upload(img)
 
     def _upload(self, img: Image.Image) -> None:
+        """把一帧送上手腕屏。有 D3D 层走 SetOverlayTexture，否则走旧的 setOverlayRaw。
+
+        两条路**共用同一套失败计数与自愈阶梯**（`_upload_fails` / `_fails_in_stage` /
+        `_escalate`）——不新造一套，否则「连续失败 → 重建 → 硬重启」的行为会在两条路上漂移。
+        """
+        if self._d3d is not None:
+            self._upload_texture(img)
+        else:
+            self._upload_raw(img)
+
+    def _upload_raw(self, img: Image.Image) -> None:
+        """旧路（降级兜底）：`setOverlayRaw` 每帧新建一张贴图，高频刷新约 200 次后会撞墙。"""
         w, h = img.size
         data = img.tobytes()               # RGBA
         buf = ctypes.create_string_buffer(data, len(data))
         try:
             self._overlay.setOverlayRaw(self._handle, buf, w, h, 4)
         except Exception as exc:  # noqa: BLE001
-            self._upload_fails += 1
-            f = self._upload_fails
-            self._fails_in_stage += 1
-            # 降噪：连失败 86 次时每帧打一行会把日志彻底淹没（用户实测就是这样），
-            # 只报第一次 + 每隔 50 次汇总一条；但**第一次**要带上现场，
-            # 否则事后只有一句 RequestFailed，谁也判断不出是「面板卡住」还是「面板被丢掉」。
-            if f == 1:
-                print(f"[overlay] ❌ setOverlayRaw 失败：{type(exc).__name__}: {exc}")
-                print(f"[overlay][diag] 失败现场：{self._state_brief()}")
-            if f % 50 == 0:
-                print(f"[overlay] ❌ 贴图上传已连续失败 {f} 次（面板会停在最后一帧）")
-                print(f"[overlay][diag] {self._state_brief()}")
-            self._escalate()
+            self._on_upload_failure(exc, "setOverlayRaw")
             return
+        self._on_upload_success(w, h)
+
+    def _upload_texture(self, img: Image.Image) -> None:
+        """新路：只更新持久 D3D11 纹理的内容，再把它交给 `setOverlayTexture`（不新建任何贴图）。"""
+        w, h = img.size
+        try:
+            self._d3d.upload(img.convert("RGBA").tobytes())
+            self._set_overlay_texture()
+        except Exception as exc:  # noqa: BLE001
+            # 「不支持 / InvalidTexture」类错误 = 这条路在这台机器/这个 SteamVR 上根本走不通，
+            # 重试没意义 → **永久回退** setOverlayRaw（只留痕一次），并立刻用旧路补上这一帧。
+            if self._is_texture_unsupported(exc):
+                self._fallback_to_raw_permanently(exc)
+                self._upload_raw(img)
+                return
+            # 其它错误（设备丢失 / RequestFailed 等）按现有自愈阶梯走。
+            self._on_upload_failure(exc, "setOverlayTexture")
+            return
+        self._on_upload_success(w, h)
+
+    def _on_upload_failure(self, exc: Exception, op: str) -> None:
+        self._upload_fails += 1
+        f = self._upload_fails
+        self._fails_in_stage += 1
+        # 降噪：连失败 86 次时每帧打一行会把日志彻底淹没（用户实测就是这样），
+        # 只报第一次 + 每隔 50 次汇总一条；但**第一次**要带上现场，
+        # 否则事后只有一句 RequestFailed，谁也判断不出是「面板卡住」还是「面板被丢掉」。
+        if f == 1:
+            print(f"[overlay] ❌ {op} 失败：{type(exc).__name__}: {exc}")
+            print(f"[overlay][diag] 失败现场：{self._state_brief()}")
+        if f % 50 == 0:
+            print(f"[overlay] ❌ 贴图上传已连续失败 {f} 次（面板会停在最后一帧）")
+            print(f"[overlay][diag] {self._state_brief()}")
+        self._escalate()
+
+    def _on_upload_success(self, w: int, h: int) -> None:
         self.frames_updated += 1
         self._last_ok_at = time.monotonic()
         if self._upload_fails:
@@ -318,6 +389,81 @@ class WristOverlay:
         # 也别每帧都打：第 1 帧 + 每 50 帧一条（保留"还在刷"的证据，但不淹日志）
         if self.frames_updated == 1 or self.frames_updated % 50 == 0:
             print(f"[overlay] ← 贴图已更新（{w}x{h}, 第 {self.frames_updated} 帧）")
+
+    # ---------- D3D11 持久贴图路径：启用 / 绑定 / 重建 / 回退 ----------
+    def _init_texture_path(self) -> None:
+        """尝试启用「持久 D3D11 贴图 + SetOverlayTexture」；任何一步失败都留一行痕并降级到旧路。
+
+        **绝不抛异常**（引擎不能被它打死）。降级判据：
+          * dry_run / 已永久回退 → 直接不启用；
+          * overlay 接口没有 `setOverlayTexture`（例如离线测试的假 openvr）→ 走旧路；
+          * 非 Windows：`D3D11Texture(...)` 构造即因 `WinDLL` 缺失抛异常 → 落到下面的降级分支；
+          * D3D 设备/纹理建不起来（无 GPU、驱动异常等）→ 同样降级。
+        """
+        if self.dry_run or self._tex_disabled:
+            return
+        if self._overlay is None or not hasattr(self._overlay, "setOverlayTexture"):
+            print("[overlay] overlay 接口无 setOverlayTexture：走 setOverlayRaw 旧路")
+            return
+        w, h = self.cfg.size_px
+        try:
+            self._d3d = D3D11Texture(w, h)
+            self._set_overlay_texture()      # 立刻绑一次：新 overlay 上此刻还没有任何贴图
+        except Exception as exc:  # noqa: BLE001
+            self._close_d3d()
+            print(f"[overlay] ⚠️ D3D11 贴图路径不可用，降级用 setOverlayRaw："
+                  f"{type(exc).__name__}: {exc}")
+            return
+        print(f"[overlay] ✅ D3D11 持久贴图路径已启用（{w}x{h}，SetOverlayTexture，"
+              f"色空间={OVERLAY_COLOR_SPACE}）")
+
+    def _set_overlay_texture(self) -> None:
+        """把当前 D3D 纹理交给 SteamVR。重建/硬重启后**新 handle 上没有任何贴图**，必须重调。"""
+        if self._d3d is None:
+            return
+        self._overlay.setOverlayTexture(self._handle, _make_texture_t(self._d3d.shared_handle))
+
+    def _close_d3d(self) -> None:
+        if self._d3d is not None:
+            try:
+                self._d3d.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._d3d = None
+
+    def _rebuild_d3d(self) -> None:
+        """size_px 变了：重建持久纹理以匹配新尺寸（否则 upload 的字节数对不上会 ValueError）。"""
+        w, h = self.cfg.size_px
+        self._close_d3d()
+        try:
+            self._d3d = D3D11Texture(w, h)
+            self._set_overlay_texture()
+        except Exception as exc:  # noqa: BLE001
+            self._close_d3d()
+            print(f"[overlay] ⚠️ 尺寸变更后重建 D3D11 纹理失败，降级用 setOverlayRaw："
+                  f"{type(exc).__name__}: {exc}")
+            return
+        print(f"[overlay] ♻️ size_px → {w}x{h}：已重建 D3D11 纹理")
+
+    def _fallback_to_raw_permanently(self, exc: Exception) -> None:
+        """setOverlayTexture 报「不支持」→ 释放 D3D、永久回退旧路，只留痕一次。"""
+        self._close_d3d()
+        self._tex_disabled = True
+        if not self._tex_fallback_logged:
+            self._tex_fallback_logged = True
+            print(f"[overlay] ⚠️ setOverlayTexture 不被支持（{type(exc).__name__}: {exc}）"
+                  f"→ 永久回退 setOverlayRaw")
+
+    @staticmethod
+    def _is_texture_unsupported(exc: Exception) -> bool:
+        """这条错误是不是「SetOverlayTexture 根本不支持 / 纹理被判非法」这类**重试无用**的错。
+
+        pyopenvr 把原因写在**异常类名**上（如 `OverlayError_InvalidTexture`），str() 常为空，
+        所以类名与文本都扫一遍。
+        """
+        blob = f"{type(exc).__name__}{exc}".lower()
+        return any(m in blob for m in ("invalidtexture", "unsupported", "notsupported",
+                                       "not supported"))
 
     def _recreate_overlay(self) -> bool:
         """销毁重建 overlay —— 贴图上传连续失败时用来恢复。
@@ -341,6 +487,7 @@ class WristOverlay:
             self.available = True
             self._apply_transform()
             self._overlay.showOverlay(self._handle)
+            self._set_overlay_texture()      # 新 handle 上没有任何贴图，D3D 路径要重新绑一次
             self._rebuilds += 1
             self._rebuilds_since_ok += 1
             self._recover_stage = "rebuild"
@@ -412,6 +559,7 @@ class WristOverlay:
             self.available = True
             self._apply_transform()
             self._overlay.showOverlay(self._handle)
+            self._set_overlay_texture()      # 新 handle 上没有任何贴图，D3D 路径要重新绑一次
         except Exception as exc:  # noqa: BLE001
             print(f"[overlay] ⚠️ 硬重启 openvr 失败（下轮失败时再试）："
                   f"{type(exc).__name__}: {exc}")
@@ -541,6 +689,10 @@ class WristOverlay:
                     # 淡出阈值只影响每帧算出来的 overlay alpha，不改几何也不改贴图 ——
                     # 但配置对象要换掉，否则改 fade_after_s 存盘不生效。
                     fade_changed = new_cfg.fade_after_s != self.cfg.fade_after_s
+                    # 面板像素尺寸单独拎出来：D3D 路径的持久纹理是按 size_px 建的，尺寸一变
+                    # 就得**重建纹理**（否则 upload 的字节数对不上会 ValueError）。必须在
+                    # self.cfg 被换掉之前算，且重建要排在重渲那一帧之前。
+                    size_changed = new_cfg.size_px != self.cfg.size_px
                     if geo_changed or anchor_changed or render_changed or fade_changed:
                         last_entries = list(self._last_entries or [])
                         last_render = self._last_render
@@ -551,6 +703,9 @@ class WristOverlay:
                             if geo_changed or anchor_changed:
                                 self._apply_transform()
                             if render_changed:
+                                # 尺寸变了且走 D3D 路径 → 先重建纹理，再重渲那一帧
+                                if size_changed and self._d3d is not None:
+                                    self._rebuild_d3d()
                                 if last_entries:
                                     self._last_entries = None      # 强制重渲
                                     self.update_entries(last_entries, force=True)
@@ -598,5 +753,6 @@ class WristOverlay:
                 openvr.shutdown()
             except Exception:
                 pass
+        self._close_d3d()          # 释放持久 D3D11 设备/纹理（幂等，raw 路径下是 no-op）
         self.available = False
 

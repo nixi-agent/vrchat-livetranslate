@@ -69,6 +69,35 @@ def check_offline(frames: int) -> bool:
     return ok
 
 
+def check_base_reuse() -> bool:
+    """真设备验 `base=` 复用设备这条路（AST 守卫只能防「拷贝表与属性不一致」，防不了运行时）。
+
+    ⚠️ 存在的理由：`base=` 只在色空间比对时用过，生产路径不碰 —— 所以它坏了不会被任何人发现
+    （实测踩过：拷贝表里留了 `_update`，一用就 `AttributeError`，还被上层 except 吞成静默降级）。
+    """
+    from vlt.output.win_d3d11 import D3D11Texture
+
+    a = D3D11Texture(WIDTH, HEIGHT)
+    b = D3D11Texture(WIDTH, HEIGHT, base=a)          # 复用 a 的 device/ctx
+    same_dev = (b.device == a.device and b.ctx == a.ctx)
+    print(f"  复用同一 device/ctx：{'[OK]' if same_dev else '[FAIL]'}")
+    hs = (a.shared_handle, b.shared_handle)
+    ok_h = bool(hs[0]) and bool(hs[1]) and hs[0] != hs[1]
+    print(f"  两张纹理共享句柄各自有效且不同：0x{hs[0]:X} / 0x{hs[1]:X} → {'[OK]' if ok_h else '[FAIL]'}")
+
+    da, db = _pattern(1), _pattern(2)
+    a.upload(da)
+    b.upload(db)
+    ok_read = (a._read_back() == da) and (b._read_back() == db)      # noqa: SLF001
+    print(f"  各自上传后回读一致：{'[OK]' if ok_read else '[FAIL]'}")
+
+    b.close()                                        # 关掉子纹理不能动共享设备
+    ok_alive = a.healthy() and a._read_back() == da                  # noqa: SLF001
+    print(f"  关掉 B 后 A 仍可用：{'[OK]' if ok_alive else '[FAIL]'}")
+    a.close()
+    return same_dev and ok_h and ok_read and ok_alive
+
+
 def check_steamvr(frames: int, every: int) -> bool:
     import openvr
 
@@ -125,15 +154,22 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="验证手腕屏持久 D3D11 贴图 + SetOverlayTexture 路径")
     ap.add_argument("--offline", action="store_true", help="只跑不依赖 SteamVR 的那段")
     ap.add_argument("--steamvr", action="store_true", help="只跑真 SteamVR 那段（需 SteamVR 在跑）")
+    ap.add_argument("--base-reuse", action="store_true", help="只跑 base= 复用设备那段（需真 D3D 设备）")
     ap.add_argument("--frames", type=int, default=FRAMES, help=f"连刷次数（默认 {FRAMES}）")
     ap.add_argument("--every", type=int, default=20, help="每多少次抽检一次可见性（默认 20）")
     args = ap.parse_args()
-    both = not (args.offline or args.steamvr)
+    both = not (args.offline or args.steamvr or args.base_reuse)
 
     ok = True
     if args.offline or both:
         print("=== 段 A：D3D11 持久贴图（不需要 SteamVR）===")
         ok = check_offline(args.frames) and ok
+    if args.base_reuse:
+        print("=== 段 C：base= 复用设备（两张纹理共用一个 device/ctx）===")
+        ok = check_base_reuse() and ok
+    if args.offline or both:
+        print("=== 段 A-2：base= 复用设备 ===")
+        ok = check_base_reuse() and ok
     if args.steamvr or both:
         print("=== 段 B：真 SteamVR overlay + SetOverlayTexture ===")
         ok = check_steamvr(args.frames, args.every) and ok

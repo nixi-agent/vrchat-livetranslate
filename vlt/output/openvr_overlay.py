@@ -54,6 +54,16 @@ def _make_texture_t(shared_handle: int):
     return t
 
 
+def _rgba_bytes(img: Image.Image) -> bytes:
+    """两条上传路**共用**的字节口径：一律 RGBA。
+
+    （原来 D3D 路 `img.convert("RGBA").tobytes()`、raw 路 `img.tobytes()` —— 渲染恒为 RGBA 时
+    逐字节等价，但口径不对称：哪天进来非 RGBA 图，炸的是 raw 路。这里统一，且已是 RGBA 时
+    不多做一次整图拷贝。）
+    """
+    return (img if img.mode == "RGBA" else img.convert("RGBA")).tobytes()
+
+
 def build_matrix(pos: tuple[float, float, float], rot_deg: tuple[float, float, float]):
     """构造 OpenVR 的 3x4 位姿矩阵（行主序）。需要 openvr 才能返回其 ctypes 类型。"""
     import openvr
@@ -146,6 +156,7 @@ class WristOverlay:
         self._d3d = None                   # win_d3d11.D3D11Texture；None = 走旧的 setOverlayRaw
         self._tex_disabled = False         # setOverlayTexture 报「不支持」后置真 → 永久回退旧路
         self._tex_fallback_logged = False  # 永久回退只留痕一次（别每帧刷）
+        self._tex_retried = False          # 「D3D 路建不起来」后再试一次的机会（只给一次，见 _escalate）
         self._last_cfg_mtime = 0.0
         self._last_text_at = 0.0
         # ---- 自愈状态机 + 诊断（用户实测「手腕屏隔一阵就消失」，见 _upload 的注释）----
@@ -333,7 +344,7 @@ class WristOverlay:
     def _upload_raw(self, img: Image.Image) -> None:
         """旧路（降级兜底）：`setOverlayRaw` 每帧新建一张贴图，高频刷新约 200 次后会撞墙。"""
         w, h = img.size
-        data = img.tobytes()               # RGBA
+        data = _rgba_bytes(img)            # 与 D3D 路**同一口径**（见 _rgba_bytes）
         buf = ctypes.create_string_buffer(data, len(data))
         try:
             self._overlay.setOverlayRaw(self._handle, buf, w, h, 4)
@@ -348,7 +359,7 @@ class WristOverlay:
         # D3D11 上传与 overlay 提交是**两类**问题，必须分开 try：合并成一段时，D3D 侧的
         # `Map(源纹理) 失败 hr=0x887A0005` 会被报成「setOverlayTexture 失败」，排障方向被带偏
         # （实测踩过）。op 名进日志，`_on_upload_failure` 才能报出真实那一步。
-        steps = (("D3D11 upload", lambda: self._d3d.upload(img.convert("RGBA").tobytes())),
+        steps = (("D3D11 upload", lambda: self._d3d.upload(_rgba_bytes(img))),
                  ("setOverlayTexture", self._set_overlay_texture))
         for op, call in steps:
             try:
@@ -428,6 +439,18 @@ class WristOverlay:
             return
         self._overlay.setOverlayTexture(self._handle, _make_texture_t(self._d3d.shared_handle))
 
+    def _rebind_or_rebuild(self, where: str) -> None:
+        """把贴图绑到当前 handle；若 D3D 设备已丢失则先重建纹理。
+
+        只重建 SteamVR 一侧救不回坏设备（把一张死纹理绑到新 handle 上，得等下一轮破坏性的
+        硬重启才有机会修）。`_recreate_overlay()` / `_hard_reinit()` 共用这一条判据。
+        """
+        if self._d3d is not None and not self._d3d.healthy():
+            print(f"[overlay]   {where}：D3D11 设备已丢失 → 一并重建持久纹理")
+            self._rebuild_d3d("设备已丢失")
+        else:
+            self._set_overlay_texture()
+
     def _close_d3d(self) -> None:
         if self._d3d is not None:
             try:
@@ -436,8 +459,11 @@ class WristOverlay:
                 pass
             self._d3d = None
 
-    def _rebuild_d3d(self) -> None:
-        """size_px 变了：重建持久纹理以匹配新尺寸（否则 upload 的字节数对不上会 ValueError）。"""
+    def _rebuild_d3d(self, reason: str = "尺寸变更") -> None:
+        """重建持久纹理 —— **两种**触发（`size_px` 变更 / D3D11 设备丢失），所以日志要带原因。
+
+        ⚠️ 文案别写死成「size_px → …」：排 TDR 时看到那行会误以为是配置热重载（复审提过）。
+        """
         w, h = self.cfg.size_px
         self._close_d3d()
         try:
@@ -445,10 +471,10 @@ class WristOverlay:
             self._set_overlay_texture()
         except Exception as exc:  # noqa: BLE001
             self._close_d3d()
-            print(f"[overlay] ⚠️ 尺寸变更后重建 D3D11 纹理失败，降级用 setOverlayRaw："
+            print(f"[overlay] ⚠️ 重建 D3D11 纹理失败（{reason}），降级用 setOverlayRaw："
                   f"{type(exc).__name__}: {exc}")
             return
-        print(f"[overlay] ♻️ size_px → {w}x{h}：已重建 D3D11 纹理")
+        print(f"[overlay] ♻️ D3D11 纹理已重建（{reason}）：{w}x{h}")
 
     def _fallback_to_raw_permanently(self, exc: Exception) -> None:
         """setOverlayTexture 报「不支持」→ 释放 D3D、永久回退旧路，只留痕一次。"""
@@ -492,7 +518,7 @@ class WristOverlay:
             self.available = True
             self._apply_transform()
             self._overlay.showOverlay(self._handle)
-            self._set_overlay_texture()      # 新 handle 上没有任何贴图，D3D 路径要重新绑一次
+            self._rebind_or_rebuild("已重建 overlay")   # 新 handle 上没有任何贴图，必须重绑/重建
             self._rebuilds += 1
             self._rebuilds_since_ok += 1
             self._recover_stage = "rebuild"
@@ -531,10 +557,26 @@ class WristOverlay:
         # `_recreate_overlay`/`_hard_reinit` 反复重建 SteamVR 侧（还会 shutdown+init openvr），
         # 面板永远回不来（实测：20 帧后 _d3d 还是那个坏设备，硬重启计数却在涨）。
         # 只在 none 阶段试一次（成功则计数器由下一次上传结果重置；失败则交给下面两级），避免重建风暴。
+        # 反向情形：设备丢失后那次重建**瞬时**失败（TDR 复位窗口内 D3D11CreateDevice 会失败），
+        # `_d3d` 就永久停在 None、静默退回 setOverlayRaw —— 正是本 PR 要消灭的那条老路。
+        # 这里再给一次机会；`_tex_retried` 挡住「GPU 真死了还反复建设备」。
+        if (self._d3d is None and not self._tex_disabled and not self._tex_retried
+                and self._recover_stage == "none"):
+            self._tex_retried = True
+            print("[overlay] ♻️ D3D11 持久贴图路径当前不可用 → 再试一次重建")
+            self._init_texture_path()
+            if self._d3d is not None:
+                self._recover_stage = "rebuild"
+                self._fails_in_stage = 0
+                return
+            # ⚠️ 重试没成功（接口本就不支持 / 设备仍建不起来）时**必须继续往下走**常规阶梯：
+            #    这里若直接 return，会把「失败 → 重建 overlay → 硬重启」整条路挡掉。
+            #    （第一版就是这么写的，被既有的 test_overlay_steamvr.py 抓出来 —— 那台假机器
+            #     的 overlay 没有 setOverlayTexture，本该走旧路自愈。）
         if (self._d3d is not None and self._recover_stage == "none"
                 and not self._d3d.healthy()):
             print("[overlay] ♻️ D3D11 设备已丢失 → 重建持久纹理")
-            self._rebuild_d3d()
+            self._rebuild_d3d("设备已丢失")
             self._recover_stage = "rebuild"    # 再失败就走硬重启那级
             self._fails_in_stage = 0
             return
@@ -576,11 +618,7 @@ class WristOverlay:
             self.available = True
             self._apply_transform()
             self._overlay.showOverlay(self._handle)
-            if self._d3d is not None and not self._d3d.healthy():
-                print("[overlay]   硬重启：D3D11 设备同样已丢失 → 一并重建持久纹理")
-                self._rebuild_d3d()          # 内部会把新纹理重新绑到新 handle
-            else:
-                self._set_overlay_texture()  # 新 handle 上没有任何贴图，D3D 路径要重新绑一次
+            self._rebind_or_rebuild("已硬重启 openvr")  # 新 handle 上没有任何贴图，必须重绑/重建
         except Exception as exc:  # noqa: BLE001
             print(f"[overlay] ⚠️ 硬重启 openvr 失败（下轮失败时再试）："
                   f"{type(exc).__name__}: {exc}")
@@ -726,7 +764,7 @@ class WristOverlay:
                             if render_changed:
                                 # 尺寸变了且走 D3D 路径 → 先重建纹理，再重渲那一帧
                                 if size_changed and self._d3d is not None:
-                                    self._rebuild_d3d()
+                                    self._rebuild_d3d("size_px 变更")
                                 if last_entries:
                                     self._last_entries = None      # 强制重渲
                                     self.update_entries(last_entries, force=True)

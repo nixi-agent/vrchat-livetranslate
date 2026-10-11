@@ -170,8 +170,9 @@ class D3D11Texture:
             for attr in ("driver", "feature_level", "device", "ctx", "_create_texture2d",
                          "_create_srv", "_copy", "_map", "_unmap", "_reason"):
                 setattr(self, attr, getattr(base, attr))
-            self._make_shared_pair(fmt)
+            # ⚠️ 先把归属定下来再建纹理：建到一半失败时，_release_owned() 要据此决定是否放 device/ctx
             self._owns_device = False
+            self._make_shared_pair(fmt)
             return
 
         d3d11 = ctypes.WinDLL("d3d11")
@@ -205,8 +206,8 @@ class D3D11Texture:
         self._unmap = _bind(self.ctx, CTX_UNMAP, [c_void_p, c_uint], restype=None)
         self._reason = _bind(self.device, DEV_REMOVED_REASON, [])
 
+        self._owns_device = True          # 同上：先定归属，失败路径才有据可依
         self._make_shared_pair(fmt)
-        self._owns_device = True
 
     def _new_texture(self, fmt: int, usage: int, bind: int, cpu: int, misc: int = 0) -> int:
         desc = D3D11_TEXTURE2D_DESC(self.width, self.height, 1, 1, fmt, DXGI_SAMPLE_DESC(1, 0),
@@ -231,12 +232,18 @@ class D3D11Texture:
         `SetOverlayTexture` 就永久 `OverlayError_InvalidTexture`（驱动把资源弄坏了）。
         所以内容必须先写进 DYNAMIC 源纹理，再 `CopyResource` 拷进共享纹理（见 upload）。
         """
-        self.texture = self._new_texture(fmt, USAGE_DEFAULT, BIND_SHADER_RESOURCE, 0, MISC_SHARED)
-        self.srv = self._new_srv(self.texture)
-        self._src = self._new_texture(fmt, USAGE_DYNAMIC, BIND_SHADER_RESOURCE, CPU_ACCESS_WRITE)
-        self._shared = self._query_shared_handle()      # 建一次就缓存，别每帧重新 QueryInterface
-        if not self._shared:
-            raise RuntimeError("取 DXGI 共享句柄失败（MISC_SHARED 纹理才支持）")
+        # 先清零：任何一步失败都靠 _release_owned() 按「已建出哪些」释放，不留无人引用的 COM 指针
+        self.texture = self.srv = self._src = self._shared = 0
+        try:
+            self.texture = self._new_texture(fmt, USAGE_DEFAULT, BIND_SHADER_RESOURCE, 0, MISC_SHARED)
+            self.srv = self._new_srv(self.texture)
+            self._src = self._new_texture(fmt, USAGE_DYNAMIC, BIND_SHADER_RESOURCE, CPU_ACCESS_WRITE)
+            self._shared = self._query_shared_handle()  # 建一次就缓存，别每帧重新 QueryInterface
+            if not self._shared:
+                raise RuntimeError("取 DXGI 共享句柄失败（MISC_SHARED 纹理才支持）")
+        except Exception:
+            self._release_owned()          # 构造失败也要好好 Release（含自建的 device/ctx）
+            raise
 
     def _query_shared_handle(self) -> int:
         """QueryInterface(IID_IDXGIResource) → GetSharedHandle()。前者是 IUnknown::QueryInterface(0)。"""
@@ -317,11 +324,22 @@ class D3D11Texture:
         if self._closed:
             return
         self._closed = True
-        if getattr(self, "_src", None):
-            _release(self._src)
-            self._src = 0
-        _release(self.srv)
-        _release(self.texture)
-        if getattr(self, "_owns_device", True):
-            _release(self.ctx)
-            _release(self.device)
+        self._release_owned()
+
+    def _release_owned(self) -> None:
+        """释放**本实例拥有**的 COM 对象（幂等；不会动共享的 device/ctx）。
+
+        与 close() 共用：构造中途失败时也走它 —— 否则 device/ctx（以及 base= 路已建出的
+        texture/srv/_src）没人放，正是「失败路径比成功路径更该谨慎」的那类泄漏。
+        """
+        for attr in ("_src", "srv", "texture"):
+            ptr = getattr(self, attr, 0)
+            if ptr:
+                _release(ptr)
+                setattr(self, attr, 0)
+        if getattr(self, "_owns_device", False):
+            for attr in ("ctx", "device"):
+                ptr = getattr(self, attr, 0)
+                if ptr:
+                    _release(ptr)
+                    setattr(self, attr, 0)

@@ -157,6 +157,18 @@ def _raising_d3d(width: int, height: int, fmt: int = 28, base=None):  # noqa: AN
     raise RuntimeError("D3D11CreateDevice 失败（HARDWARE/WARP 都不行）")
 
 
+class FailOnceD3D(FakeD3D):
+    """第一次构造就抛（模拟 TDR 复位窗口内 `D3D11CreateDevice` **瞬时**失败），之后正常。"""
+
+    attempts = 0
+
+    def __init__(self, width: int, height: int, fmt: int = 28, base=None) -> None:  # noqa: ANN001
+        type(self).attempts += 1
+        if type(self).attempts == 1:
+            raise RuntimeError("D3D11CreateDevice 失败 hr=0x887A0005（DEVICE_REMOVED）")
+        super().__init__(width, height, fmt, base)
+
+
 # ------------------------------------------------------------------ 工具
 def _cfg():
     from vlt.output.overlay import OverlayConfig
@@ -353,6 +365,58 @@ def test_d3d_device_loss_rebuilds_texture() -> None:
     print("  D3D11 设备丢失 → 重建持久纹理 OK")
 
 
+def test_recreate_overlay_rebuilds_when_device_dead() -> None:
+    """设备已死时重建 overlay → 必须**重建纹理**，而不是把一张死纹理绑到新 handle 上。
+
+    实测踩过（复审第 5 条）：`_recreate_overlay()` 原来无条件重绑 → 死纹理绑到新 handle，
+    只能等下一轮**破坏性**的硬重启（还会 shutdown+init openvr）才有机会修回来。
+    """
+    oo = _fresh(FakeD3D)
+    ov = oo.WristOverlay(_cfg())
+    assert ov.start() is True
+    dead = FakeD3D.instances[0]
+    dead.healthy = lambda: False              # type: ignore[method-assign]
+    n_before = len(FakeD3D.instances)
+
+    assert ov._recreate_overlay() is True
+    assert len(FakeD3D.instances) > n_before, "设备已死却没重建纹理（等于把死纹理绑到新 handle）"
+    assert dead.closed is True, "旧（已死）纹理应被 close"
+    assert ov._d3d is not dead and ov._d3d is not None
+    ov.close()
+    print("  设备已死时重建 overlay → 一并重建纹理 OK")
+
+
+def test_tex_path_retries_once_after_transient_failure() -> None:
+    """「D3D 路建不起来」后应再给**一次**机会，否则本会话永久退回旧路。
+
+    实测场景（复审第 1 条）：设备丢失后那次重建恰好在 TDR 复位窗口内失败 → `_d3d` 永久停在
+    None，而 `_init_texture_path()` 只在 `start()` 调过一次 → 静默跑回 `setOverlayRaw`
+    （正是本 PR 要消灭的那条老路）。判据：**建出来了**、且**只再试一次**（别对真死 GPU 反复建设备）。
+    """
+    FailOnceD3D.attempts = 0
+    oo = _fresh(FailOnceD3D)
+    ov = oo.WristOverlay(_cfg())
+    assert ov.start() is True
+    assert ov._d3d is None, "第一次构造失败 → 此刻应无 D3D 纹理（降级状态）"
+
+    RAW_FAIL["remaining"] = 99              # 旧路也失败 → 逼出自愈阶梯
+    CALLS.clear()
+    for _ in range(4):
+        ov.update_entries([("theirs", "Hello", "你好")], force=True)
+
+    assert ov._d3d is not None, "给了重试机会却没建出 D3D 纹理（会永久退回旧路）"
+    assert FailOnceD3D.attempts == 2, f"只该再试一次，实际试了 {FailOnceD3D.attempts} 次"
+    assert "setOverlayTexture" in _names(), f"重试成功后应切到 D3D 路：{_names()}"
+
+    RAW_FAIL["remaining"] = 0
+    CALLS.clear()
+    ov.update_entries([("mine", "你好", "Hello")], force=True)
+    assert "setOverlayTexture" in _names() and "setOverlayRaw" not in _names(), (
+        f"恢复后应稳定走 D3D 路：{_names()}")
+    ov.close()
+    print("  瞬时构造失败 → 只重试一次并切回 D3D 路 OK")
+
+
 def test_base_reuse_copy_list_only_names_the_class_sets() -> None:
     """`base=` 复用路径的拷贝表里，每个名字都必须是**类里真的会设置**的属性。
 
@@ -393,7 +457,16 @@ def test_base_reuse_copy_list_only_names_the_class_sets() -> None:
     assert not missing, (
         f"拷贝表里的这些名字类里根本不会设置（base= 复用路径必炸）：{missing}；"
         f"类里实际会设置的：{sorted(assigned)}")
-    print(f"  base= 拷贝表与实例属性一致（{len(set(copied))} 项）OK")
+    # 顺带守住 base= 分支的结构：先定归属（失败路径才知道该不该放 device/ctx）→ 建纹理 → 标记非自建。
+    base_branch = [n for n in ast.walk(init) if isinstance(n, ast.If)]
+    src_text = ast.unparse(init)
+    assert "_owns_device = False" in src_text and "_make_shared_pair(fmt)" in src_text, (
+        "base= 复用分支少了「定归属 / 建共享纹理」其中之一")
+    assert src_text.index("_owns_device = False") < src_text.index("_make_shared_pair(fmt)"), (
+        "base= 分支必须先定 _owns_device 再建纹理（否则构造失败时释放归属无从判断）")
+    assert "_release_owned" in ast.unparse(cls), "构造失败路径应复用 _release_owned() 释放半成品"
+    assert base_branch, "基类分支解析异常"
+    print(f"  base= 拷贝表与实例属性一致（{len(set(copied))} 项）+ 分支结构 OK")
 
 
 if __name__ == "__main__":
@@ -404,5 +477,7 @@ if __name__ == "__main__":
     test_recreate_and_reinit_rebind_texture()
     test_size_change_rebuilds_texture()
     test_d3d_device_loss_rebuilds_texture()
+    test_recreate_overlay_rebuilds_when_device_dead()
+    test_tex_path_retries_once_after_transient_failure()
     test_base_reuse_copy_list_only_names_the_class_sets()
     print("ALL PASSED")

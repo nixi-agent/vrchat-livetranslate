@@ -406,9 +406,26 @@ STRINGS: dict[str, str] = {
     "手腕屏已开启（位置 / 字号等见「设置 → 手腕屏」）":
         "Wrist overlay is on — position, font size and more are under "
         "\"Settings → Wrist Overlay\"",
-    "手腕屏没启动起来，已自动取消勾选（先把 SteamVR 打开，再勾一次即可）":
-        "The wrist overlay could not start, so the tick was reverted — "
-        "start SteamVR first, then tick it again",
+    "手腕屏没启动起来，已自动取消勾选：{reason}":
+        "The wrist overlay could not start, so the tick was reverted: {reason}",
+    "手腕屏已开启，但锚点设备（手柄 / tracker）还没被追踪：唤醒它面板会自动出现（不用重新勾选）":
+        "The wrist overlay is on, but the anchor device (controller / tracker) is not tracked yet: "
+        "wake it and the panel will appear by itself (no need to tick it again)",
+    # ---- 手腕屏起不来的真因（进状态栏；真因不同解药完全不同，别混成一句「先把 SteamVR 打开」）----
+    "SteamVR 没在运行或不可用：先启动 SteamVR，再勾一次":
+        "SteamVR is not running or not reachable — start it, then tick again",
+    "SteamVR 在跑，但它的合成器没起来：完全退出 SteamVR 再启动一次":
+        "SteamVR is running but its compositor is not — quit SteamVR completely "
+        "and start it again",
+    "SteamVR 在跑，但没检测到头显：戴上头显、确认 SteamVR 里能看到设备，再勾一次":
+        "SteamVR is running but sees no headset — put the headset on, make sure SteamVR "
+        "lists it, then tick again",
+    "选中的锚点设备没被追踪：唤醒手柄 / tracker（或戴上头显）后再勾一次":
+        "The anchor device is not tracked — wake the controller / tracker (or put the "
+        "headset on), then tick again",
+    "原因见日志（程序目录 logs 里最新那份）":
+        "See the log (the newest file in the app folder's logs)",
+
 
     # ---- 桌面字幕（PC 桌面模式叠加窗）----
     "桌面字幕": "Desktop Subtitles",

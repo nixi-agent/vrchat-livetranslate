@@ -37,6 +37,7 @@ from .level_probe import LevelProbe as LevelProbe
 from .ui_tk import _char_width_for as _char_width_for
 from .gui_bindings import _DELEGATE_MAP
 from .gui_proxy import ProxyMethods, _is_test_process as _is_test_process
+from .gui_sinks import overlay_error_text as overlay_error_text
 from . import gui_room, gui_voice, gui_audio, gui_update, gui_settings
 from . import gui_desktop, gui_chat, gui_engine, gui_layout
 from .gui_room import RoomCtx; from .gui_voice import VoiceCtx
@@ -54,7 +55,7 @@ def _yaml_write(p: Path, fn, *, err="保存"):
 # gui.py ↔ EngineCtx 双向同步的属性名
 _GATE_HINT = "只有响度超过门限的声音才会被翻译；改完立刻生效（勾选「启用」后这里显示实时电平）"
 _E2G = ["engines", "engine_dirs", "specs", "sinks", "pending_starts", "current",
-    "auto_scroll", "closing", "overlay_out", "desktop_out", "desktop_dragging",
+    "auto_scroll", "closing", "overlay_out", "overlay_error", "desktop_out", "desktop_dragging",
     "desktop_save_job", "desktop_alpha_touched", "start_job"]
 _G2E = ["power_btn", "direction_var", "chatbox_var", "overlay_var",
     "desktop_var", "vmic_var", "desktop_alpha_var", "desktop_alpha_lbl",
@@ -64,7 +65,7 @@ class TranslationGUI(ProxyMethods):
     def __init__(self, headless: bool = False) -> None:
         self._headless = headless; self._q: queue.Queue = queue.Queue()
         self._engines: list = []; self._engine_dirs: list = []; self._specs: list = []; self._sinks: set = set(); self._pending_starts = 0
-        self._overlay_out: Any = None; self._desktop_out: Any = None; self._desktop_dragging = False
+        self._overlay_out: Any = None; self._overlay_error: str = ""; self._desktop_out: Any = None; self._desktop_dragging = False
         self._desktop_save_job: str | None = None; self._desktop_alpha_touched = False; self._start_job: str | None = None
         self._current: dict = {}; self._auto_scroll = True; self._stop_done_evt = threading.Event(); self._stop_done_evt.set()
         self._voice_ctx = VoiceCtx(); self._bubbles: list = []; self._stats: dict = {}; self._canvas_w = 600
@@ -371,8 +372,20 @@ class TranslationGUI(ProxyMethods):
         self._sync_engine_ctx(); r = gui_engine.start_overlay(self._engine_ctx, force=force); self._overlay_out = self._engine_ctx.overlay_out; self._unsync_engine_ctx(); return r
     def _on_overlay_toggle(self):
         if self._overlay_var.get():
-            if self._start_overlay(force=True): self._set_status("info", t("手腕屏已开启（位置 / 字号等见「设置 → 手腕屏」）"))
-            else: self._overlay_var.set(False); self._set_status("error", t("手腕屏没启动起来，已自动取消勾选（先把 SteamVR 打开，再勾一次即可）"))
+            if self._start_overlay(force=True):
+                # 面板起来了，但锚点设备**还没被追踪**（手柄没醒 / 头显没戴 —— 真机实测那种
+                # `OverlayError_InvalidTrackedDevice`）→ 如实说清：面板留在那儿，设备一被追踪
+                # 它自己会出现，不需要再勾一次（见 openvr_overlay._maybe_apply_anchor）。
+                if getattr(self._overlay_out, "pending_anchor", False):
+                    self._set_status("warn", t("手腕屏已开启，但锚点设备（手柄 / tracker）还没被追踪：唤醒它面板会自动出现（不用重新勾选）"))
+                else:
+                    self._set_status("info", t("手腕屏已开启（位置 / 字号等见「设置 → 手腕屏」）"))
+            else:
+                # 退回勾选时把**真因**写进状态栏：旧文案一律说「先把 SteamVR 打开」，
+                # 而真因可能是「锚点手柄没被追踪 / 没头显」（用户照那句话重试是白费力气）。
+                self._overlay_var.set(False)
+                self._set_status("error", t("手腕屏没启动起来，已自动取消勾选：{reason}",
+                                            reason=overlay_error_text(self._overlay_error)))
         else: self._stop_overlay(); self._sinks.discard("overlay")
         self._save_ui_state()
     def _stop_overlay(self): self._engine_ctx.overlay_out = self._overlay_out; gui_engine._stop_overlay(self._engine_ctx); self._overlay_out = self._engine_ctx.overlay_out

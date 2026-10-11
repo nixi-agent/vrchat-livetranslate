@@ -5,7 +5,8 @@ from typing import Any
 from . import platform
 from . import config as _cfg_mod
 from .config_io import _fmt_scalar, _write_config_text, _yaml_set_or_create
-from .output.overlay import OverlayConfig
+from .output.overlay import (OverlayConfig, OVERLAY_ERR_ANCHOR, OVERLAY_ERR_COMPOSITOR,
+                             OVERLAY_ERR_HMD, OVERLAY_ERR_OTHER, OVERLAY_ERR_RUNTIME)
 from .i18n import t
 from .gui_engine_context import EngineCtx
 
@@ -17,24 +18,84 @@ def start_overlay(ctx: EngineCtx, *, force: bool = False) -> bool:
 
     *force* =True 用于「勾上就起」那条路（此时还没点开始翻译，``ctx.sinks`` 里没有 overlay）。
     返回是否 **真的起来了** —— 调用方要靠它决定失败时是否自动退回勾选。
+
+    ⚠️ 已经有实例时**必须看它是否还活着**（`alive`）：旧写法只判 ``overlay_out is not None``
+    就直接 `return True`，于是「实例还在、但已失效」（硬重启 openvr 失败过 / 已被 close）
+    会让勾选框**点了什么都不做、日志一行没有** —— 用户 v0.11.1 报的「非翻译模式下勾了
+    手腕屏打不开」正是这个观感（勾选 = 重新尝试接管，必须能重建）。
     """
-    if ctx.overlay_out is not None:
+    ov = ctx.overlay_out
+    if ov is not None and _overlay_alive(ov):
         return True                       # 已经起来了，别重复建（会撞 KeyInUse）
+    if ov is not None:
+        print(f"[gui] 手腕屏实例已失效（{_overlay_dead_why(ov)}）→ 关掉并重新接管 SteamVR",
+              flush=True)
+        _stop_overlay(ctx)                # best-effort 关掉，再重建（绝不复用死实例）
     if not force and "overlay" not in ctx.sinks:
         return False
+    if force:
+        print("[gui] 勾选「手腕屏」→ 立刻接管 SteamVR（不需要先点开始翻译）", flush=True)
+    ctx.overlay_error = ""
     try:
         ctx.overlay_out = platform.create_wrist_overlay(
             OverlayConfig.from_dict(ctx.cfg.overlay), config_path=_cfg_mod.DEFAULT_CONFIG)
         if not ctx.overlay_out.start():
+            ctx.overlay_error = _error_code_of(ctx.overlay_out)
+            # 响亮留痕：真因（原因码）+ 明确说清「勾选会退回」，别让用户对着没反应的勾选框排查
+            print(f"[gui] ❌ 手腕屏没建起来（原因={ctx.overlay_error}）：勾选会退回；"
+                  f"真因见上面 [overlay] 那几行，翻译不受影响", flush=True)
             ctx.overlay_out = None        # start() 内部已打印原因
             return False
         push_overlay(ctx, force=True)
         return True
     except Exception as exc:              # noqa: BLE001
         ctx.overlay_out = None
-        print(f"[gui] ⚠️ 手腕屏初始化异常，已禁用（翻译不受影响）："
+        ctx.overlay_error = OVERLAY_ERR_OTHER
+        print(f"[gui] ❌ 手腕屏初始化异常，已禁用（翻译不受影响）："
               f"{type(exc).__name__}: {exc}", flush=True)
         return False
+
+
+def _overlay_alive(ov: Any) -> bool:
+    """实例现在还可用吗？认 `alive`（新），退化认 `available`（Linux 后端 / 老替身）。
+
+    两个属性都没有的极简替身一律当「活着」—— 免得把既有用例与外部实现搞红。
+    """
+    v = getattr(ov, "alive", None)
+    if v is None:
+        v = getattr(ov, "available", None)
+    return True if v is None else bool(v)
+
+
+def _overlay_dead_why(ov: Any) -> str:
+    """给日志一句「为什么算失效」（禁静默：这条日志本身就是本次修复的一半）。"""
+    closed = getattr(ov, "_closed", None)
+    if closed is None:
+        closed = getattr(ov, "closed", None)
+    return "已关闭" if closed else "available=False（接管 SteamVR 失败过）"
+
+
+def _error_code_of(ov: Any) -> str:
+    """起不来的原因码（后端写在实例的 `last_error` 上；取不到就 OTHER）。"""
+    return str(getattr(ov, "last_error", "") or OVERLAY_ERR_OTHER)
+
+
+def overlay_error_text(code: str) -> str:
+    """原因码 → 状态栏文案（**唯一真源**；码定义在 `vlt/output/overlay.py`）。
+
+    ⚠️ 走到这里说明「勾选被自动退回了」。文案必须能区分真因：过去一律写
+    「先把 SteamVR 打开」，而实测的常见真因是**锚点手柄没被追踪**（SteamVR 明明在跑）
+    —— 用户照那句话重试是白费力气。
+    """
+    if code == OVERLAY_ERR_RUNTIME:
+        return t("SteamVR 没在运行或不可用：先启动 SteamVR，再勾一次")
+    if code == OVERLAY_ERR_COMPOSITOR:
+        return t("SteamVR 在跑，但它的合成器没起来：完全退出 SteamVR 再启动一次")
+    if code == OVERLAY_ERR_HMD:
+        return t("SteamVR 在跑，但没检测到头显：戴上头显、确认 SteamVR 里能看到设备，再勾一次")
+    if code == OVERLAY_ERR_ANCHOR:
+        return t("选中的锚点设备没被追踪：唤醒手柄 / tracker（或戴上头显）后再勾一次")
+    return t("原因见日志（程序目录 logs 里最新那份）")
 
 
 def push_overlay(ctx: EngineCtx, force: bool = False) -> None:

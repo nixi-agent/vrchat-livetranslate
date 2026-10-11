@@ -164,7 +164,7 @@ def main() -> int:
     if args.offline or both:
         print("=== 段 A：D3D11 持久贴图（不需要 SteamVR）===")
         ok = check_offline(args.frames) and ok
-    if args.base_reuse:
+    if args.base_reuse and not both:        # both/--offline 已含段 A-2，别重复跑一遍
         print("=== 段 C：base= 复用设备（两张纹理共用一个 device/ctx）===")
         ok = check_base_reuse() and ok
     if args.offline or both:

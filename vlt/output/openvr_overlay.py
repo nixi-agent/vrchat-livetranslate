@@ -34,6 +34,12 @@ from .win_d3d11 import D3D11Texture
 #    否则 50% 灰会明显发灰。
 OVERLAY_COLOR_SPACE = 0
 
+# 「D3D 路当前不可用」之后隔多久再试一次（TDR 复位窗口通常是百毫秒级；2s 足够稳）。
+# ⚠️ 触发点在 `tick()` 而**不是** `_escalate`：设备丢失重建成败后 raw 路会成功，
+#    `_escalate` 要等 raw 再攒够 3 次连续失败才被调用（按旧路特性约 200 帧/2 分钟）——
+#    重试挂在 `_escalate` 上等于永远等不到（复审第 1 条就是这么抓出来的）。
+TEX_RETRY_AFTER_S = 2.0
+
 
 def _make_texture_t(shared_handle: int):
     """构造 OpenVR 的 `Texture_t`：handle = **DXGI 共享句柄**，eType = DXGISharedHandle。
@@ -156,7 +162,8 @@ class WristOverlay:
         self._d3d = None                   # win_d3d11.D3D11Texture；None = 走旧的 setOverlayRaw
         self._tex_disabled = False         # setOverlayTexture 报「不支持」后置真 → 永久回退旧路
         self._tex_fallback_logged = False  # 永久回退只留痕一次（别每帧刷）
-        self._tex_retried = False          # 「D3D 路建不起来」后再试一次的机会（只给一次，见 _escalate）
+        self._tex_retried = False          # 「D3D 路不可用」后**定点重试**一次的机会（整个会话只给一次）
+        self._tex_retry_at = None          # 定点重试的时间点（monotonic；由 _schedule_tex_retry 设置）
         self._last_cfg_mtime = 0.0
         self._last_text_at = 0.0
         # ---- 自愈状态机 + 诊断（用户实测「手腕屏隔一阵就消失」，见 _upload 的注释）----
@@ -427,8 +434,9 @@ class WristOverlay:
             self._set_overlay_texture()      # 立刻绑一次：新 overlay 上此刻还没有任何贴图
         except Exception as exc:  # noqa: BLE001
             self._close_d3d()
-            print(f"[overlay] ⚠️ D3D11 贴图路径不可用，降级用 setOverlayRaw："
+            print(f"[overlay] ⚠️ D3D11 贴图路径不可用，降级用 setOverlayRaw（稍后会再试一次）："
                   f"{type(exc).__name__}: {exc}")
+            self._schedule_tex_retry()      # 可能是瞬时失败（TDR 复位窗口）→ 到点再试一次
             return
         print(f"[overlay] ✅ D3D11 持久贴图路径已启用（{w}x{h}，SetOverlayTexture，"
               f"色空间={OVERLAY_COLOR_SPACE}）")
@@ -438,6 +446,30 @@ class WristOverlay:
         if self._d3d is None:
             return
         self._overlay.setOverlayTexture(self._handle, _make_texture_t(self._d3d.shared_handle))
+
+    def _schedule_tex_retry(self) -> None:
+        """记下「隔一会儿再试一次 D3D 路」的时间点（`_maybe_retry_tex_path` 会在 tick 里兑现）。
+
+        两种入口都会调它：① `start()` 时 `_init_texture_path()` 就失败；② 设备丢失后那次重建失败。
+        真死 GPU 也不会反复建设备 —— 兑现代价是 `_tex_retried`，整个会话只放行一次。
+        """
+        if not self._tex_retried and not self._tex_disabled:
+            self._tex_retry_at = time.monotonic() + TEX_RETRY_AFTER_S
+
+    def _maybe_retry_tex_path(self) -> None:
+        """到点了就再试一次启用 D3D 路（跑在 `tick()` 里，所以不依赖「有上传失败」）。"""
+        if (self._d3d is not None or self._tex_disabled or self._tex_retried
+                or self._tex_retry_at is None or time.monotonic() < self._tex_retry_at):
+            return
+        self._tex_retried = True
+        self._tex_retry_at = None
+        print("[overlay] ♻️ 再试一次启用 D3D11 持久贴图路径（上次不可用）")
+        self._init_texture_path()
+        if self._d3d is not None:
+            # 换路成功：把计数与阶段都清干净，别让新旧两条路的失败历史互相干扰
+            self._upload_fails = 0
+            self._fails_in_stage = 0
+            self._recover_stage = "none"
 
     def _rebind_or_rebuild(self, where: str) -> None:
         """把贴图绑到当前 handle；若 D3D 设备已丢失则先重建纹理。
@@ -471,8 +503,9 @@ class WristOverlay:
             self._set_overlay_texture()
         except Exception as exc:  # noqa: BLE001
             self._close_d3d()
-            print(f"[overlay] ⚠️ 重建 D3D11 纹理失败（{reason}），降级用 setOverlayRaw："
+            print(f"[overlay] ⚠️ 重建 D3D11 纹理失败（{reason}），降级用 setOverlayRaw（稍后会再试一次）："
                   f"{type(exc).__name__}: {exc}")
+            self._schedule_tex_retry()      # 同上：瞬时失败给一次定点重试的机会
             return
         print(f"[overlay] ♻️ D3D11 纹理已重建（{reason}）：{w}x{h}")
 
@@ -557,28 +590,18 @@ class WristOverlay:
         # `_recreate_overlay`/`_hard_reinit` 反复重建 SteamVR 侧（还会 shutdown+init openvr），
         # 面板永远回不来（实测：20 帧后 _d3d 还是那个坏设备，硬重启计数却在涨）。
         # 只在 none 阶段试一次（成功则计数器由下一次上传结果重置；失败则交给下面两级），避免重建风暴。
-        # 反向情形：设备丢失后那次重建**瞬时**失败（TDR 复位窗口内 D3D11CreateDevice 会失败），
-        # `_d3d` 就永久停在 None、静默退回 setOverlayRaw —— 正是本 PR 要消灭的那条老路。
-        # 这里再给一次机会；`_tex_retried` 挡住「GPU 真死了还反复建设备」。
-        if (self._d3d is None and not self._tex_disabled and not self._tex_retried
-                and self._recover_stage == "none"):
-            self._tex_retried = True
-            print("[overlay] ♻️ D3D11 持久贴图路径当前不可用 → 再试一次重建")
-            self._init_texture_path()
-            if self._d3d is not None:
-                self._recover_stage = "rebuild"
-                self._fails_in_stage = 0
-                return
-            # ⚠️ 重试没成功（接口本就不支持 / 设备仍建不起来）时**必须继续往下走**常规阶梯：
-            #    这里若直接 return，会把「失败 → 重建 overlay → 硬重启」整条路挡掉。
-            #    （第一版就是这么写的，被既有的 test_overlay_steamvr.py 抓出来 —— 那台假机器
-            #     的 overlay 没有 setOverlayTexture，本该走旧路自愈。）
+        # 设备丢失（TDR / 驱动重置 / 适配器移除）：重建持久纹理。**只在建成功时**才把阶段推到
+        # "rebuild"；建失败（复位窗口内的瞬时失败 → `_d3d` 变 None）时保持 "none"，
+        # 交给 `tick()` 的定点重试（`_maybe_retry_tex_path`）—— 重试挂在这里是等不到的：
+        # raw 路随后会成功，`_escalate` 要等 raw 再攒够 3 次连续失败才被调用（约 200 帧/2 分钟）。
+        # ① 见复审第 1 条（这一条我第一版就是这么错的）。
         if (self._d3d is not None and self._recover_stage == "none"
                 and not self._d3d.healthy()):
             print("[overlay] ♻️ D3D11 设备已丢失 → 重建持久纹理")
             self._rebuild_d3d("设备已丢失")
-            self._recover_stage = "rebuild"    # 再失败就走硬重启那级
-            self._fails_in_stage = 0
+            if self._d3d is not None:
+                self._recover_stage = "rebuild"   # 再失败就走硬重启那级
+                self._fails_in_stage = 0
             return
         if self._recover_stage == "none":
             print(f"[overlay] ♻️ 贴图连续失败 {self._upload_fails} 次 → 重建 overlay")
@@ -708,6 +731,7 @@ class WristOverlay:
         # 配置热重载（位置/尺寸改完存盘即生效，无需重启）
         if self.dry_run:
             return
+        self._maybe_retry_tex_path()       # D3D 路曾不可用 → 到点再试一次（不依赖上传失败）
         if self.config_path and self.config_path.exists():
             mtime = self.config_path.stat().st_mtime
             if mtime != self._last_cfg_mtime:

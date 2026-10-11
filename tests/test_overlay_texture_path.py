@@ -157,6 +157,23 @@ def _raising_d3d(width: int, height: int, fmt: int = 28, base=None):  # noqa: AN
     raise RuntimeError("D3D11CreateDevice 失败（HARDWARE/WARP 都不行）")
 
 
+def _boom_upload(_data: bytes) -> None:
+    """模拟设备丢失后 `Map()` 恒失败（DEVICE_REMOVED）。"""
+    raise RuntimeError("Map(源纹理) 失败 hr=0x887A0005")
+
+
+class FailSecondD3D(FakeD3D):
+    """第 1 次构造成功、**第 2 次抛**（设备丢失后那次重建在 TDR 复位窗口内失败）、之后正常。"""
+
+    attempts = 0
+
+    def __init__(self, width: int, height: int, fmt: int = 28, base=None) -> None:  # noqa: ANN001
+        type(self).attempts += 1
+        if type(self).attempts == 2:
+            raise RuntimeError("D3D11CreateDevice 失败 hr=0x887A0005（DEVICE_REMOVED）")
+        super().__init__(width, height, fmt, base)
+
+
 class FailOnceD3D(FakeD3D):
     """第一次构造就抛（模拟 TDR 复位窗口内 `D3D11CreateDevice` **瞬时**失败），之后正常。"""
 
@@ -395,26 +412,65 @@ def test_tex_path_retries_once_after_transient_failure() -> None:
     """
     FailOnceD3D.attempts = 0
     oo = _fresh(FailOnceD3D)
+    oo.TEX_RETRY_AFTER_S = 0.0              # 测试里不等 2s
     ov = oo.WristOverlay(_cfg())
     assert ov.start() is True
-    assert ov._d3d is None, "第一次构造失败 → 此刻应无 D3D 纹理（降级状态）"
+    assert ov._d3d is None, "第一次构造失败 → 此刻应无 D3D 纹理（暂时走旧路）"
 
-    RAW_FAIL["remaining"] = 99              # 旧路也失败 → 逼出自愈阶梯
-    CALLS.clear()
-    for _ in range(4):
-        ov.update_entries([("theirs", "Hello", "你好")], force=True)
-
-    assert ov._d3d is not None, "给了重试机会却没建出 D3D 纹理（会永久退回旧路）"
+    ov.tick()                               # ← 定点重试在这里兑现（不依赖上传失败）
+    assert ov._d3d is not None, "给了重试机会却没建出 D3D 纹理（会一直停在旧路）"
     assert FailOnceD3D.attempts == 2, f"只该再试一次，实际试了 {FailOnceD3D.attempts} 次"
-    assert "setOverlayTexture" in _names(), f"重试成功后应切到 D3D 路：{_names()}"
 
-    RAW_FAIL["remaining"] = 0
     CALLS.clear()
     ov.update_entries([("mine", "你好", "Hello")], force=True)
     assert "setOverlayTexture" in _names() and "setOverlayRaw" not in _names(), (
         f"恢复后应稳定走 D3D 路：{_names()}")
+    ov.tick()
+    ov.tick()
+    assert FailOnceD3D.attempts == 2, f"定点重试只该一次，实际 {FailOnceD3D.attempts} 次"
     ov.close()
-    print("  瞬时构造失败 → 只重试一次并切回 D3D 路 OK")
+    print("  start 期构造失败 → tick 定点重试一次并切回 D3D 路 OK")
+
+
+def test_device_loss_rebuild_failure_then_retry_recovers() -> None:
+    """复审第 1 条的**真场景**：设备已建好 → 设备丢失 → 那次重建瞬时失败 → 恢复。
+
+    上一版把重试挂在 `_escalate` 且要求 `stage == "none"`：设备丢失分支先跑并把阶段推成
+    "rebuild" → 判据恒不成立；raw 路随后成功又没人再调 `_escalate` → 会话静默跑回旧路。
+    本用例按这条路径构造，断言 `tick()` 的定点重试救回来、且只试一次。
+    """
+    FailSecondD3D.attempts = 0
+    oo = _fresh(FailSecondD3D)
+    oo.TEX_RETRY_AFTER_S = 0.0
+    ov = oo.WristOverlay(_cfg())
+    assert ov.start() is True
+    dead = FakeD3D.instances[0]
+    dead.upload = _boom_upload                  # type: ignore[method-assign]
+    dead.healthy = lambda: False                # type: ignore[method-assign]
+
+    # ⚠️ 正好 3 帧：第 3 帧触发自愈阶梯（设备丢失分支 → 重建失败）。**别多跑**——第 4 帧的 raw 成功
+    #    会把阶段重置回 "none"，那样「重建失败时阶段必须保持 none」这条判据就失去分辨力了（踩过）。
+    for _ in range(3):
+        ov.update_entries([("theirs", "Hello", "你好")], force=True)
+    assert FailSecondD3D.attempts == 2, f"没走到「设备丢失后重建」：{FailSecondD3D.attempts} 次"
+    assert ov._d3d is None, "那次重建应失败（模拟 TDR 复位窗口）"
+    assert ov._recover_stage == "none", (
+        f"重建失败时阶段必须保持 none（否则下一级直接是破坏性的硬重启）：{ov._recover_stage}")
+
+    CALLS.clear()
+    ov.tick()                                   # ← 定点重试
+    assert ov._d3d is not None, "tick 的定点重试没建出纹理（会话会静默退回旧路）"
+    assert FailSecondD3D.attempts == 3, f"应正好再试一次：{FailSecondD3D.attempts} 次"
+
+    ov.update_entries([("mine", "你好", "Hello")], force=True)
+    assert "setOverlayTexture" in _names() and "setOverlayRaw" not in _names(), (
+        f"恢复后应稳定走 D3D 路：{_names()}")
+    assert not [c for c in CALLS if c[0] == "shutdown"], "不该为此去硬重启 openvr"
+    ov.tick()
+    ov.tick()
+    assert FailSecondD3D.attempts == 3, f"定点重试只该一次：{FailSecondD3D.attempts} 次"
+    ov.close()
+    print("  设备丢失→重建瞬时失败→tick 定点重试救回 OK")
 
 
 def test_base_reuse_copy_list_only_names_the_class_sets() -> None:
@@ -478,6 +534,7 @@ if __name__ == "__main__":
     test_size_change_rebuilds_texture()
     test_d3d_device_loss_rebuilds_texture()
     test_recreate_overlay_rebuilds_when_device_dead()
+    test_device_loss_rebuild_failure_then_retry_recovers()
     test_tex_path_retries_once_after_transient_failure()
     test_base_reuse_copy_list_only_names_the_class_sets()
     print("ALL PASSED")

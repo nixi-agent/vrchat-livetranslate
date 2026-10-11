@@ -1,0 +1,383 @@
+"""手腕屏「面板不可用自愈断链」+「兼容模式（旧路）降级留痕 / 主动重建」的离线守卫。
+
+## 为什么要有这个测试（三条实测出来的真问题）
+
+1. **自愈断链**：`openvr_overlay.WristOverlay` 里上传 / 心跳 / 热重载**全都**有
+   `if not self.available` 早退，而 `_hard_reinit()` 失败会把 `available` 置 False。
+   于是从那一刻起：没有任何上传会发生 → 没有失败 → `_escalate()` 再也不会被调用 →
+   `_hard_reinit` 里那句「下轮失败时再试」**永远等不到**。用户看到的就是「手腕屏内容不
+   再更新 / 比桌面慢」而日志一片安静。判据：`available=False` 后 tick 必须能自己救回来，
+   且退避有界（不能变成重建风暴）。
+
+2. **兼容模式（`setOverlayRaw` 旧路）的僵住**：旧路每约 200 次上传必挂
+   （`OverlayError_RequestFailed`，见 `vlt/output/win_d3d11.py` 的 docstring 与用户真机日志
+   「重建=20/硬重启=20」）。原来**等它挂了**才靠自愈阶梯救 → 症状（僵住数秒）已经发生。
+   现在按帧数主动重建，把「僵住数秒」换成「一次极短的刷新」。
+
+3. **降级必须响亮**：用户报「手腕屏比桌面晚几秒」时，如果只打一行日志、界面什么都不说，
+   他只能靠猜。`degraded_note` 由引擎每帧转发到状态栏（`Engine._relay_overlay_note`）。
+
+全部离线：假 openvr + 假 D3D，不碰真实 steamvr/d3d11。
+"""
+from __future__ import annotations
+
+import ast
+import contextlib
+import io
+import sys
+import time
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import vlt.output.openvr_overlay as _oo_mod  # noqa: E402  取模块常量的原始值（用例会临时改）
+
+_ORIG_TUNING = (_oo_mod.REINIT_BACKOFF_S, _oo_mod.REINIT_BACKOFF_MAX_S,
+                _oo_mod.RAW_REBUILD_EVERY_FRAMES)
+
+CALLS: list[tuple] = []
+INIT_FAIL = {"on": False, "count": 0}   # True → openvr.init() 抛错（模拟 SteamVR 换代/没起来）
+TEX_UNSUPPORTED = {"on": False}         # True → setOverlayTexture 抛 InvalidTexture
+HAS_TEX_API = {"on": True}              # False → 假 overlay 干脆没有 setOverlayTexture
+
+
+class _FakeHmdMatrix34_t:
+    def __init__(self) -> None:
+        self.m = [[0.0] * 4 for _ in range(3)]
+
+
+class _FakeTexture_t:
+    def __init__(self) -> None:
+        self.handle = None
+        self.eType = -1
+        self.eColorSpace = -1
+
+
+class _RawOnlyOverlay:
+    """只有旧路接口的 overlay（老 SteamVR 的真实形状）。"""
+
+    def createOverlay(self, key, name):  # noqa: ANN001, ANN201
+        CALLS.append(("createOverlay", key))
+        return 7
+
+    def destroyOverlay(self, handle):  # noqa: ANN001
+        CALLS.append(("destroyOverlay", handle))
+
+    def setOverlayWidthInMeters(self, handle, w):  # noqa: ANN001
+        CALLS.append(("setOverlayWidthInMeters", round(float(w), 4)))
+
+    def setOverlayAlpha(self, handle, a):  # noqa: ANN001
+        CALLS.append(("setOverlayAlpha", round(float(a), 4)))
+
+    def setOverlayCurvature(self, handle, c):  # noqa: ANN001
+        CALLS.append(("setOverlayCurvature", round(float(c), 4)))
+
+    def setOverlayTransformTrackedDeviceRelative(self, handle, device, mat):  # noqa: ANN001
+        CALLS.append(("setOverlayTransformTrackedDeviceRelative", device))
+
+    def setOverlayRaw(self, handle, buf, w, h, depth):  # noqa: ANN001
+        CALLS.append(("setOverlayRaw", w, h, depth))
+
+    def showOverlay(self, handle):  # noqa: ANN001
+        CALLS.append(("showOverlay", handle))
+
+    def findOverlay(self, key):  # noqa: ANN001, ANN201
+        return 7
+
+    def isOverlayVisible(self, handle):  # noqa: ANN001, ANN201
+        return True
+
+
+class _TexOverlay(_RawOnlyOverlay):
+    """新路接口也在的 overlay。"""
+
+    def setOverlayTexture(self, handle, tex):  # noqa: ANN001
+        if TEX_UNSUPPORTED["on"]:
+            raise RuntimeError("OverlayError_InvalidTexture")
+        CALLS.append(("setOverlayTexture", handle, tex.eType,
+                      getattr(tex.handle, "value", tex.handle)))
+
+
+def _install_fake_openvr() -> types.ModuleType:
+    m = types.ModuleType("openvr")
+    m.VRApplication_Background = 3
+    m.TrackedControllerRole_LeftHand = 1
+    m.TrackedControllerRole_RightHand = 2
+    m.TrackedDeviceClass_GenericTracker = 4
+    m.k_unMaxTrackedDeviceCount = 64
+    m.k_unTrackedDeviceIndex_Hmd = 0
+    m.TextureType_DirectX = 0
+    m.TextureType_DXGISharedHandle = 5
+    m.ColorSpace_Auto = 0
+    m.HmdMatrix34_t = _FakeHmdMatrix34_t
+    m.Texture_t = _FakeTexture_t
+
+    def _init(_app_type):  # noqa: ANN001, ANN202
+        INIT_FAIL["count"] += 1
+        if INIT_FAIL["on"]:
+            raise RuntimeError("InitError_Init_NoServerForBackgroundApp")
+        return types.SimpleNamespace()
+
+    m.init = _init
+    m.VR_IsHmdPresent = lambda: True
+    m.IVROverlay = lambda: (_TexOverlay() if HAS_TEX_API["on"] else _RawOnlyOverlay())
+    m.shutdown = lambda: CALLS.append(("shutdown",))
+    sys.modules["openvr"] = m
+    return m
+
+
+class FakeD3D:
+    instances: list["FakeD3D"] = []
+
+    def __init__(self, width: int, height: int, fmt: int = 28, base=None) -> None:  # noqa: ANN001
+        self.width, self.height = width, height
+        self.texture, self.srv, self.shared_handle = 0x1234, 0x5678, 0xDEAD
+        self.uploads, self.closed = 0, False
+        FakeD3D.instances.append(self)
+
+    def upload(self, data: bytes) -> None:
+        self.uploads += 1
+
+    def healthy(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FailOnceD3D(FakeD3D):
+    """第一次构造就抛（TDR 复位窗口），之后正常。"""
+
+    attempts = 0
+
+    def __init__(self, width: int, height: int, fmt: int = 28, base=None) -> None:  # noqa: ANN001
+        type(self).attempts += 1
+        if type(self).attempts == 1:
+            raise RuntimeError("D3D11CreateDevice 失败 hr=0x887A0005")
+        super().__init__(width, height, fmt, base)
+
+
+def _fresh(d3d_cls=FakeD3D, tex_api: bool = True):
+    CALLS.clear()
+    FakeD3D.instances.clear()
+    INIT_FAIL["on"] = False
+    INIT_FAIL["count"] = 0
+    TEX_UNSUPPORTED["on"] = False
+    HAS_TEX_API["on"] = tex_api
+    _install_fake_openvr()
+    import vlt.output.openvr_overlay as oo
+    oo.D3D11Texture = d3d_cls
+    # ⚠️ 用例会就地改这些模块常量（缩短等待/帧数）→ 每个用例开头必须还原，
+    #    否则「上一个用例改的」会静默污染下一个（实测：退避测试被前一个用例的 0.0 带跑偏）。
+    oo.REINIT_BACKOFF_S, oo.REINIT_BACKOFF_MAX_S, oo.RAW_REBUILD_EVERY_FRAMES = _ORIG_TUNING
+    return oo
+
+
+def _cfg():
+    from vlt.output.overlay import OverlayConfig
+
+    return OverlayConfig()
+
+
+def _count(name: str) -> int:
+    return sum(1 for c in CALLS if c[0] == name)
+
+
+def _names() -> list[str]:
+    return [c[0] for c in CALLS]
+
+
+# ---------------------------------------------------------------- C：自愈断链
+def test_unavailable_selfheals_and_repushes() -> None:
+    """`available=False` 之后：退避窗口内不重试；到点必须自己救回来并重贴内容。
+
+    故障注入：把 `tick()` 里的 `_maybe_reinit()` 删掉 → 本条红（面板永远停在最后一帧）。
+    """
+    oo = _fresh()
+    ov = oo.WristOverlay(_cfg())
+    assert ov.start() is True
+    ov.update_entries([("theirs", "Hello", "你好")], force=True)
+    assert ov.available is True
+
+    # —— 制造「硬重启失败」现场（真实成因：SteamVR 换代 / 合成器重启后接口指针全废）——
+    INIT_FAIL["on"] = True
+    ov.available = False
+    oo.REINIT_BACKOFF_S = 30.0                      # 退避窗口 30s
+    ov._schedule_reinit("硬重启失败")
+    attempts = INIT_FAIL["count"]
+    ov.tick()
+    ov.tick()
+    assert INIT_FAIL["count"] == attempts, (
+        f"退避窗口内不该反复重试（会变成重建风暴）：{INIT_FAIL['count'] - attempts} 次")
+
+    # —— 到点重试一次：仍然失败 → 保持不可用 + 重排下一次（不风暴、也不静默死掉）——
+    oo.REINIT_BACKOFF_S = 0.0
+    ov._reinit_at = time.monotonic() - 1.0
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ov.tick()
+    assert INIT_FAIL["count"] - attempts == 1, "到点应正好重试一次"
+    assert ov.available is False, "init 仍失败时不该假装可用"
+    assert ov._reinit_at is not None, "失败后必须重排下一次（否则又变成永远不试）"
+    assert "面板不可用 → 重试接管 SteamVR" in buf.getvalue(), f"缺重试留痕：{buf.getvalue()}"
+
+    # —— SteamVR 回来了 → 同一条路必须把面板救回来，并把内容重贴回去 ——
+    INIT_FAIL["on"] = False
+    ov._reinit_at = time.monotonic() - 1.0
+    CALLS.clear()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ov.tick()
+    assert ov.available is True, f"init 恢复后 tick 没能救回面板：{ov.available}"
+    assert ov._reinit_fails == 0, "救回来后退避计数要清零"
+    assert "createOverlay" in _names(), f"没有重新接管 overlay：{_names()}"
+    assert "setOverlayTexture" in _names() or "setOverlayRaw" in _names(), (
+        f"恢复后没有把面板内容重贴回去：{_names()}")
+    ov.close()
+    print("  available=False → 退避重试自愈并重贴内容 OK")
+
+
+def test_reinit_backoff_is_bounded() -> None:
+    """退避必须**翻倍且封顶**（5s→10s→20s→40s→60s→60s）—— 真死 GPU 时不能风暴。"""
+    oo = _fresh()
+    ov = oo.WristOverlay(_cfg())
+    assert ov.start() is True
+    delays = []
+    for _ in range(6):
+        t0 = time.monotonic()
+        ov._schedule_reinit("测试")
+        delays.append(round(ov._reinit_at - t0))
+    assert delays == [5, 10, 20, 40, 60, 60], f"退避节奏不对（应翻倍封顶 60s）：{delays}"
+    ov.close()
+    print(f"  不可用重试退避有界：{delays} OK")
+
+
+def test_heartbeat_logs_even_when_unavailable() -> None:
+    """心跳必须在不可用时**继续**打（其余路径全早退，日志一安静就再也查不出死在哪一刻）。"""
+    oo = _fresh()
+    ov = oo.WristOverlay(_cfg())
+    assert ov.start() is True
+    ov.available = False
+    ov.HEARTBEAT_S = 0.0                     # 立刻到点
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ov.tick()
+    out = buf.getvalue()
+    assert "心跳" in out, f"不可用时心跳没了（等于事后无据可查）：{out}"
+    assert "面板=不可用" in out, f"心跳里要能看出面板状态：{out}"
+    assert "上传路=" in out, f"心跳里要能看出走的是哪条上传路：{out}"
+    ov.close()
+    print("  面板不可用时心跳仍留痕（含面板状态/上传路）OK")
+
+
+# ---------------------------------------------------------------- B：兼容模式
+def test_raw_path_rebuilds_before_the_200_wall() -> None:
+    """兼容模式（旧路）必须**主动**重建，而不是等每 ~200 次上传挂掉之后再自愈。
+
+    故障注入：删掉 `_upload_raw` 里的主动重建 → `createOverlay` 只会有最初那一次 → 本条红。
+    """
+    oo = _fresh(tex_api=False)                 # 老 SteamVR：没有 setOverlayTexture
+    oo.RAW_REBUILD_EVERY_FRAMES = 3            # 测试里缩短（生产 150）
+    ov = oo.WristOverlay(_cfg())
+    assert ov.start() is True
+    CALLS.clear()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        for i in range(3):                     # 第 3 帧到点 → 主动重建
+            ov.update_entries([("theirs", f"hi{i}", f"你好{i}")], force=True)
+    out = buf.getvalue()
+    assert _count("createOverlay") == 1, f"应正好主动重建一次：{_names()}"
+    assert _count("destroyOverlay") == 1, f"重建前应先销毁旧 overlay：{_names()}"
+    assert "主动重建" in out, f"缺主动重建留痕：{out}"
+    assert _count("setOverlayRaw") >= 4, (
+        f"重建后必须把面板内容重贴回去（3 帧 + 重贴 1 帧）：{_names()}")
+    ov.close()
+    print("  兼容模式按帧数主动重建（不等 ~200 次挂掉）OK")
+
+
+def test_degraded_note_is_loud_and_clears_on_recovery() -> None:
+    """降级必须**响亮可查**：`degraded_note` 要有面向用户的说明 + 日志说清代价；恢复后清空。"""
+    # ① 老 SteamVR（接口没有 setOverlayTexture）→ 兼容模式：说明 + 留痕
+    oo = _fresh(tex_api=False)
+    ov = oo.WristOverlay(_cfg())
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert ov.start() is True
+    out = buf.getvalue()
+    assert ov.degraded_note and "兼容" in ov.degraded_note, f"降级说明缺失：{ov.degraded_note!r}"
+    assert "不支持贴图直传" in out, f"缺降级留痕：{out}"
+    ov.close()
+
+    # ② setOverlayTexture 报不支持 → 永久回退：日志要把**已知代价**写出来（用户可感知）
+    oo = _fresh()
+    ov = oo.WristOverlay(_cfg())
+    assert ov.start() is True
+    TEX_UNSUPPORTED["on"] = True
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ov.update_entries([("theirs", "Hello", "你好")], force=True)
+    out = buf.getvalue()
+    assert ov.degraded_note, "永久回退后必须有面向用户的降级说明"
+    assert "已知代价" in out and "200" in out, f"没把旧路的已知代价说清楚：{out}"
+    assert ov._tex_disabled is True
+    ov.close()
+
+    # ③ 瞬时失败 → tick 定点重试成功 → 说明必须被清掉（否则状态栏会一直挂着警告）
+    FailOnceD3D.attempts = 0
+    oo = _fresh(FailOnceD3D)
+    oo.TEX_RETRY_AFTER_S = 0.0
+    ov = oo.WristOverlay(_cfg())
+    assert ov.start() is True
+    assert ov.degraded_note, "首次构造失败后应给出「暂时降级」说明"
+    ov.tick()                                  # 定点重试 → 成功
+    assert ov._d3d is not None
+    assert ov.degraded_note is None, f"恢复后降级说明必须清空：{ov.degraded_note!r}"
+    ov.close()
+    print("  降级说明响亮可查、恢复后清空 OK")
+
+
+def test_engine_relays_degraded_note_once() -> None:
+    """引擎必须把降级说明转发到状态栏（**只在变化时**一次），并且在 tick 里调用它。"""
+    from vlt.engine import Engine, EngineEvents
+
+    eng = Engine.__new__(Engine)               # 只测这一个方法，不构造整台引擎
+    seen: list[tuple[str, str]] = []
+    eng._events = EngineEvents(on_status=lambda lvl, msg: seen.append((lvl, msg)))
+    eng._overlay_note_seen = None
+    eng._overlay = types.SimpleNamespace(degraded_note="手腕屏暂时退回兼容刷新方式（测试）")
+    eng._relay_overlay_note()
+    eng._relay_overlay_note()                  # 同一说明不重复推
+    assert seen == [("warn", "手腕屏暂时退回兼容刷新方式（测试）")], f"应在变化时推一次：{seen}"
+
+    eng._overlay.degraded_note = None          # 恢复：不再改写状态栏（日志里已有）
+    eng._relay_overlay_note()
+    assert len(seen) == 1, f"恢复不该重复打扰用户：{seen}"
+
+    # 没有 degraded_note 属性的后端（Linux / 假对象）必须静默跳过
+    eng._overlay = object()
+    eng._overlay_note_seen = None
+    eng._relay_overlay_note()
+    assert len(seen) == 1, "可选属性缺失时不该抛异常/不该推空消息"
+
+    # 接线守卫：`_relay_overlay_note()` 必须真的挂在每帧的 `_pump_loop` 里（别只定义不调用）
+    src = Path(ROOT / "vlt" / "engine.py").read_text(encoding="utf-8")
+    # `_pump_loop` 是 async def（AsyncFunctionDef），别只挑 FunctionDef（踩过：KeyError）
+    fns = {n.name: n for n in ast.walk(ast.parse(src))
+           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    pump = ast.unparse(fns["_pump_loop"])
+    assert "_relay_overlay_note" in pump and "tick()" in pump, (
+        f"_pump_loop 里没有转发降级说明（等于用户永远看不到）：{pump}")
+    print("  降级说明经 on_status 推一次 + 接线在 _pump_loop OK")
+
+
+if __name__ == "__main__":
+    print("test_overlay_recovery:")
+    test_unavailable_selfheals_and_repushes()
+    test_reinit_backoff_is_bounded()
+    test_heartbeat_logs_even_when_unavailable()
+    test_raw_path_rebuilds_before_the_200_wall()
+    test_degraded_note_is_loud_and_clears_on_recovery()
+    test_engine_relays_degraded_note_once()
+    print("ALL PASSED")

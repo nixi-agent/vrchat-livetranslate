@@ -40,6 +40,20 @@ OVERLAY_COLOR_SPACE = 0
 #    重试挂在 `_escalate` 上等于永远等不到（复审第 1 条就是这么抓出来的）。
 TEX_RETRY_AFTER_S = 2.0
 
+# —— 「面板整个不可用」之后的重试节奏（`available=False` 的自愈，见 `_maybe_reinit`）——
+# 背景：`_hard_reinit()` 失败会置 `available=False`，而上传 / 心跳 / 热重载**全部**有
+# `if not self.available` 早退 → 从此再没有任何一次上传失败去驱动 `_escalate`，
+# 那句「下轮失败时再试」永远等不到：面板冻结在最后一帧、日志也安静了。
+# 现在按退避重试（5s 起步、翻倍、封顶 60s），既不静默死掉，也不会变成重建风暴。
+REINIT_BACKOFF_S = 5.0
+REINIT_BACKOFF_MAX_S = 60.0
+
+# 兼容模式（走 `setOverlayRaw` 旧路）下**主动**重建面板的间隔（帧）。
+# 旧路每约 200 次上传必挂（`OverlayError_RequestFailed`，openvr#772 / #1565），用户可感知
+# 症状是「每 ~2 分钟僵住数秒」。等它挂掉再靠自愈阶梯救 = 症状已经发生；所以改成**提前**
+# 重建（帧数到点就重建，此刻屏幕上是干净的最后一帧，用户只会看到一次极短的刷新）。
+RAW_REBUILD_EVERY_FRAMES = 150
+
 
 def _make_texture_t(shared_handle: int):
     """构造 OpenVR 的 `Texture_t`：handle = **DXGI 共享句柄**，eType = DXGISharedHandle。
@@ -166,6 +180,9 @@ class WristOverlay:
         self._tex_retry_at = None          # 定点重试的时间点（monotonic；由 _schedule_tex_retry 设置）
         self._last_cfg_mtime = 0.0
         self._last_text_at = 0.0
+        # ---- 兼容模式（旧路 setOverlayRaw）下的主动重建 + 降级留痕 ----
+        self._raw_frames = 0               # 兼容模式下自上次重建以来成功刷新的帧数（见 RAW_REBUILD_EVERY_FRAMES）
+        self.degraded_note = None          # 面向用户的降级说明（None = 正常走持久贴图路）；见 _note_degraded
         # ---- 自愈状态机 + 诊断（用户实测「手腕屏隔一阵就消失」，见 _upload 的注释）----
         self._last_ok_at = 0.0             # 最后一次成功上传贴图的时刻（monotonic）
         self._recover_stage = "none"       # none / rebuild / reinit
@@ -174,6 +191,8 @@ class WristOverlay:
         self._reinits_since_ok = 0         # 自上次成功以来硬重启几次
         self._rebuilds = 0                 # 累计
         self._reinits = 0
+        self._reinit_at = None             # 「面板不可用」后的下一次重试时间点（monotonic）
+        self._reinit_fails = 0             # 不可用状态下的重试次数（退避用）
         self._last_heartbeat = 0.0
         self.available = False
         self.frames_updated = 0
@@ -349,7 +368,12 @@ class WristOverlay:
             self._upload_raw(img)
 
     def _upload_raw(self, img: Image.Image) -> None:
-        """旧路（降级兜底）：`setOverlayRaw` 每帧新建一张贴图，高频刷新约 200 次后会撞墙。"""
+        """旧路（降级兜底）：`setOverlayRaw` 每帧新建一张贴图，高频刷新约 200 次后会撞墙。
+
+        ⚠️ 这条路的性质是**已知缺陷**（见模块 docstring / openvr#772）：我们不用「等它挂了
+        再自愈」，而是按帧数**主动**重建（`RAW_REBUILD_EVERY_FRAMES`），把「僵住数秒」换
+        成「一次极短的刷新」。
+        """
         w, h = img.size
         data = _rgba_bytes(img)            # 与 D3D 路**同一口径**（见 _rgba_bytes）
         buf = ctypes.create_string_buffer(data, len(data))
@@ -359,6 +383,13 @@ class WristOverlay:
             self._on_upload_failure(exc, "setOverlayRaw")
             return
         self._on_upload_success(w, h)
+        self._raw_frames += 1
+        if self._raw_frames >= RAW_REBUILD_EVERY_FRAMES:
+            # 先清零再重建：重建内部会重贴一帧（force=True）→ 不清零就会立刻再触发一次
+            self._raw_frames = 0
+            print(f"[overlay] ♻️ 兼容模式：已连续刷新 {RAW_REBUILD_EVERY_FRAMES} 帧 → "
+                  f"主动重建面板（旧路约 200 次上传必挂，提前换掉以免僵住数秒）")
+            self._recreate_overlay()
 
     def _upload_texture(self, img: Image.Image) -> None:
         """新路：只更新持久 D3D11 纹理的内容，再把它交给 `setOverlayTexture`（不新建任何贴图）。"""
@@ -414,6 +445,16 @@ class WristOverlay:
             print(f"[overlay] ← 贴图已更新（{w}x{h}, 第 {self.frames_updated} 帧）")
 
     # ---------- D3D11 持久贴图路径：启用 / 绑定 / 重建 / 回退 ----------
+    def _note_degraded(self, note: str | None) -> None:
+        """记下**面向用户**的降级说明（`None` = 已在正常路径上）。
+
+        用途：`engine` 每帧把它与上一帧比对，变了就经 `on_status` 推到状态栏（禁静默降级）。
+        日志那几行仍然照打 —— 状态栏会被后续消息覆盖，日志才是事后可查的那一份。
+        """
+        if note != self.degraded_note:
+            self.degraded_note = note
+            print(f"[overlay] ⚠️ 手腕屏降级状态变化：{note or '已恢复正常（持久贴图路）'}", flush=True)
+
     def _init_texture_path(self) -> None:
         """尝试启用「持久 D3D11 贴图 + SetOverlayTexture」；任何一步失败都留一行痕并降级到旧路。
 
@@ -427,6 +468,8 @@ class WristOverlay:
             return
         if self._overlay is None or not hasattr(self._overlay, "setOverlayTexture"):
             print("[overlay] overlay 接口无 setOverlayTexture：走 setOverlayRaw 旧路")
+            self._note_degraded("手腕屏走的是兼容刷新方式（这套 SteamVR 不支持贴图直传）："
+                                "内容偶尔会短暂不更新，属已知限制")
             return
         w, h = self.cfg.size_px
         try:
@@ -436,8 +479,10 @@ class WristOverlay:
             self._close_d3d()
             print(f"[overlay] ⚠️ D3D11 贴图路径不可用，降级用 setOverlayRaw（稍后会再试一次）："
                   f"{type(exc).__name__}: {exc}")
+            self._note_degraded("手腕屏暂时退回兼容刷新方式（图形加速路径不可用，稍后会自动重试）")
             self._schedule_tex_retry()      # 可能是瞬时失败（TDR 复位窗口）→ 到点再试一次
             return
+        self._note_degraded(None)
         print(f"[overlay] ✅ D3D11 持久贴图路径已启用（{w}x{h}，SetOverlayTexture，"
               f"色空间={OVERLAY_COLOR_SPACE}）")
 
@@ -470,6 +515,39 @@ class WristOverlay:
             self._upload_fails = 0
             self._fails_in_stage = 0
             self._recover_stage = "none"
+            self._raw_frames = 0
+        else:
+            # 定点重试也失败 → 本会话就停在兼容模式了：必须**响亮**说清代价（用户可感知）
+            self._note_degraded("手腕屏本次运行一直用兼容刷新方式（图形加速路径不可用）："
+                                "面板会每约 2 分钟短暂重刷一次；重启程序可再试")
+
+    # ---------- 「面板整个不可用」（available=False）的退避自愈 ----------
+    def _schedule_reinit(self, reason: str) -> None:
+        """排下一次「重新接管 SteamVR」的时间点（退避翻倍、封顶 `REINIT_BACKOFF_MAX_S`）。
+
+        ⚠️ 为什么必须有它：`available=False` 时上传/心跳/热重载**全部**早退，再也没有一次
+        上传失败去驱动 `_escalate()` —— `_hard_reinit` 里那句「下轮失败时再试」永远等不到，
+        面板冻结在最后一帧。重试因此由 `tick()` 驱动（见 `_maybe_reinit`）。
+        退避保证不会变成重建风暴（真死 GPU / SteamVR 没起来时，5s→10s→20s→40s→60s…）。
+        """
+        if self.dry_run:
+            return
+        self._reinit_fails += 1
+        delay = min(REINIT_BACKOFF_MAX_S, REINIT_BACKOFF_S * (2 ** (self._reinit_fails - 1)))
+        self._reinit_at = time.monotonic() + delay
+        print(f"[overlay] ⏳ 面板当前不可用（{reason}）：{delay:.0f}s 后自动重试接管 SteamVR"
+              f"（第 {self._reinit_fails} 次尝试）", flush=True)
+
+    def _maybe_reinit(self) -> None:
+        """到点了就再试一次 `_hard_reinit()`（跑在 `tick()` 里，不依赖「有上传失败」）。"""
+        if (self.available or self.dry_run or self._reinit_at is None
+                or time.monotonic() < self._reinit_at):
+            return
+        self._reinit_at = None
+        print(f"[overlay] ♻️ 面板不可用 → 重试接管 SteamVR（第 {self._reinit_fails} 次）", flush=True)
+        if self._hard_reinit():              # 失败时它会自己 `_schedule_reinit` 排下一次
+            self._reinit_fails = 0
+            self._note_degraded(None)
 
     def _rebind_or_rebuild(self, where: str) -> None:
         """把贴图绑到当前 handle；若 D3D 设备已丢失则先重建纹理。
@@ -513,10 +591,18 @@ class WristOverlay:
         """setOverlayTexture 报「不支持」→ 释放 D3D、永久回退旧路，只留痕一次。"""
         self._close_d3d()
         self._tex_disabled = True
+        self._note_degraded("手腕屏本次运行一直用兼容刷新方式（这套 SteamVR 不支持贴图直传）："
+                            "面板会每约 2 分钟短暂重刷一次；重启程序可再试")
         if not self._tex_fallback_logged:
             self._tex_fallback_logged = True
             print(f"[overlay] ⚠️ setOverlayTexture 不被支持（{type(exc).__name__}: {exc}）"
                   f"→ 永久回退 setOverlayRaw")
+            # 降级要**响亮**：这条路的已知代价写清楚，别让用户拿「面板偶尔不更新」去猜原因
+            print("[overlay] ⚠️ 兼容模式的已知代价：旧路每约 200 次上传会失败一次，"
+                  "面板会僵住数秒 —— 已改为每 "
+                  f"{RAW_REBUILD_EVERY_FRAMES} 帧主动重建来避开，仍可能看到一次极短的刷新")
+            print("[overlay]    排查方向：这套 SteamVR 版本是否支持 setOverlayTexture、"
+                  "显卡/驱动是否异常（把本段日志发给我们）", flush=True)
 
     @staticmethod
     def _is_texture_unsupported(exc: Exception) -> bool:
@@ -556,6 +642,7 @@ class WristOverlay:
             self._rebuilds_since_ok += 1
             self._recover_stage = "rebuild"
             self._fails_in_stage = 0
+            self._raw_frames = 0          # 兼容模式的主动重建计数跟着清零（新 overlay = 新贴图配额）
             print(f"[overlay] ♻️ 已重建 overlay 并重新贴到 {self.cfg.anchor}"
                   f"（device={self._device}，自上次成功以来第 {self._rebuilds_since_ok} 次）")
             if entries:                        # 新 overlay 是空的，立刻把内容贴回去
@@ -643,14 +730,20 @@ class WristOverlay:
             self._overlay.showOverlay(self._handle)
             self._rebind_or_rebuild("已硬重启 openvr")  # 新 handle 上没有任何贴图，必须重绑/重建
         except Exception as exc:  # noqa: BLE001
-            print(f"[overlay] ⚠️ 硬重启 openvr 失败（下轮失败时再试）："
+            print(f"[overlay] ⚠️ 硬重启 openvr 失败（已排入退避重试）："
                   f"{type(exc).__name__}: {exc}")
+            # ⚠️ 这里置 available=False 之后，上传 / 心跳 / 热重载会**全部**早退 ——
+            #    必须有 `_maybe_reinit()` 接手重试，否则「下轮失败时再试」永远等不到
+            #    （面板冻结在最后一帧、日志也安静了 = 用户看到的「内容不更新」）。
             self.available = False
+            self._schedule_reinit("硬重启失败")
             return False
         self._reinits += 1
         self._reinits_since_ok += 1
         self._recover_stage = "reinit"
         self._fails_in_stage = 0
+        self._reinit_at = None
+        self._reinit_fails = 0            # 接管成功 → 「不可用」的退避计数清零
         print(f"[overlay] ♻️♻️ 已硬重启 openvr 连接并重建 overlay"
               f"（累计第 {self._reinits} 次，device={self._device}）")
         entries = list(self._last_entries or [])
@@ -700,7 +793,11 @@ class WristOverlay:
         """一行现场信息，故障时决定下一步查什么（永不抛异常）。"""
         age = time.monotonic() - self._last_ok_at if self._last_ok_at else -1.0
         exists = self._overlay_exists()
+        mode = "持久贴图" if self._d3d is not None else ("兼容旧路" if not self._tex_disabled
+                                                       else "兼容旧路(永久)")
         bits = [
+            f"面板={'可用' if self.available else '不可用'}",
+            f"上传路={mode}",
             f"最后成功上传 {age:.0f}s 前" if age >= 0 else "还没成功上传过",
             f"帧数={self.frames_updated}",
             {True: "overlay在", False: "overlay已被丢弃", None: "overlay状态未知"}[exists],
@@ -732,6 +829,7 @@ class WristOverlay:
         if self.dry_run:
             return
         self._maybe_retry_tex_path()       # D3D 路曾不可用 → 到点再试一次（不依赖上传失败）
+        self._maybe_reinit()               # 面板整个不可用 → 退避重试接管（同上，别挂在失败路径上）
         if self.config_path and self.config_path.exists():
             mtime = self.config_path.stat().st_mtime
             if mtime != self._last_cfg_mtime:
@@ -805,14 +903,15 @@ class WristOverlay:
 
         # 健康心跳：定期把「面板还活着吗」写进日志，并在 overlay 已被 SteamVR 丢掉时重建。
         # 放在热重载与淡出之前——它是最该先出结果的一条诊断。
-        if self.available:
-            now = time.monotonic()
-            if now - self._last_heartbeat >= self.HEARTBEAT_S:
-                self._last_heartbeat = now
-                try:
-                    self._log_heartbeat()
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[overlay] ⚠️ 心跳失败（不影响翻译）：{type(exc).__name__}: {exc}")
+        # ⚠️ 心跳**不看 available**：面板不可用时最需要它来留痕（`available=False` 之后
+        #    其余路径全早退，日志会彻底安静，事后完全看不出是什么时候死的）。
+        now = time.monotonic()
+        if now - self._last_heartbeat >= self.HEARTBEAT_S:
+            self._last_heartbeat = now
+            try:
+                self._log_heartbeat()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[overlay] ⚠️ 心跳失败（不影响翻译）：{type(exc).__name__}: {exc}")
 
         # 可选淡出
         if self.available and self.cfg.fade_after_s > 0 and self._last_text_at:

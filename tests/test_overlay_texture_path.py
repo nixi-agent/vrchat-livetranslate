@@ -525,8 +525,66 @@ def test_base_reuse_copy_list_only_names_the_class_sets() -> None:
     print(f"  base= 拷贝表与实例属性一致（{len(set(copied))} 项）+ 分支结构 OK")
 
 
+def test_upload_flushes_after_copy() -> None:
+    """`upload()` 必须在 `CopyResource` **之后** Flush，且 `flush=False` 真的能关掉它。
+
+    为什么这条离线用例非有不可：共享贴图的命令是排进 GPU 队列的，不 Flush 时跨进程的
+    vrcompositor 会一直读到**上一帧**（用户报的「手腕屏比桌面慢几秒」）。
+    真机判据在 `scripts/verify/verify_d3d11_shared_readback.py`（独立设备/独立进程回读：
+    不 Flush 12/12 帧读到旧帧；Flush 后 12/12 全新）。这条用例守的是**代码形状**：
+    顺序错（先 Flush 后 Copy）、漏绑 `_flush`、或 `flush=False` 开关失效，都必须立刻变红。
+
+    手法：`object.__new__` 绕开 `__init__`（不建真实 D3D 设备），只把 upload 依赖的
+    几个绑定换成记录用的假函数。
+    """
+    import ctypes as _ct
+
+    from vlt.output.win_d3d11 import D3D11_MAPPED_SUBRESOURCE, D3D11Texture, S_OK
+
+    calls: list[str] = []
+    mapped_buf = _ct.create_string_buffer(64)   # 保持引用：cast 出来的指针不能悬空
+    tex = D3D11Texture.__new__(D3D11Texture)          # 绕开 __init__：不碰真实设备
+    tex.width, tex.height, tex.row_pitch = 4, 2, 16
+
+    def fake_map(_ctx, _res, _idx, _flag, _n, out):  # noqa: ANN001, ANN202
+        calls.append("map")
+        out._obj.pData = _ct.cast(mapped_buf, _ct.c_void_p).value
+        out._obj.RowPitch = 16
+        return S_OK
+
+    def fake_unmap(_ctx, _res, _idx):  # noqa: ANN001
+        calls.append("unmap")
+
+    def fake_copy(_ctx, _dst, _src):  # noqa: ANN001
+        calls.append("copy")
+
+    def fake_flush(_ctx):  # noqa: ANN001
+        calls.append("flush")
+
+    tex._map, tex._unmap, tex._copy, tex._flush = fake_map, fake_unmap, fake_copy, fake_flush
+    tex.ctx, tex._src, tex.texture = 0x1, 0x2, 0x3
+
+    tex.upload(bytes(tex.row_pitch * tex.height))
+    assert calls == ["map", "unmap", "copy", "flush"], (
+        f"upload() 的调用顺序必须是 map→unmap→copy→flush（Flush 必须在 CopyResource 之后）：{calls}")
+
+    calls.clear()
+    tex.upload(bytes(tex.row_pitch * tex.height), flush=False)
+    assert calls == ["map", "unmap", "copy"], (
+        f"flush=False 必须真的不 Flush（验证脚本靠它做修复前/后的 A/B）：{calls}")
+
+    # 常量来源：mingw-w64 `d3d11.h` 的 ID3D11DeviceContextVtbl 与 wine 的 `d3d11.idl`
+    # 两处解析都给出 111（见 win_d3d11.py docstring）。写错一个索引 = 调到别的 COM 方法。
+    import vlt.output.win_d3d11 as _wd
+    assert _wd.CTX_FLUSH == 111, f"ID3D11DeviceContext::Flush 的虚表索引应为 111：{_wd.CTX_FLUSH}"
+    assert hasattr(tex, "_flush"), "upload 依赖的 _flush 绑定必须存在"
+    _ = D3D11_MAPPED_SUBRESOURCE
+    print("  upload() 在 CopyResource 之后 Flush（且 flush=False 可关）OK")
+
+
 if __name__ == "__main__":
     print("test_overlay_texture_path:")
+    test_upload_flushes_after_copy()
     test_texture_path_uses_setoverlaytexture()
     test_d3d_unavailable_falls_back_to_raw()
     test_unsupported_texture_permanent_fallback_logs_once()

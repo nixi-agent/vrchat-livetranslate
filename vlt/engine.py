@@ -543,6 +543,9 @@ class Engine:
         self._chatbox: Chatbox | None = None
         self._merger: Merger | None = None
         self._overlay: Any | None = None
+        # 上一次已上报给界面的「手腕屏降级说明」（None = 正常）。见 _relay_overlay_note：
+        # 只在**变化**时推状态栏（每帧都推会刷屏，且状态栏会被后续消息立刻覆盖）。
+        self._overlay_note_seen: str | None = None
         self._virtualmic: VirtualMic | None = None
         # True = _virtualmic 是引擎自建的（停翻译时要 close）；False = 外部注入的共享 sink
         # （归代理管，引擎不碰它的生命周期）。
@@ -1355,9 +1358,23 @@ class Engine:
                 self._chatbox.flush_pending()
             if self._overlay is not None:
                 self._overlay.tick()
+                self._relay_overlay_note()
             if self._session is not None:
                 self._session.tick()
                 await self._watchdog()      # 会话挂了就自动重连（不再让这条腿永久死掉）
+
+    def _relay_overlay_note(self) -> None:
+        """把手腕屏的**降级说明**（`degraded_note`）变化推到状态栏 + 日志。
+
+        手腕屏后端（Windows / Linux 两个后端）**可选**提供这个属性；有变化才转发一次 ——
+        用户关心的是「面板为什么偶尔不刷新」，只打日志的话他永远看不到（禁静默降级）。
+        """
+        note = getattr(self._overlay, "degraded_note", None)
+        if note == self._overlay_note_seen:
+            return
+        self._overlay_note_seen = note
+        if note:
+            self._events.on_status("warn", note)
 
     async def _feed_audio(self) -> None:
         if self._source.startswith("pcm:"):

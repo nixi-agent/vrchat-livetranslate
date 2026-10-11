@@ -44,8 +44,32 @@ render targets`。**注意**：用户机器上 `eType=0` 那几种是**静默不
 
 本机实测：对 `MISC_SHARED` 纹理调一次 `UpdateSubresource` 之后，`SetOverlayTexture` 就**永久**
 `OverlayError_InvalidTexture`（驱动把资源弄坏了）。必须走「DYNAMIC 源纹理 → Map(WRITE_DISCARD)
-逐行写 → Unmap → CopyResource 拷进共享纹理」（见 `upload()`）。`CTX_UPDATE_SUBRESOURCE` 索引
-仍列在下面备查，但**本模块刻意不绑定它**，免得有人顺手用回去。
+逐行写 → Unmap → CopyResource 拷进共享纹理」（见 `upload()`）。
+`CTX_UPDATE_SUBRESOURCE` 索引仍列在下面备查，但**本模块刻意不绑定它**，免得有人顺手用回去。
+
+## ⚠️ 更新内容之后**必须 `Flush()`**（「手腕屏比桌面慢几秒」的直接成因）
+
+从 `CopyResource` 到「vrcompositor 能读到新内容」之间隔着 **GPU 命令队列**：D3D11 的立即上下文
+**攒着**命令，只有 `Flush()`（或 `Present()`）才把它们真正提交出去。手腕屏这条路**没有 Present**
+（我们从不自己出画面），所以不 Flush 时那份 `CopyResource` 会在 CPU 侧的命令缓冲里
+**滞留若干帧**，跨进程的合成器就一直读到**上一帧**。
+
+判据（`scripts/verify/verify_d3d11_shared_readback.py`，独立 D3D11 设备 / 独立进程打开同一份
+DXGI 共享句柄回读，1024x440 真实渲染帧，本机 RTX 4080）：
+
+    不 Flush（修复前）  同进程独立设备：30/30 帧读到的都是**旧帧**（滞后 1~3 帧）
+                        跨进程：8 帧里只有 3 帧被看到，其余整帧丢失
+                        生产类（`WristOverlay.update_entries`，1 Hz 推帧）→ 8 帧只见到 2 帧，
+                        见到的那两帧滞后 **1046ms / 1057ms**（正好一个帧周期）＝ 用户报的现象
+    Flush 之后          同进程 30 帧里 29 帧 fresh（残余 1 帧是「GPU 还没执行完就同时去读」的
+                        亚毫秒竞态，跨进程实测滞后中位 4~5ms）；跨进程 8/8 全到
+                        生产类 → 10/10 帧全到，滞后中位 10.3ms / 最大 17.2ms（1 Hz 推帧）
+
+⇒ 「用户看到手腕屏比桌面字幕晚几秒」不是渲染慢，就是这一处缺 Flush。`upload(flush=False)`
+保留给探针做 A/B（生产路径恒为 True）。
+⚠️ `MISC_SHARED` 没有 keyed mutex：Flush 只保证「命令已提交并被 GPU 执行」，残余竞态窗口是
+GPU 执行那一瞬（跨进程实测中位 4~5ms），不是整帧 —— 要彻底消掉得换
+`MISC_SHARED_KEYEDMUTEX` + 双方 AcquireSync（见下面「已知边界」第 2 条）。
 
 ## 常量 / 虚表索引来源（照抄，别自己数）
 
@@ -53,7 +77,7 @@ render targets`。**注意**：用户机器上 `eType=0` 那几种是**静默不
 坑**：数错一个就调到别的 COM 方法上，症状是随机崩溃或 `E_INVALIDARG`，极难定位。
 
     ID3D11Device:        CreateTexture2D=5   CreateShaderResourceView=7   GetDeviceRemovedReason=39
-    ID3D11DeviceContext: Map=14  Unmap=15  CopyResource=47  UpdateSubresource=48（本模块不绑，见上）
+    ID3D11DeviceContext: Map=14  Unmap=15  CopyResource=47  UpdateSubresource=48（本模块不绑，见上）  Flush=111
     IDXGIResource:       GetSharedHandle=8（实测；IID 见 IID_IDXGI_RESOURCE）
     枚举：DXGI_FORMAT_R8G8B8A8_UNORM=28 / _UNORM_SRGB=29；D3D11_USAGE_DEFAULT=0 / STAGING=3
          D3D11_BIND_SHADER_RESOURCE=8；D3D11_CPU_ACCESS_READ=0x20000；D3D11_MAP_READ=1
@@ -109,6 +133,11 @@ IID_IDXGI_RESOURCE = bytes((0xB4, 0x3A, 0x5F, 0x03, 0x2E, 0x48, 0x50, 0x4E,
 IDXGI_RESOURCE_GET_SHARED_HANDLE = 8   # 实测可用（见 docstring）
 DEV_CREATE_TEXTURE2D, DEV_CREATE_SRV, DEV_REMOVED_REASON = 5, 7, 39
 CTX_MAP, CTX_UNMAP, CTX_COPY_RESOURCE, CTX_UPDATE_SUBRESOURCE = 14, 15, 47, 48
+# Flush：把命令真正提交给 GPU。**这条不是优化，是共享贴图的正确性要求**（不 Flush 时跨进程
+# 的 vrcompositor 会读到上一帧 → 用户看到的「手腕屏比桌面慢几秒」）。
+# 索引来源双份核对：mingw-w64 `d3d11.h` 的 ID3D11DeviceContextVtbl 与 wine 的 `d3d11.idl`，
+# 两处解析出的 vtable 顺序一致（111）；判据与实测见模块 docstring。
+CTX_FLUSH = 111
 S_OK = 0
 
 
@@ -168,7 +197,7 @@ class D3D11Texture:
             #    （共享纹理不能直写，见 upload），所以不能把 "_update" 放进来 —— 放了必炸
             #    AttributeError（base= 复用路径一用就挂，实测）。
             for attr in ("driver", "feature_level", "device", "ctx", "_create_texture2d",
-                         "_create_srv", "_copy", "_map", "_unmap", "_reason"):
+                         "_create_srv", "_copy", "_map", "_unmap", "_flush", "_reason"):
                 setattr(self, attr, getattr(base, attr))
             # ⚠️ 先把归属定下来再建纹理：建到一半失败时，_release_owned() 要据此决定是否放 device/ctx
             self._owns_device = False
@@ -204,6 +233,7 @@ class D3D11Texture:
         self._map = _bind(self.ctx, CTX_MAP, [c_void_p, c_uint, c_uint, c_uint,
                                               POINTER(D3D11_MAPPED_SUBRESOURCE)])
         self._unmap = _bind(self.ctx, CTX_UNMAP, [c_void_p, c_uint], restype=None)
+        self._flush = _bind(self.ctx, CTX_FLUSH, [], restype=None)
         self._reason = _bind(self.device, DEV_REMOVED_REASON, [])
 
         self._owns_device = True          # 同上：先定归属，失败路径才有据可依
@@ -268,11 +298,16 @@ class D3D11Texture:
         """交给 SteamVR 的 **DXGI 共享句柄**（配 `TextureType_DXGISharedHandle`，别用 `.texture`）。"""
         return self._shared
 
-    def upload(self, data: bytes) -> None:
+    def upload(self, data: bytes, flush: bool = True) -> None:
         """只更新内容（不新建任何 D3D 对象 —— 这正是绕开 200 次上限的关键）。
 
         路径：Map(源, WRITE_DISCARD) → 逐行 memmove（**按 RowPitch 走行**）→ Unmap
-        → CopyResource(源 → 共享纹理)。**不要**改成 UpdateSubresource 直写共享纹理。
+        → CopyResource(源 → 共享纹理) → **Flush**。
+        **不要**改成 UpdateSubresource 直写共享纹理。
+
+        `flush=False` 只给验证脚本做 A/B（`scripts/verify/verify_d3d11_shared_readback.py`），
+        生产路径恒为 True：不 Flush 时命令滞留 CPU 侧命令缓冲，跨进程的 vrcompositor
+        会一直读到上一帧（「手腕屏比桌面慢几秒」，见模块 docstring 的实测数据）。
         """
         if len(data) != self.row_pitch * self.height:
             raise ValueError(f"字节数 {len(data)} != {self.row_pitch * self.height}"
@@ -290,6 +325,8 @@ class D3D11Texture:
         finally:
             self._unmap(self.ctx, self._src, 0)
         self._copy(self.ctx, self.texture, self._src)
+        if flush:
+            self._flush(self.ctx)
 
     def healthy(self) -> bool:
         """设备是否还在（`GetDeviceRemovedReason()==S_OK`）。诊断/自愈用，不在热路径上。"""

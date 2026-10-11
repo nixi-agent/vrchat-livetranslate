@@ -35,6 +35,7 @@ CI 只跑 `tests/`（纯离线单元测试）与打包门禁；这里的手动�
 | `verify_proxy_loopback_linux.py` | 同一件事的 **Linux 版**：假麦克风喂 1kHz → 代理直通 / 译音档 → 从**运行时声明**的虚拟麦（`vlt_mic_source`）抓回来判主频；**顺带验**两条 Linux 硬约束：声明虚拟麦**不抢默认输出**、退出后**节点零残留** | Linux + **PipeWire**（`pw-dump`/`pw-record`/`pw-cat`）；**不需要**虚拟声卡 / 麦克风 / 头显 / 桌面会话 | **本机已实测跑通** |
 | `verify_proxy_app_start.py` | **真起界面**（非 headless）证明「启动即起代理」：启动日志出现「虚拟声卡已打开 / 麦克风代理已启动 / 麦克风直通已启动」，并从录音端真抓到假麦克风的 1kHz | Windows + 真实桌面会话 + **已装虚拟声卡** | **本机已实测跑通** |
 | `run_suite.sh` | 在指定 worktree（默认本仓库）跑全量**离线**测试并汇总（死代理 + 清 `DASHSCOPE_API_KEY`） | bash + 该 worktree 的 `.venv` | **本机已实测跑通** |
+| `verify_d3d11_shared_readback.py` | 用**独立 D3D11 设备 / 独立进程**打开手腕屏那张 `MISC_SHARED` 共享句柄并回读，量「upload 完到另一个消费者看得见新帧」的滞后；`--no-flush` 复现修复前的整帧滞后，`--png` 把生产者回读 / 消费者所见各存一张 PNG 供肉眼判 | Windows + 真 GPU（**不需要** SteamVR / 头显） | **本机已实测跑通**（RTX 4080：不 Flush 12/12 帧读到旧帧；Flush 后 12/12 新帧、跨进程滞后中位 4.4ms） |
 
 内部助手：`_shot_window.py`（Win32 `PrintWindow` 截图的共用小工具，**不是给人单独跑的入口**，
 被 `verify_room_button.py` / `verify_room_i18n.py` 复用）；`_proxy_probe.py`（两份回环探针共用的
@@ -68,6 +69,17 @@ CI 只跑 `tests/`（纯离线单元测试）与打包门禁；这里的手动�
 
 # 全量离线测试（可指定别的 worktree：bash scripts/verify/run_suite.sh <路径> [标签]）
 bash scripts/verify/run_suite.sh
+```
+
+## 手腕屏共享贴图的滞后探针（不需要 SteamVR）
+
+```bash
+# 生产路径（已 Flush）：同进程独立设备逐帧判定 + 跨进程量滞后
+./.venv/Scripts/python.exe scripts/verify/verify_d3d11_shared_readback.py --mode all --frames 12
+# 故障注入：切回修复前的写法（不 Flush）——同进程应 12/12 帧读到旧帧、跨进程应丢帧
+./.venv/Scripts/python.exe scripts/verify/verify_d3d11_shared_readback.py --mode same --frames 12 --no-flush
+# 存 PNG 供肉眼判：producer_readback_*.png（我们写进去的）vs consumer_after_*.png（另一个消费者看到的）
+./.venv/Scripts/python.exe scripts/verify/verify_d3d11_shared_readback.py --mode same --frames 30 --png
 ```
 
 ## 是否会写盘

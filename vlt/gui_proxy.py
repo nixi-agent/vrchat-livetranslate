@@ -4,10 +4,11 @@ import os
 import sys
 import tkinter as tk
 from pathlib import Path
+from . import gui_proxy_hint
 from . import platform
 from .i18n import t
-from .config_io import (_fmt_scalar, _yaml_set_in_text, _yaml_set_or_create,
-                        _yaml_scalar)
+from .config_io import (_fmt_scalar, _write_config_text, _yaml_set_or_create,
+                        _yaml_set_or_create_checked, _yaml_scalar)
 from .output import level_match
 from .output.level_match import format_db
 from .output.micproxy import MODE_TRANSLATED
@@ -146,12 +147,47 @@ class ProxyMethods:
 
         ⚠️ 落盘与配置路径都走 ``_m(self)``：那套打桩（`gui_mod._yaml_write` / `gui_mod.DEFAULT_CONFIG`）
         在动了这个类的模块命名空间上才生效，本仓库的用例正是这么钉的。
+        ⚠️ 走 `_write_proxy_leaves`（**补建父级 + 写后复检**），不是 `_yaml_set_in_text`：
+        老 config.yaml 里没有 `output.audio.proxy` 整段时旧写法是静默 no-op → 标记永远存不下去
+        → 这条说明每次启动都弹（用户实测）。写不进去也**不留死角**：一行 `[proxy]` WARN
+        （由 `_write_proxy_leaves` 打）＋ 一个同目录的兜底标记文件，见
+        `gui_proxy_hint.write_fallback_marker`。
         """
-        _m(self)._yaml_write(
-            _m(self).DEFAULT_CONFIG, lambda t: _yaml_set_in_text(
-                t, ["output", "audio", "proxy", "hint_shown"], _fmt_scalar(True)),
-            err="保存代理首次启用提示标记")
-        self._sync_proxy_cfg_mem(proxy={"hint_shown": True})
+        ok = self._write_proxy_leaves(
+            [(["output", "audio", "proxy", "hint_shown"], _fmt_scalar(True))],
+            what="代理首次启用说明的「已提示」标记")
+        self._sync_proxy_cfg_mem(proxy={"hint_shown": True})   # 本次运行不再弹（内存真源）
+        if not ok:
+            gui_proxy_hint.write_fallback_marker(self)
+
+    def _write_proxy_leaves(self, leaves: list[tuple[list[str], str]], *, what: str) -> bool:
+        """把 ``output.audio...`` 里的若干叶子值就地写进 config.yaml：**缺失的父级补建 + 写后复检**。
+
+        为什么一律不走 `_yaml_set_in_text`：老用户的 config.yaml 是更早的模板生成的，里面
+        可能**整段** `output.audio.proxy`（甚至 `audio.level`）都不存在 —— 旧函数遇到缺父键
+        **原样返回**（静默 no-op），于是「关掉代理下次启动又开了」「缓冲改了没记住」
+        「首次启用说明每次都弹」全都是同一个根因。`_yaml_set_or_create` 会按缩进补建整条链。
+
+        为什么还要复检（`_yaml_set_or_create_checked`）：补建函数在「找不到落点」时同样
+        是不抛的原地返回，光看返回值分不出来 —— 写盘前解析回来确认值真的变了，不等就抛。
+
+        失败 / 没生效一律留一行 ``[proxy]`` WARN（禁静默降级）并返回 False；
+        **本函数绝不抛**（写配置失败不该打断界面，更不能把代理启动搞崩）。
+        """
+        p = _m(self).DEFAULT_CONFIG
+        try:
+            if not p.exists():
+                raise FileNotFoundError(f"配置文件不存在（{p}）")
+            text = p.read_text(encoding="utf-8")
+            for key_path, value in leaves:
+                text = _yaml_set_or_create_checked(text, key_path, value)
+            _write_config_text(p, text)
+        except Exception as exc:                       # noqa: BLE001 — 绝不因写配置打断界面
+            names = " / ".join(".".join(k) for k, _ in leaves)
+            print(f"[proxy] ⚠️ {what}没能写进 config.yaml（{names}）："
+                  f"{type(exc).__name__}: {exc}（这次改动只在内存里生效）", flush=True)
+            return False
+        return True
 
 
     def _proxy_degraded(self, status_text: str, log_line: str) -> None:
@@ -354,7 +390,11 @@ class ProxyMethods:
 
     def _on_proxy_toggle(self) -> None:
         self._sync_audio_ctx(); self._audio_ctx.proxy_enabled = self._proxy_enabled_var.get()
-        _m(self)._yaml_write(_m(self).DEFAULT_CONFIG, lambda t: _yaml_set_in_text(t, ["output", "audio", "proxy", "enabled"], _fmt_scalar(self._audio_ctx.proxy_enabled)), err="保存代理开关")
+        # ⚠️ 不用 `_yaml_set_in_text`：老配置里没有 `output.audio.proxy` 整段时它是静默 no-op
+        #    → 「关掉代理、下次启动又开了」（用户在界面上的改动没落盘，还看不到任何提示）。
+        self._write_proxy_leaves(
+            [(["output", "audio", "proxy", "enabled"], _fmt_scalar(self._audio_ctx.proxy_enabled))],
+            what="代理开关")
         self._sync_proxy_cfg_mem(proxy={"enabled": bool(self._audio_ctx.proxy_enabled)})
         self._restart_proxy()
         self._sync_proxy_controls_state()
@@ -370,10 +410,15 @@ class ProxyMethods:
             pt, tr = pt_clamped, tr_clamped
         except (ValueError, TypeError): return
         self._sync_audio_ctx()
-        def _fn(t):
-            t = _yaml_set_in_text(t, ["output", "audio", "proxy", "passthrough_buffer_ms"], _fmt_scalar(pt))
-            return _yaml_set_in_text(t, ["output", "audio", "buffer_ms"], _fmt_scalar(tr))
-        _m(self)._yaml_write(_m(self).DEFAULT_CONFIG, _fn, err="保存代理缓冲")
+        # ⚠️ 两个键都走补建+复检的那条路：老配置里**没有** `output.audio.proxy` 整段，
+        #    以前 `_yaml_set_in_text` 对 `passthrough_buffer_ms` 是静默 no-op →
+        #    用户「改了直通缓冲、下次启动又变回默认」，且界面上什么提示都没有。
+        #    `buffer_ms` 在同一条链上一起走（它虽在老配置里也有，但 `audio:` 段整体缺失时
+        #    同样存不下去）。
+        self._write_proxy_leaves(
+            [(["output", "audio", "proxy", "passthrough_buffer_ms"], _fmt_scalar(pt)),
+             (["output", "audio", "buffer_ms"], _fmt_scalar(tr))],
+            what="代理缓冲")
         self._sync_proxy_cfg_mem(audio={"buffer_ms": tr}, proxy={"passthrough_buffer_ms": pt})
         self._apply_proxy_buffers(pt, tr)
 

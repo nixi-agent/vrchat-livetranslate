@@ -16,13 +16,82 @@
 - 弹窗是**非模态**（``transient`` + ``lift``，**不** ``grab_set``）：翻译正在跑时也不许卡住界面，
   与 ``gui_update.show_update_dialog`` 同一口径。
 - 本模块**不许** ``import vlt.gui``（防循环引用），控件与回调都从 ``gui`` 属性上取。
+  ⚠️ 但配置路径例外地要拿：走 `gui.__class__.__module__` 取那个模块的 `DEFAULT_CONFIG`
+  （与 `gui_proxy._m(self)` 同一个理由 —— 用例把那套打桩指到临时文件时才生效）。
+- 「已提示过」这件事**不能留不下痕迹**：config.yaml 写不进去时（只读目录 / 文件被占用 /
+  配置损坏）落一个同目录的**兜底标记文件**（见 `write_fallback_marker`）。否则用户每次启动
+  都会被同一条说明再打扰一次，而它按设计只该弹一次 —— 这条与「禁静默降级」是同一件事的
+  两个面：降级必须留痕，留痕之后就不该再重复打扰。
 """
 from __future__ import annotations
 
+import sys
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk
 
 from .i18n import t
+
+#: 兜底标记文件名（与 config.yaml 同目录、点号开头 = 内部状态）。
+_FALLBACK_NAME = ".proxy-hint-shown"
+
+
+def _gui_module(gui):
+    """定义 *gui* 那个类的模块（= `vlt.gui`）—— 配置路径要从它上面取，见模块说明。"""
+    return sys.modules.get(gui.__class__.__module__)
+
+
+def fallback_marker_path(gui) -> Path | None:
+    """兜底标记文件的路径（config.yaml 同目录）；取不到配置路径就返回 None。"""
+    cfg = getattr(_gui_module(gui), "DEFAULT_CONFIG", None)
+    return Path(cfg).with_name(_FALLBACK_NAME) if cfg else None
+
+
+def already_hinted(gui) -> bool:
+    """说明是否已经弹过：配置里的 ``hint_shown`` **或**兜底标记文件，有一个就算。
+
+    用兜底文件时每次启动留一行痕（禁静默降级）—— 它意味着 config.yaml 一直写不进去，
+    用户该知道这件事，也该知道删掉这个文件就能再看一次说明。
+    """
+    proxy_cfg = (gui._proxy_audio_cfg().get("proxy") or {}) if hasattr(gui, "_proxy_audio_cfg") else {}
+    if proxy_cfg.get("hint_shown"):
+        return True
+    p = fallback_marker_path(gui)
+    if p is None or not p.exists():
+        return False
+    try:
+        why = p.read_text(encoding="utf-8").strip()
+    except OSError:
+        why = ""
+    print(f"[proxy] 首次启用说明的「已提示」标记来自兜底文件 {p}"
+          f"{f'（config.yaml 写不进去：{why}）' if why else ''}"
+          " —— 删除它可以让这条说明再弹一次", flush=True)
+    return True
+
+
+def write_fallback_marker(gui) -> bool:
+    """config.yaml 写不进去时的兜底：把「已提示过」落成同目录的一个小文件。
+
+    只在真正需要时才被调（`gui_proxy._mark_proxy_hint_shown` 发现标记没落盘）。
+    成功/失败都留一行 ``[proxy]``（禁静默降级）：成功要让人知道多了个文件、怎么撤销；
+    失败要明确说出后果 —— 下次启动还会再弹一次。
+    """
+    p = fallback_marker_path(gui)
+    if p is None:
+        print("[proxy] ⚠️ 连兜底标记也写不了：取不到 config.yaml 的路径 —— "
+              "下次启动还会再弹一次这条说明", flush=True)
+        return False
+    try:
+        p.write_text("代理首次启用说明已弹过（config.yaml 写不进去时的兜底标记）\n",
+                     encoding="utf-8", newline="\n")
+    except OSError as exc:
+        print(f"[proxy] ⚠️ 连兜底标记 {p} 也写不了（{exc}）—— 下次启动还会再弹一次这条说明",
+              flush=True)
+        return False
+    print(f"[proxy] ⚠️ config.yaml 改不动，已改用兜底标记 {p} 记住「说明已弹过」"
+          "（它保证以后不再打扰；想让说明再弹一次就删掉它）", flush=True)
+    return True
+
 
 def maybe_show(gui, *, on_shown=None, opener=None) -> bool:
     """首次成功启用代理时弹一次说明，返回是否真的弹了。
@@ -30,12 +99,11 @@ def maybe_show(gui, *, on_shown=None, opener=None) -> bool:
     - ``on_shown``：弹窗**已显示**后调用（用来落盘「已提示」标记）；不传就只弹。
     - ``opener``：开窗函数替身（用例里传假的，免得在 CI 上真开 Tk 窗）。
 
-    三条早退：``headless`` / 配置里已标记提示过 / 窗口被销毁后重建——都不弹。
+    三条早退：``headless`` / 已经提示过（配置里的标记或兜底标记）/ 窗口被销毁后重建——都不弹。
     """
     if getattr(gui, "_headless", False):
         return False
-    proxy_cfg = (gui._proxy_audio_cfg().get("proxy") or {}) if hasattr(gui, "_proxy_audio_cfg") else {}
-    if proxy_cfg.get("hint_shown"):
+    if already_hinted(gui):
         return False
     (opener or _open_window)(gui)
     print("[proxy] 首次启用说明已弹出（占用虚拟声卡输出流 / 默认播放设备指向它会听到回声）",

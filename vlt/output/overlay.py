@@ -25,6 +25,18 @@ from PIL import Image, ImageDraw, ImageFont
 # 调试帧是"跑完要看"的产物 → 可写目录（exe 旁），不是临时解包目录
 from ..paths import APP_DIR as ROOT
 
+# ---------------------------------------------------------------- 起不来的「原因码」
+# 后端（Windows: openvr_overlay / Linux: openxr_overlay）只给**码**，界面按码翻文案
+# （`vlt/gui_sinks.py::overlay_error_text`），日志里各后端另打完整中文原因。
+# ⚠️ 为什么要区分：状态栏过去无论什么原因都写「先把 SteamVR 打开」，而真因可能是
+#    「锚点手柄没被追踪」「SteamVR 在跑但没头显」—— 用户照那句提示重试一辈子也没用
+#    （用户实测报告：「非翻译模式下勾不了手腕屏」，日志里其实是 InvalidTrackedDevice）。
+OVERLAY_ERR_RUNTIME = "runtime"    # VR 运行时没在运行 / 不可用（Windows 上就是 SteamVR）
+OVERLAY_ERR_COMPOSITOR = "compositor"  # 运行时在跑，但它的**合成器**没起来（Windows: vrcompositor）
+OVERLAY_ERR_HMD = "hmd"            # 运行时在跑，但没检测到头显
+OVERLAY_ERR_ANCHOR = "anchor"      # 锚点设备没被追踪（手柄 / tracker 不在线）
+OVERLAY_ERR_OTHER = "other"        # 其它（细节看日志）
+
 # 配置里没写字体时用哪份：按平台探测（Windows → 雅黑；Linux → fontconfig）。
 # 解析结果缓存，避免每次渲染都去 spawn 一个 fc-match。
 _font_cache: dict[str, str | None] = {}

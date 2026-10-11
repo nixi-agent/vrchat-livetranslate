@@ -20,6 +20,7 @@ class EngineCtx:
 
     # ── 覆盖层输出 ──
     overlay_out: Any = None          # WristOverlay 实例
+    overlay_error: str = ""          # 手腕屏起不来的**原因码**（界面翻文案；见 output/overlay.py）
     desktop_out: Any = None          # DesktopOverlay 实例
     desktop_dragging: bool = False
 

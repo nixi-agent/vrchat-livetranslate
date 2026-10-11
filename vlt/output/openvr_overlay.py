@@ -24,7 +24,9 @@ from pathlib import Path
 from PIL import Image
 
 from ..paths import APP_DIR as ROOT
-from .overlay import OverlayConfig, _unpack_entry, render_conversation, render_panel
+from .overlay import (OverlayConfig, _unpack_entry, render_conversation, render_panel,
+                      OVERLAY_ERR_ANCHOR, OVERLAY_ERR_COMPOSITOR, OVERLAY_ERR_HMD,
+                      OVERLAY_ERR_OTHER, OVERLAY_ERR_RUNTIME)
 from .win_d3d11 import D3D11Texture
 
 # 交给 SteamVR 的贴图色空间（OpenVR 的 EColorSpace）。Auto(=0) 实测可用；Linear 会被 SteamVR
@@ -127,6 +129,9 @@ _INIT_ERROR_HINTS = {
         "SteamVR 的日志目录不可用",
     "InitError_Init_Retry":
         "SteamVR 让稍后重试（多半正在启动/切换场景）：过几秒再勾一次",
+    "InitError_IPC_CompositorConnectFailed":
+        "SteamVR 在跑，但它的合成器（vrcompositor）没起来 —— 手腕屏面板必须由合成器显示。"
+        "把 SteamVR 完全退出后重新启动一次；不行就重启电脑",
 }
 
 
@@ -138,6 +143,38 @@ def _no_server_hint() -> str:
             "（重启 SteamVR；不行就重启电脑）")
 
 
+# ------------------------------------------------- 失败原因：给界面一个**可翻译的码**
+# 界面（状态栏）只认码；完整原因由下面的中文提示负责（日志保持中文，诊断用）。
+_RUNTIME_ERRORS = (
+    "InitError_Init_NoServerForBackgroundApp", "InitError_Init_InstallationNotFound",
+    "InitError_Init_VRClientDLLNotFound", "InitError_Init_VRMonitorNotFound",
+    "InitError_Init_VRMonitorStartupFailed", "InitError_Init_AnotherAppLaunching",
+    "InitError_Init_ShuttingDown", "InitError_Init_UserConfigDirectoryInvalid",
+    "InitError_Init_PathRegistryNotFound", "InitError_Init_PathRegistryNotWritable",
+    "InitError_Init_NoLogPath", "InitError_Init_Retry",
+)
+_HMD_ERRORS = ("InitError_Init_HmdNotFound", "InitError_Init_HmdNotFoundPresenceFailed")
+# 合成器（vrcompositor）没起来：overlay 接口连不上它 → 面板根本建不出来。
+# 实测形态（本机 null 驱动、SteamVR 明明在跑）：
+#   [overlay] ⚠️ 创建 overlay 失败…：InitError_IPC_CompositorConnectFailed:
+# 与「SteamVR 没跑」解药不同（那句「先启动 SteamVR」在这条上纯误导）。
+_COMPOSITOR_ERRORS = ("InitError_IPC_CompositorConnectFailed", "Compositor")
+
+
+def _reason_code(text: str) -> str:
+    """把 openvr 的错误类名 / 异常文本归成界面能翻译的原因码（码定义见 `output/overlay.py`）。"""
+    blob = str(text or "")
+    if "invalidtrackeddevice" in blob.lower():
+        return OVERLAY_ERR_ANCHOR
+    if any(name in blob for name in _HMD_ERRORS):
+        return OVERLAY_ERR_HMD
+    if any(name in blob for name in _COMPOSITOR_ERRORS):
+        return OVERLAY_ERR_COMPOSITOR
+    if any(name in blob for name in _RUNTIME_ERRORS):
+        return OVERLAY_ERR_RUNTIME
+    return OVERLAY_ERR_OTHER
+
+
 # ---------------------------------------------------------------- overlay 本体
 class WristOverlay:
     """SteamVR overlay 生命周期管理 + 文本刷新 + 配置热重载。"""
@@ -145,6 +182,12 @@ class WristOverlay:
     # 健康心跳间隔（秒）：日志里留一条「面板还活着 / 已经多久没成功上传」的定期证据。
     # 用户报的「隔一阵手腕屏就消失」没有这行时，事后完全看不出是哪个时刻掉的。
     HEARTBEAT_S = 30.0
+
+    #: `available=False`（硬重启也失败）之后每隔这么久重试一次「重新接管 SteamVR」。
+    #: 只跑在 `tick()` 里：那种状态下上传 / 心跳 / 热重载全都 `if self.available` 早退，
+    #: 实例等于失去了所有周期性动作 —— 面板再也救不回来（用户实测形态：勾选框还勾着、
+    #: 屏再也不出现，只能重启程序）。见 `_maybe_heal`。
+    HEAL_RETRY_S = 15.0
 
     def __init__(self, cfg: OverlayConfig, config_path: Path | None = None, dry_run: bool = False) -> None:
         self.cfg = cfg
@@ -176,13 +219,33 @@ class WristOverlay:
         self._reinits = 0
         self._last_heartbeat = 0.0
         self.available = False
+        #: 起不来时的**原因码**（界面按码翻文案；见 `output/overlay.py` 的 OVERLAY_ERR_*）。
+        #: 空串 = 最近一次没有失败。`start()` 的每条失败路径都必须写它 ——
+        #: 界面过去无从知道真因，把什么都写成「先把 SteamVR 打开」。
+        self.last_error = ""
+        self._closed = False               # close() 过：绝不参与自愈（否则取消勾选后屏会自己回来）
+        self._heal_at: float | None = None  # available=False 之后的下一次自愈时间点（见 _maybe_heal）
         self.frames_updated = 0
+
+    @property
+    def alive(self) -> bool:
+        """现在还真的在接管 SteamVR 吗？
+
+        ⚠️ `available` 单独不够：`close()` 之后 handle 已经销毁，而界面可能仍持有这个对象
+        （勾选与停止是两条路），那种「已关但还在」的实例必须算不可用。
+        界面据此决定「勾选时要不要重建」（见 `vlt/gui_sinks.py::start_overlay`）——
+        旧写法只看 `overlay_out is not None`，于是已死的实例让勾选框「点了什么都不做」。
+        """
+        return bool(self.available) and not self._closed
 
     # ---------- 生命周期 ----------
     def start(self) -> bool:
         """尝试接管 SteamVR；没跑就返回 False 并禁用（不抛异常、不阻塞）。"""
+        self._closed = False               # 显式 start() 过的实例重新参与自愈
+        self.last_error = ""
         if not self.cfg.enabled:
             print("[overlay] 配置里已禁用")
+            self.last_error = OVERLAY_ERR_OTHER
             return False
         if self.dry_run:
             self._frames_dir.mkdir(parents=True, exist_ok=True)
@@ -192,12 +255,14 @@ class WristOverlay:
             import openvr
         except Exception as exc:  # noqa: BLE001
             print(f"[overlay] openvr 不可用：{exc}")
+            self.last_error = OVERLAY_ERR_OTHER
             return False
         try:
             self._vr = openvr.init(openvr.VRApplication_Background)
         except Exception as exc:  # noqa: BLE001
             # ⚠️ 打**类名**：openvr 异常的 str() 恒为空，只打 `{exc}` 等于没有信息
             name = type(exc).__name__
+            self.last_error = _reason_code(name)
             print(f"[overlay] ⚠️ SteamVR 未运行或不可用，overlay 已禁用（其他输出不受影响）："
                   f"{name}: {exc}", flush=True)
             print(f"[overlay]   原因："
@@ -243,13 +308,45 @@ class WristOverlay:
             # 这一步**绝不许抛异常**（内部全 try 住）：建不起来就留一行痕、继续用旧的 setOverlayRaw。
             self._init_texture_path()
         except Exception as exc:  # noqa: BLE001
+            name = type(exc).__name__
+            self.last_error = _reason_code(f"{name}{exc}")
             print(f"[overlay] ⚠️ 创建 overlay 失败，已禁用（其他输出不受影响）："
-                  f"{type(exc).__name__}: {exc}")
+                  f"{name}: {exc}")
+            # 真因要能行动：锚点设备没被追踪 ≠ SteamVR 没开（用户照「先把 SteamVR 打开」
+            # 重试是白费力气，实测就是这么报的：OverlayError_InvalidTrackedDevice）
+            if self.last_error == OVERLAY_ERR_ANCHOR:
+                print(f"[overlay]   原因：{self._anchor_hint()}", flush=True)
+            else:
+                print(f"[overlay]   原因："
+                      f"{_INIT_ERROR_HINTS.get(name, '未知原因（请把这一行连同上下文发给我们）')}",
+                      flush=True)
+            # ⚠️ `createOverlay()` 可能在**之前**就已经成功（锚点解析 / 应用变换都在它之后）：
+            #    不销毁的话，SteamVR 里就留着一个我们不再持有的同名 overlay → 下次勾选直接撞
+            #    `OverlayError_KeyInUse`（真机日志里那串「key 已被占用 → 清理残留」正是它，
+            #    而且每失败一次多留一个）。
+            self._release_handle()
             self.available = False
             return False
         print(f"[overlay] ✅ 已挂到 {self.cfg.anchor}（device={self._device}），"
               f"宽 {self.cfg.width_m}m，位置 {self.cfg.pos}")
         return True
+
+    def _anchor_hint(self) -> str:
+        """锚点设备无效时的可行动解释（真机实测：手柄/tracker 不在线就会这样）。"""
+        return (f"锚点设备（{self.cfg.anchor}）没被 SteamVR 追踪：手柄 / tracker 需要在追踪中"
+                f"（戴上头显、唤醒手柄后再勾一次；也可在「设置 → 手腕屏」里改锚点试）")
+
+    def _release_handle(self) -> None:
+        """销毁我们这把 key 的 overlay（幂等、绝不抛异常）。失败路径专用，防残留 KeyInUse。"""
+        if self._overlay is None or self._handle is None:
+            return
+        try:
+            self._overlay.destroyOverlay(self._handle)
+            print("[overlay]   已销毁本次创建的 overlay（不留残留 key）", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[overlay]   清理本次 overlay 失败（忽略）：{type(exc).__name__}: {exc}",
+                  flush=True)
+        self._handle = None
 
     def _resolve_anchor(self):
         import openvr
@@ -643,9 +740,12 @@ class WristOverlay:
             self._overlay.showOverlay(self._handle)
             self._rebind_or_rebuild("已硬重启 openvr")  # 新 handle 上没有任何贴图，必须重绑/重建
         except Exception as exc:  # noqa: BLE001
-            print(f"[overlay] ⚠️ 硬重启 openvr 失败（下轮失败时再试）："
-                  f"{type(exc).__name__}: {exc}")
+            print(f"[overlay] ⚠️ 硬重启 openvr 失败：{type(exc).__name__}: {exc}")
+            print(f"[overlay]   面板进入不可用状态 → 之后每 {self.HEAL_RETRY_S:.0f}s 自动重试一次接管"
+                  f"（也可取消 / 重新勾选「手腕屏」立刻重建）", flush=True)
+            self.last_error = _reason_code(f"{type(exc).__name__}{exc}")
             self.available = False
+            self._heal_at = time.monotonic() + self.HEAL_RETRY_S
             return False
         self._reinits += 1
         self._reinits_since_ok += 1
@@ -727,10 +827,30 @@ class WristOverlay:
                 print(f"[overlay]   showOverlay 失败：{type(exc).__name__}: {exc}")
 
     # ---------- 周期任务：热重载 + 淡出 ----------
+    def _maybe_heal(self) -> None:
+        """`available=False` 时**定期**重试接管 SteamVR —— 否则面板再也救不回来（死角）。
+
+        ⚠️ 触发点只能在 `tick()`：`available=False` 之后上传 / 心跳 / 热重载**全部**
+        `if self.available` 早退，等于整个实例不再有任何周期性动作（实测的形态是
+        「勾选框还勾着、屏永远回不来，只能重启程序」）。
+        ⚠️ `close()` 过的实例绝不复活：用户取消勾选时我们把实例关掉了，而界面可能还拿着
+        这个对象（`gui_sinks._stop_overlay` 之后 `_overlay_out` 才置 None）——
+        自愈一跑，勾选框显示关掉、屏却自己回来了。
+        """
+        if self.dry_run or self._closed or self.available or self._heal_at is None:
+            return
+        if time.monotonic() < self._heal_at:
+            return
+        self._heal_at = time.monotonic() + self.HEAL_RETRY_S
+        print(f"[overlay] ♻️ 面板处于不可用状态 → 重试接管 SteamVR"
+              f"（每 {self.HEAL_RETRY_S:.0f}s 一次）", flush=True)
+        self._hard_reinit()
+
     def tick(self) -> None:
         # 配置热重载（位置/尺寸改完存盘即生效，无需重启）
         if self.dry_run:
             return
+        self._maybe_heal()                 # available=False → 定期重试接管（否则是死角）
         self._maybe_retry_tex_path()       # D3D 路曾不可用 → 到点再试一次（不依赖上传失败）
         if self.config_path and self.config_path.exists():
             mtime = self.config_path.stat().st_mtime
@@ -824,11 +944,13 @@ class WristOverlay:
                 pass
 
     def close(self) -> None:
+        self._closed = True                # 之后 `alive` 恒为假 + 不再自愈（见 _maybe_heal）
         if self._overlay is not None and self._handle is not None:
             try:
                 self._overlay.destroyOverlay(self._handle)
             except Exception:
                 pass
+            self._handle = None
         if self._vr is not None:
             try:
                 import openvr
@@ -836,6 +958,7 @@ class WristOverlay:
                 openvr.shutdown()
             except Exception:
                 pass
+            self._vr = None
         self._close_d3d()          # 释放持久 D3D11 设备/纹理（幂等，raw 路径下是 no-op）
         self.available = False
 

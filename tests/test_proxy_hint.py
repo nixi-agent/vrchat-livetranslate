@@ -8,6 +8,11 @@
   · 早退判断丢掉 → 代理每次启动都弹。
 所以三条各自一条用例，另加「关掉代理时不该弹」与「关窗幂等」。
 
+★ 用户报的缺陷（本文件 ⑥⑦ 两条专门守它）：「我期望只有第一次开的时候会弹一次，以后永远都不会弹，
+  现在我发现我每次启动程序都会弹这一下」。根因：**老用户的 config.yaml 里没有 `output.audio.proxy`
+  整段**，而旧的落盘写法 `_yaml_set_in_text` 遇到缺父键是**静默 no-op**（原样返回）→ 标记永远写不进
+  磁盘 → 每次启动都重新弹。既有用例的 harness 里**预先写了** proxy 段，所以它测不出这个缺陷（假绿）。
+
 打桩纪律（与 test_proxy_wiring 同一条）：不碰任何真实音频设备 ——
 `platform.create_mic_proxy` 换成假代理，GUI 用 headless，弹窗用 opener 替身（CI 上不开 Tk 窗）。
 """
@@ -44,6 +49,28 @@ CONFIG_TEXT = (
     "      passthrough_buffer_ms: 150\n"
 )
 
+#: 老用户的 config.yaml（更早的模板生成）：`output.audio` 在，但**整段 proxy 都没有**。
+#: 这就是用户那台机器上的形态 —— 缺陷只在它上面现形（见文件头的 ⑥）。
+LEGACY_CONFIG_TEXT = (
+    "# 老用户从更早的模板生成的配置：没有 output.audio.proxy 整段\n"
+    "ui:\n"
+    "  lang: zh\n"
+    "session:\n"
+    "  api_key: test-key-not-real\n"
+    "output:\n"
+    "  capture:\n"
+    "    mic_device: ''\n"
+    "  audio:\n"
+    "    enabled: false           # 总开关\n"
+    "    device: ['FakeCard Output']\n"
+    "    sample_rate: 48000\n"
+    "    buffer_ms: 300           # 起播前先攒这么多\n"
+    "    max_buffer_ms: 2000\n"
+)
+
+#: 兜底标记文件名（与 config.yaml 同目录）；见 vlt/gui_proxy_hint.py。
+FALLBACK_NAME = ".proxy-hint-shown"
+
 
 class _Widget:
     def __init__(self) -> None:
@@ -78,20 +105,31 @@ def _read_proxy_cfg(path: Path) -> dict:
 
 
 @contextlib.contextmanager
-def _harness(*, enabled: bool = True, headless: bool = True, hint_shown: bool | None = None):
-    """沙箱配置 + headless GUI + 假代理 + 假 opener。yield (gui, cfg_path, opened, buf)。"""
+def _harness(*, enabled: bool = True, headless: bool = True, hint_shown: bool | None = None,
+             legacy: bool = False, cfg_dir: Path | None = None, write_config: bool = True):
+    """沙箱配置 + headless GUI + 假代理 + 假 opener。yield (gui, cfg_path, opened)。
+
+    - ``legacy=True``：写一份**老用户形态**的 config.yaml（没有 `output.audio.proxy` 整段）；
+    - ``cfg_dir``/``write_config=False``：**复用**上一次留下的配置目录、不再改写它 ——
+      用来逐次模拟「重启程序」（每次都是新 GUI、配置从磁盘重读），
+      这样才能测出「标记到底有没有落盘」而不是只测内存快照。
+    """
     import vlt.config as cfg_mod
     import vlt.gui as gui_mod
     import vlt.gui_proxy as gui_proxy_mod
     from vlt import gui_proxy_hint
 
-    tmp = Path(tempfile.mkdtemp(prefix="vlt-proxy-hint-"))
+    tmp = Path(cfg_dir) if cfg_dir is not None else Path(tempfile.mkdtemp(prefix="vlt-proxy-hint-"))
     cfg_path = tmp / "config.yaml"
-    text = CONFIG_TEXT.format(enabled="true" if enabled else "false")
-    if hint_shown is not None:
-        text = text.replace("      passthrough_buffer_ms: 150\n",
-                            f"      passthrough_buffer_ms: 150\n      hint_shown: {str(hint_shown).lower()}\n")
-    cfg_path.write_text(text, encoding="utf-8", newline="\n")
+    if write_config:
+        if legacy:
+            cfg_path.write_text(LEGACY_CONFIG_TEXT, encoding="utf-8", newline="\n")
+        else:
+            text = CONFIG_TEXT.format(enabled="true" if enabled else "false")
+            if hint_shown is not None:
+                text = text.replace("      passthrough_buffer_ms: 150\n",
+                                    f"      passthrough_buffer_ms: 150\n      hint_shown: {str(hint_shown).lower()}\n")
+            cfg_path.write_text(text, encoding="utf-8", newline="\n")
 
     saved_env = {k: os.environ.get(k) for k in ("USERPROFILE", "HOME", "DASHSCOPE_API_KEY")}
     os.environ["USERPROFILE"] = str(tmp)
@@ -217,10 +255,95 @@ def test_close_is_idempotent_and_wired_into_exit() -> None:
     print("  ✓ ⑤ 关窗幂等 + 退出时收窗")
 
 
+def _n_hashes(text: str) -> int:
+    """含 `#` 的行数（本文件用老配置形态做回归，顺便盯住注释不被吃）。"""
+    return sum(1 for ln in text.splitlines() if "#" in ln)
+
+
+def test_legacy_config_without_proxy_section_marks_once() -> None:
+    """⑥ **用户报的那个缺陷**：老 config.yaml（整段 `output.audio.proxy` 都没有）→ 标记要真的落盘。
+
+    判据三条：① 首次启用弹一次；② 磁盘上出现 `output.audio.proxy.hint_shown: true`
+    （不是只在内存里）；③ 老配置原有的键与注释一个字不少。
+    然后**逐次模拟重启**（新 GUI、配置从磁盘重读）两次 —— 一次都不许再弹。
+    """
+    tmp = None
+    with _harness(headless=False, legacy=True) as (gui, cfg_path, opened):
+        before = cfg_path.read_text(encoding="utf-8")
+        ok, out = _start(gui)
+        assert ok is True, out
+        assert len(opened) == 1, f"首次启用应弹一次，实际 {len(opened)} 次：{out!r}"
+        assert "[proxy] 首次启用说明已弹出" in out, f"必须留痕（禁静默）：{out!r}"
+
+        text = cfg_path.read_text(encoding="utf-8")
+        assert _read_proxy_cfg(cfg_path).get("hint_shown") is True, (
+            "标记必须真的落盘 —— 老配置缺整段时旧写法是静默 no-op，于是每次启动都弹："
+            f"{text!r}")
+        assert "hint_shown" not in before, "前提：老配置里本来没有这个标记"
+        assert _n_hashes(text) == _n_hashes(before), "就地写入把注释吃掉了"
+        doc = yaml.safe_load(text)
+        audio = (doc.get("output") or {}).get("audio") or {}
+        assert audio.get("buffer_ms") == 300 and audio.get("max_buffer_ms") == 2000, \
+            f"老配置里已有的键被动了：{audio!r}"
+        assert "[proxy] ⚠️" not in out, f"落盘成功就不该有 WARN：{out!r}"
+        tmp = cfg_path.parent
+
+    assert tmp is not None
+    for nth in (2, 3):
+        with _harness(headless=False, cfg_dir=tmp, write_config=False) as (gui2, _c2, opened2):
+            ok2, out2 = _start(gui2)
+            assert ok2 is True, out2
+            assert opened2 == [], f"第 {nth} 次启动不该再弹：{out2!r}"
+    print("  ✓ ⑥ 老配置（无 proxy 整段）：标记真的落盘 + 之后两次启动都不弹（用户报的缺陷）")
+
+
+def test_unwritable_config_falls_back_loudly_and_never_repeats() -> None:
+    """⑦ 故障注入：config.yaml 写不进去（只读 / 被占用 / 损坏）→ 响亮留痕 + 兜底标记，且不再无限弹。
+
+    口径（本仓库「禁静默降级」）：写不进去**必须**有一行 `[proxy]` WARN 说清「没写进 config.yaml」；
+    同时「已提示过」这件事不能一点痕迹都留不下 —— 否则用户每次启动都被同一条说明再打扰一次，
+    而它按设计只该弹一次（用户原话「以后永远都不会弹」）。所以落一个同目录的兜底标记文件，
+    下次启动读到它就安静，并且每次都会如实说明标记来自哪里。
+    """
+    tmp = None
+    with _harness(headless=False, legacy=True) as (gui, cfg_path, opened):
+        import vlt.gui_proxy as gui_proxy_mod
+
+        def _boom(*_a, **_k):
+            raise PermissionError("模拟：config.yaml 只读 / 被占用")
+
+        real = gui_proxy_mod._write_config_text
+        gui_proxy_mod._write_config_text = _boom          # type: ignore[assignment]
+        try:
+            ok, out = _start(gui)
+        finally:
+            gui_proxy_mod._write_config_text = real       # type: ignore[assignment]
+
+        assert ok is True, out
+        assert len(opened) == 1, f"写不进标记也不许影响这次弹窗：{out!r}"
+        assert "[proxy] ⚠️" in out and "没能写进 config.yaml" in out, \
+            f"写不进去必须响亮留痕（禁静默降级）：{out!r}"
+        assert "hint_shown" not in cfg_path.read_text(encoding="utf-8"), "写不进去就别动文件"
+        assert (cfg_path.parent / FALLBACK_NAME).exists(), \
+            f"必须有兜底标记，否则下次启动还会再弹：{list(cfg_path.parent.iterdir())!r}"
+        assert "已改用兜底标记" in out, f"用了兜底标记要留痕：{out!r}"
+        tmp = cfg_path.parent
+
+    assert tmp is not None
+    with _harness(headless=False, cfg_dir=tmp, write_config=False) as (gui2, _c2, opened2):
+        ok2, out2 = _start(gui2)
+        assert ok2 is True, out2
+        assert opened2 == [], f"兜底标记在 → 不该再弹：{out2!r}"
+        assert "标记来自兜底文件" in out2, f"用了兜底标记就每次都要留痕：{out2!r}"
+    print("  ✓ ⑦ config.yaml 写不进去：响亮 WARN + 兜底标记 → 下次启动不再弹（不静默、不无限弹）")
+
+
 if __name__ == "__main__":
     test_headless_never_shows_and_never_writes_flag()
     test_first_start_shows_once_then_persists()
     test_second_process_reads_flag_and_stays_quiet()
     test_disabled_proxy_does_not_hint()
     test_close_is_idempotent_and_wired_into_exit()
+    test_legacy_config_without_proxy_section_marks_once()
+    test_unwritable_config_falls_back_loudly_and_never_repeats()
     print("\nALL PASSED")

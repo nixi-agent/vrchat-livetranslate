@@ -136,12 +136,13 @@ def main() -> int:
     CONFIG.write_text(before, encoding="utf-8")
     print(f"已还原 config.yaml（注释 {n_comments(CONFIG.read_text(encoding='utf-8'))} 行）")
 
-    # 三个新用例：块序列替换 / 写入校验 / 坏配置恢复 / 深层注释不被吃掉
+    # 四个新用例：块序列替换 / 写入校验 / 坏配置恢复 / 深层注释不被吃掉 / 补建+复检
     try:
         test_block_sequence_value_is_replaced_intact()
         test_write_guard_refuses_invalid_yaml()
         test_broken_config_backed_up_and_regenerated()
         test_deep_indented_comments_survive_leaf_writes()
+        test_set_or_create_checked_catches_silent_noop()
     except AssertionError as exc:
         fails.append(f"新增用例失败：{exc}")
 
@@ -231,6 +232,66 @@ def test_write_guard_refuses_invalid_yaml() -> None:
         raise AssertionError("非法 YAML 竟然被写进去了")
     assert guard.read_text(encoding="utf-8") == "keep: me\n", "原有内容被破坏"
     guard.unlink(missing_ok=True)
+
+
+def test_set_or_create_checked_catches_silent_noop() -> None:
+    """缺父键时**补建**，而「补建也没写进去 / 值写歪」必须抛 —— 不许像 `_yaml_set_in_text` 那样静默返回原文。
+
+    用户报的缺陷就是这种静默 no-op：老 config.yaml 里没有 `output.audio.proxy` 整段时，
+    写 `proxy.hint_shown` 原样返回（不抛不报），`_write_config_text` 写回同一份文本，
+    调用方以为成功了 → 「首次启用说明」每次启动都弹。
+    """
+    from vlt import config_io
+
+    # 老用户的配置形态：`output.audio` 在，但**没有** proxy 子段
+    legacy = ("ui:\n  lang: zh\noutput:\n  audio:\n"
+              "    enabled: false           # 总开关\n    buffer_ms: 300\n")
+    path = ["output", "audio", "proxy", "hint_shown"]
+
+    # ① 旧函数：父键缺失 → **原样返回**（静默 no-op，把它的语义钉死）
+    assert config_io._yaml_set_in_text(legacy, path, "true") == legacy, \
+        "前提：旧函数对缺失父键应原样返回（这就是那条静默 no-op）"
+
+    # ② 新函数：补建整条链，写后复检通过；原有键与注释一个字不少
+    out = config_io._yaml_set_or_create_checked(legacy, path, "true")
+    audio = ((yaml.safe_load(out) or {}).get("output") or {}).get("audio") or {}
+    assert (audio.get("proxy") or {}).get("hint_shown") is True, f"没补建出标记：{audio!r}"
+    assert audio.get("buffer_ms") == 300 and "# 总开关" in out, f"原有内容被动了：{out!r}"
+    print("  ✓ 缺父键 → 补建整条链并复检通过（hint_shown 落进 output.audio.proxy，原键与注释都在）")
+
+    # ③ 故障注入：让「补建」也退化成静默 no-op（返回原文）→ 复检必须**抛**，不许静默
+    real = config_io._yaml_set_or_create
+    config_io._yaml_set_or_create = lambda text, _p, _v: text          # type: ignore[assignment]
+    try:
+        try:
+            config_io._yaml_set_or_create_checked(legacy, path, "true")
+        except RuntimeError as exc:
+            assert "没能写进配置" in str(exc), f"异常信息要说清是「没写进去」：{exc}"
+            print(f"  ✓ 没生效时响亮报错 OK：{str(exc)[:60]}…")
+        else:
+            raise AssertionError("写不进去竟然没抛（静默降级）")
+    finally:
+        config_io._yaml_set_or_create = real                          # type: ignore[assignment]
+
+    # ④ 故障注入：写进去了但**值不对**（写成 false）→ 同样要抛
+    config_io._yaml_set_or_create = lambda text, p, _v: real(text, p, "false")
+    try:
+        try:
+            config_io._yaml_set_or_create_checked(legacy, path, "true")
+        except RuntimeError as exc:
+            assert "不是期望的" in str(exc), f"异常信息要说清值不对：{exc}"
+            print(f"  ✓ 值写歪时响亮报错 OK：{str(exc)[:60]}…")
+        else:
+            raise AssertionError("值不对竟然没抛（静默降级）")
+    finally:
+        config_io._yaml_set_or_create = real                          # type: ignore[assignment]
+
+    # ⑤ 已存在的键走就地替换（不整文件重写）：注释一行不少
+    template = (ROOT / "config.example.yaml").read_text(encoding="utf-8")
+    assert "hint_shown" in template, "前提：模板里已有这个键"
+    out2 = config_io._yaml_set_or_create_checked(template, path, "true")
+    assert n_comments(out2) == n_comments(template), "就地改写的取舍被破坏了（注释行数变了）"
+    print("  ✓ 已存在的键：就地替换（注释行数不变）")
 
 
 def test_broken_config_backed_up_and_regenerated() -> None:

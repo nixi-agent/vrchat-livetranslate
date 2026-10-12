@@ -663,8 +663,14 @@ class WristOverlay:
               f"（第 {self._reinit_fails} 次尝试）", flush=True)
 
     def _maybe_reinit(self) -> None:
-        """到点了就再试一次 `_hard_reinit()`（跑在 `tick()` 里，不依赖「有上传失败」）。"""
-        if (self.available or self.dry_run or self._reinit_at is None
+        """到点了就再试一次 `_hard_reinit()`（跑在 `tick()` 里，不依赖「有上传失败」）。
+
+        ⚠️ 必须显式看 `_closed`：`close()` 恰好把 `available` 置 False，而这正是本函数
+        「可以重试」的条件 —— 少了这个守卫，「已排定重试 + 用户取消勾选」会让下一次 tick
+        直接 `openvr.init()` 把面板**复活**（正是本 PR 要消灭的「取消勾选后屏自己回来」）。
+        复审实测指出（`_maybe_apply_anchor` 那边本来就有这条守卫，这里漏了）。
+        """
+        if (self._closed or self.available or self.dry_run or self._reinit_at is None
                 or time.monotonic() < self._reinit_at):
             return
         self._reinit_at = None
@@ -1067,8 +1073,10 @@ class WristOverlay:
         # 放在热重载与淡出之前——它是最该先出结果的一条诊断。
         # ⚠️ 心跳**不看 available**：面板不可用时最需要它来留痕（`available=False` 之后
         #    其余路径全早退，日志会彻底安静，事后完全看不出是什么时候死的）。
+        # ⚠️ 但**要看 `_closed`**：已取消勾选的实例再打心跳只会刷日志、还多调一次
+        #    `findOverlay`（复审第 2 条：与 `_maybe_*` 的 `_closed` 纪律不对称）。
         now = time.monotonic()
-        if now - self._last_heartbeat >= self.HEARTBEAT_S:
+        if not self._closed and now - self._last_heartbeat >= self.HEARTBEAT_S:
             self._last_heartbeat = now
             try:
                 self._log_heartbeat()
@@ -1087,6 +1095,7 @@ class WristOverlay:
     def close(self) -> None:
         self._closed = True                # 之后 `alive` 恒为假 + 不再自愈（见 _maybe_reinit）
         self.pending_anchor = False        # 取消勾选后不许「自己出现」（见 _maybe_apply_anchor）
+        self._reinit_at = None             # 已排定的「重试接管」也一并作废（见 _maybe_reinit）
         if self._overlay is not None and self._handle is not None:
             try:
                 self._overlay.destroyOverlay(self._handle)

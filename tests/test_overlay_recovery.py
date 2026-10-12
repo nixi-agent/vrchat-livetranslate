@@ -273,6 +273,86 @@ def test_heartbeat_logs_even_when_unavailable() -> None:
 
 
 # ---------------------------------------------------------------- B：兼容模式
+def test_close_blocks_reinit_resurrection() -> None:
+    """取消勾选（close）后，**已排定的**「重试接管」不许把面板复活（复审第 1 条）。
+
+    场景：`available=False` → `_schedule_reinit()` 已排定 → 用户取消勾选 `close()`。
+    旧守卫只看 `available`（close() 恰好把它置 False ⇒ 满足「可以往下走」）与
+    `_reinit_at`（非 None）⇒ 下一次 tick 会 `_hard_reinit()` → `openvr.init()`，
+    面板**自己回来**（正是本 PR 要消灭的那条症状，只不过换了一条路径）。
+    判据：tick 之后不得出现 `init`/`shutdown`，且已排定的时间点被清掉。
+
+    故障注入：把 `_maybe_reinit` 守卫里的 `self._closed` 删掉 → 本条红。
+    """
+    oo = _fresh()
+    ov = oo.WristOverlay(_cfg())
+    assert ov.start() is True
+    ov.available = False                       # 模拟「面板不可用」
+    ov._schedule_reinit("测试：已排定重试")
+    assert ov._reinit_at is not None, "前置条件：应已排定一次重试"
+    ov.close()                                 # 用户取消勾选
+
+    # 护栏一（物理上不可能）：close() 把已排定的时间点直接作废。
+    #   故障注入 B：删掉 `close()` 里的 `self._reinit_at = None` → 这一条红。
+    assert ov._reinit_at is None, "close() 应把已排定的重试清掉（护栏要物理上不可能）"
+
+    # 护栏二（守卫）：即使 `_reinit_at` 又被弄成「已到点」（旧状态残留 / 将来有人挪走清理），
+    #   `_closed` 也必须拦住 —— ⚠️ 这一条**只有** `_closed` 能守：`available` 被 close()
+    #   置成 False 恰好满足「可以重试」的条件。
+    #   故障注入 A：删掉 `_maybe_reinit` 守卫里的 `self._closed` → 这一条红。
+    ov._reinit_at = time.monotonic() - 1.0
+    CALLS.clear()
+    INIT_FAIL["count"] = 0
+    ov._last_heartbeat = 0.0
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ov.tick()
+    out = buf.getvalue()
+
+    assert INIT_FAIL["count"] == 0, f"close() 之后 tick 又调了 openvr.init()（面板复活）：\n{out}"
+    assert "shutdown" not in _names(), f"close() 之后 tick 又走了接管流程：\n{out}"
+    assert ov.available is False, "close() 之后不该变成 available"
+    print("  close() 之后「已排定的重试」不再复活面板 OK（两条护栏各验一次）")
+
+
+def test_heartbeat_skips_closed_instance() -> None:
+    """已 close() 的实例不再打心跳（少刷日志、少探活）—— 复审第 2 条。
+
+    与 `test_heartbeat_logs_even_when_unavailable` 成对：**不可用**要留痕，**已关闭**要安静。
+    判据用「探测次数 + 留痕」两条：`findOverlay`/`isOverlayVisible` 一次都不该被调。
+
+    故障注入：把心跳条件里的 `not self._closed` 删掉 → 本条红。
+    """
+    oo = _fresh()
+    ov = oo.WristOverlay(_cfg())
+    assert ov.start() is True
+    ov._last_heartbeat = 0.0                   # 下一跳必到点
+    ov.close()
+
+    probes = {"find": 0, "vis": 0}
+    ovl = ov._overlay
+
+    def _find(key):  # noqa: ANN001, ANN202
+        probes["find"] += 1
+        return 7
+
+    def _vis(handle):  # noqa: ANN001, ANN202
+        probes["vis"] += 1
+        return True
+
+    ovl.findOverlay, ovl.isOverlayVisible = _find, _vis
+    CALLS.clear()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ov.tick()
+    out = buf.getvalue()
+
+    assert "心跳" not in out, f"close() 之后还在打心跳：\n{out}"
+    assert probes["find"] == 0 and probes["vis"] == 0, \
+        f"close() 之后还在探活：findOverlay={probes['find']} isOverlayVisible={probes['vis']}"
+    print("  close() 之后不再打心跳 / 不再探活 OK")
+
+
 def test_raw_path_rebuilds_before_the_200_wall() -> None:
     """兼容模式（旧路）必须**主动**重建，而不是等每 ~200 次上传挂掉之后再自愈。
 
@@ -377,6 +457,8 @@ if __name__ == "__main__":
     test_unavailable_selfheals_and_repushes()
     test_reinit_backoff_is_bounded()
     test_heartbeat_logs_even_when_unavailable()
+    test_close_blocks_reinit_resurrection()
+    test_heartbeat_skips_closed_instance()
     test_raw_path_rebuilds_before_the_200_wall()
     test_degraded_note_is_loud_and_clears_on_recovery()
     test_engine_relays_degraded_note_once()

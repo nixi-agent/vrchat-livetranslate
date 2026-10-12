@@ -27,7 +27,7 @@ from .platform.audio import MixedAudioSource
 from .platform.base import LoopbackTarget
 from .output.chatbox import Chatbox, TokenBucket
 from .output.merger import Merger
-from .output.overlay import OverlayConfig
+from .output.overlay import DegradedNoteRelay, OverlayConfig
 from .output.level_match import LevelConfig, LevelMatcher, block_db, format_db
 from .output.level_match import MODE_OFF as LEVEL_MODE_OFF
 from .output.virtualmic import VirtualMic, pick_output_device, resample_24k_mono_to_48k_stereo
@@ -543,9 +543,10 @@ class Engine:
         self._chatbox: Chatbox | None = None
         self._merger: Merger | None = None
         self._overlay: Any | None = None
-        # 上一次已上报给界面的「手腕屏降级说明」（None = 正常）。见 _relay_overlay_note：
-        # 只在**变化**时推状态栏（每帧都推会刷屏，且状态栏会被后续消息立刻覆盖）。
-        self._overlay_note_seen: str | None = None
+        # 「手腕屏降级说明」的转发（只在**变化**时推状态栏；每帧都推会刷屏，且状态栏会被
+        # 后续消息立刻覆盖）。判重与 GUI 那条 tick **共用** `DegradedNoteRelay` ——
+        # 分开写必然漂移（GUI 走的不是这条 `_pump_loop`，见 `vlt/output/overlay.py` 里那段说明）。
+        self._note_relay = DegradedNoteRelay()
         self._virtualmic: VirtualMic | None = None
         # True = _virtualmic 是引擎自建的（停翻译时要 close）；False = 外部注入的共享 sink
         # （归代理管，引擎不碰它的生命周期）。
@@ -1368,13 +1369,12 @@ class Engine:
 
         手腕屏后端（Windows / Linux 两个后端）**可选**提供这个属性；有变化才转发一次 ——
         用户关心的是「面板为什么偶尔不刷新」，只打日志的话他永远看不到（禁静默降级）。
+        判重本身在 `DegradedNoteRelay` 里（GUI 那条 tick 用的是**同一个**类，见其 docstring）。
+
+        ⚠️ 只覆盖 CLI / `--demo` 那条路：GUI 下 `Engine._overlay` 恒为 None（手腕屏由界面持有），
+        所以 GUI 的降级说明由 `gui_chat.poll` 里那一跳负责推 —— 两处都必须在。
         """
-        note = getattr(self._overlay, "degraded_note", None)
-        if note == self._overlay_note_seen:
-            return
-        self._overlay_note_seen = note
-        if note:
-            self._events.on_status("warn", note)
+        self._note_relay.relay(self._overlay, self._events.on_status)
 
     async def _feed_audio(self) -> None:
         if self._source.startswith("pcm:"):

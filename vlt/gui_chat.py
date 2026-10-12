@@ -17,6 +17,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from .i18n import t
+from .output.overlay import DegradedNoteRelay
 from .ui_text import _Bubble
 from .ui_theme import (
     BG,
@@ -89,6 +90,9 @@ class ChatCtx:
     overlay_out_fn: Optional[Callable] = None      # () -> Overlay | None
     desktop_out_fn: Optional[Callable] = None      # () -> DesktopOverlay | None
     pending_starts_fn: Optional[Callable] = None   # () -> int
+    # 手腕屏**降级说明**的转发（判重与引擎 `_pump_loop` 那条路**共用同一个类**）：
+    # 实例由本模块每跳现取 `overlay_out_fn()`，所以这里只放判重状态，不持有实例。
+    overlay_note_relay: DegradedNoteRelay = field(default_factory=DegradedNoteRelay)
 
     # ── 状态栏 ──
     last_status_level: str = "info"
@@ -646,6 +650,11 @@ def poll(ctx: ChatCtx, root: tk.Misc,
     ov = ctx.overlay_out_fn() if ctx.overlay_out_fn else None
     if ov is not None:
         ov.tick()
+        # 手腕屏的**降级说明**也要推给状态栏 —— GUI 下 `Engine._overlay` 恒为 None（实例由界面
+        # 持有），引擎 `_pump_loop` 里那条转发在这里根本跑不到：只打日志的话用户永远看不到
+        # 「面板为什么偶尔不刷新」（#98 合并后复审发现的缺口，见 issue #99）。
+        # 判重与那条路共用 `DegradedNoteRelay`，只在变化时推（降级 warn / 恢复 info）。
+        ctx.overlay_note_relay.relay(ov, set_status_fn)
     dov = ctx.desktop_out_fn() if ctx.desktop_out_fn else None
     if dov is not None:
         dov.tick()

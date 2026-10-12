@@ -268,6 +268,33 @@ class WristOverlay:
         """尝试接管 SteamVR；没跑就返回 False 并禁用（不抛异常、不阻塞）。"""
         self._closed = False               # 显式 start() 过的实例重新参与自愈
         self.last_error = ""
+        # ⚠️ 会话级自愈状态必须归零：`start()` 之后就是**新的一轮会话**，上一轮的值留着会
+        #    让新会话按上一轮的档位跑（复审 #99 第 3 条，逐条实测过）：
+        #      * `_reinit_fails` 从 3 接着走 → 下一次「面板不可用」排定 **40s** 而不是 5s；
+        #      * `_tex_retried` 仍是 True → 「整个会话只给一次」的 D3D 定点重试名额已被用掉
+        #        （`_schedule_tex_retry` 直接成了 no-op）；
+        #      * `_anchor_tries` 留着 → 新会话的锚点重试从「第 9 次」开始，前 30 次的留痕
+        #        规则（`ANCHOR_RETRY_LOG_EVERY`）跟着错位；
+        #      * `_upload_fails` / `_fails_in_stage` 留着 → 新会话第一次失败就凑够 3 次、
+        #        立刻升级成「重建面板 / 硬重启 openvr」。
+        #    `_tex_disabled` / `_tex_fallback_logged` **不重置**：它们是「这套 SteamVR 不支持
+        #    贴图直传」的判定（与 openvr 版本绑定，重启同一实例也不会变），重置只会让同一条
+        #    不支持重复踩一遍。`degraded_note` 同理（重置会在 `_init_texture_path` 因
+        #    `_tex_disabled` 早退时把「仍在降级」这件事从状态栏抹掉）。
+        self._reinit_at = None
+        self._reinit_fails = 0
+        self._tex_retry_at = None
+        self._tex_retried = False
+        self._upload_fails = 0
+        self._fails_in_stage = 0
+        self._recover_stage = "none"
+        self._rebuilds_since_ok = 0
+        self._reinits_since_ok = 0
+        self._raw_frames = 0
+        self._last_ok_at = 0.0
+        self.pending_anchor = False
+        self._anchor_retry_at = 0.0
+        self._anchor_tries = 0
         if not self.cfg.enabled:
             print("[overlay] 配置里已禁用")
             self.last_error = OVERLAY_ERR_OTHER
@@ -626,8 +653,16 @@ class WristOverlay:
             self._tex_retry_at = time.monotonic() + TEX_RETRY_AFTER_S
 
     def _maybe_retry_tex_path(self) -> None:
-        """到点了就再试一次启用 D3D 路（跑在 `tick()` 里，所以不依赖「有上传失败」）。"""
-        if (self._d3d is not None or self._tex_disabled or self._tex_retried
+        """到点了就再试一次启用 D3D 路（跑在 `tick()` 里，所以不依赖「有上传失败」）。
+
+        ⚠️ 与 `_maybe_reinit` / `_maybe_apply_anchor` **同一套纪律**：只跑在 `tick()` 里，且
+        `close()` 过的实例绝不复活。少了 `_closed` 守卫时的实测后果（复审 #99 第 2 条）：
+        对一个已 `close()` 的实例调 `tick()`，会真的**新建一个 D3D11 设备/纹理**
+        （真机上泄漏到进程退出），再拿 `handle=None` 去调 `setOverlayTexture`。
+        `close()` 里那条 `_tex_retry_at = None` 是第二道护栏（把已排定的时间点直接作废）——
+        两道都要，缺一道就有一半路径能复活（同 `_maybe_reinit` 那对护栏）。
+        """
+        if (self._closed or self._d3d is not None or self._tex_disabled or self._tex_retried
                 or self._tex_retry_at is None or time.monotonic() < self._tex_retry_at):
             return
         self._tex_retried = True
@@ -1096,6 +1131,10 @@ class WristOverlay:
         self._closed = True                # 之后 `alive` 恒为假 + 不再自愈（见 _maybe_reinit）
         self.pending_anchor = False        # 取消勾选后不许「自己出现」（见 _maybe_apply_anchor）
         self._reinit_at = None             # 已排定的「重试接管」也一并作废（见 _maybe_reinit）
+        # ⚠️ D3D 路的定点重试同样要作废：它的守卫星是 `_closed` + 这个时间点**两道**，
+        #    只留一道时「已排定重试 + 取消勾选」仍能让下一次 tick 建出一个新 D3D 设备
+        #    （见 _maybe_retry_tex_path；复审 #99 第 2 条）。
+        self._tex_retry_at = None
         if self._overlay is not None and self._handle is not None:
             try:
                 self._overlay.destroyOverlay(self._handle)

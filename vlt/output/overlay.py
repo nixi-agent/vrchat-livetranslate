@@ -19,6 +19,7 @@ from __future__ import annotations
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -36,6 +37,63 @@ OVERLAY_ERR_COMPOSITOR = "compositor"  # 运行时在跑，但它的**合成器*
 OVERLAY_ERR_HMD = "hmd"            # 运行时在跑，但没检测到头显
 OVERLAY_ERR_ANCHOR = "anchor"      # 锚点设备没被追踪（手柄 / tracker 不在线）
 OVERLAY_ERR_OTHER = "other"        # 其它（细节看日志）
+
+# ------------------------------------------------- 降级说明「变化才推」（GUI / CLI 共用一份）
+#: 降级**恢复**时推给状态栏的那句话。
+#: ⚠️ 与 `degraded_note`（后端给的中文说明）走同一条通道，所以这句也用中文 —— 只翻「恢复」
+#:    这一句会让状态栏变成半中半外，整条通道的 i18n 另议。
+DEGRADED_NOTE_RECOVERED = "手腕屏已恢复正常刷新方式（不再降级）"
+
+
+class DegradedNoteRelay:
+    """把手腕屏的**降级说明**（`overlay.degraded_note`）的变化按需推到界面。GUI 与 CLI 共用。
+
+    ⚠️ 为什么判重必须只有这一份：GUI 的手腕屏实例由**界面**持有（`gui_engine.start_engine`
+    把 overlay 从引擎自己的 sinks 里剔掉 ⇒ `Engine._overlay` 恒为 None），每帧的 `tick()` 也走
+    界面自己那条（`gui_chat.poll` 的 tick 段）；引擎的 `_pump_loop` 只在 CLI / `--demo` 那条路
+    上碰到实例。两处各写一份判重必然漂移 —— 实测正是分开写的后果：降级说明只进了日志，
+    状态栏永远看不到（#98 合并后复审发现，见 issue #99）。
+
+    用法：两处各持一个实例，每帧调一次 `relay(实例, 推送函数)`：
+
+        relay = DegradedNoteRelay()
+        relay.relay(self._overlay, self._events.on_status)   # CLI：引擎 _pump_loop
+        relay.relay(ov, set_status_fn)                       # GUI：gui_chat.poll 的 tick 段
+
+    只在**变化**时推：降级 → 一条 warn（后端给的说明）；恢复 → 一条 info。恢复那条不能省 ——
+    状态栏只显示最新一条消息，没人再推就等于那条降级说明**永远挂在那里**（用户反而更慌）。
+    后端没有 `degraded_note` 属性时（Linux 后端 / 极简替身）一律当「正常」：不抛异常、不推空消息。
+    """
+
+    def __init__(self) -> None:
+        self._seen: str | None = None
+        self._last_overlay: Any = None
+
+    @property
+    def note(self) -> str | None:
+        """上一次已推出去的说明（None = 正常）。诊断 / 用例用。"""
+        return self._seen
+
+    def relay(self, overlay: Any, on_note: Callable[[str, str], None] | None = None) -> str | None:
+        """比对 `overlay.degraded_note`，有变化就推一条；返回本次的说明（None = 无变化）。
+
+        换过实例（界面关掉手腕屏又重新接管）时自动当「新的一轮」：上一轮的「已推过」历史
+        不能带到新实例上，否则新实例用**同一句**说明降级时会被判成「推过了」而静默丢掉。
+        """
+        if overlay is not self._last_overlay:
+            self._last_overlay, self._seen = overlay, None
+        note = getattr(overlay, "degraded_note", None) if overlay is not None else None
+        if note == self._seen:
+            return None
+        prev, self._seen = self._seen, note
+        if on_note is None:
+            return note
+        if note:
+            on_note("warn", note)
+        elif prev:
+            on_note("info", DEGRADED_NOTE_RECOVERED)
+        return note
+
 
 # 配置里没写字体时用哪份：按平台探测（Windows → 雅黑；Linux → fontconfig）。
 # 解析结果缓存，避免每次渲染都去 spawn 一个 fc-match。

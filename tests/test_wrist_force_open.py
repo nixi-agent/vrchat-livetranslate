@@ -39,6 +39,14 @@ from _cfgbox import sandbox_config  # noqa: E402
 
 sandbox_config(reset=True)
 
+# ⚠️ 界面语言必须在**构造 TranslationGUI 之前**钉死（本仓库的铁律）：状态栏文案走 `t()`，
+#    本机中文系统全绿、GitHub CI（英文系统）会一片红 —— 实测踩过（PR #98 的 CI 就红在这一条：
+#    断言里写「已自动取消勾选」，而 CI 拿到的是 "The wrist overlay could not start, so the
+#    tick was reverted: …"）。口径与 test_api_key_gui.py / test_config_save.py 完全一致。
+import vlt.i18n as _i18n  # noqa: E402
+
+_i18n.detect_system_language = lambda: "zh"
+
 import test_overlay_steamvr as fakeov  # noqa: E402  复用假 openvr 与调用记录
 from vlt import platform  # noqa: E402
 from vlt.output.openvr_overlay import WristOverlay as _RealWristOverlay  # noqa: E402

@@ -16,6 +16,11 @@
 到 **[Releases](https://github.com/nixi-agent/vrchat-livetranslate/releases/latest)** 下载
 `VRChatLiveTranslate.exe`（**单文件、免安装、无控制台窗口**），双击即用。
 
+> 🌏 **大陆网络打不开 GitHub 时**，直接下这两个直链（本项目自己的 CDN，不用连 GitHub）：
+> - Windows：<https://dl.kcm-nixi.cn/VRChatLiveTranslate.exe>
+> - Linux：<https://dl.kcm-nixi.cn/VRChatLiveTranslate-x86_64.AppImage>
+> - 校验值：<https://dl.kcm-nixi.cn/SHA256SUMS.txt>（exe 的 SHA256；`certutil -hashfile <文件> SHA256` 可自查）
+
 - 仍然要自备一个**千问云 API key**：界面里的「⚙ 设置」粘贴保存
 - 配置与日志写在 `%APPDATA%\vrchat-livetranslate`（exe 放在只读目录也能跑）
 - 想做成绿色版（配置跟着 exe 走）→ 在 exe 旁边放一个**空的 `portable.txt`**
@@ -32,6 +37,9 @@
   - **下次再说** → 这次不弹了，下次启动再看
   - **不再提示这个版本** → 跳过这个版本，出更新的再告诉你
 - 下载失败 → 可以重试，也可以点窗口里的「打开下载页自己下」去 Releases 页手动下
+- **更新从哪来**：检查新版本与下载都走本项目自己的 CDN（`dl.kcm-nixi.cn`，架在 Cloudflare R2 上），
+  **不需要连 GitHub** —— 大陆网络下这是它能稳定收到更新的原因。万一这个主源不可用，会自动回落到
+  GitHub Releases 取（两个源都拿不到时才会提示「检查失败」）
 - 想在没弹窗的时候看看有没有新版 → 「⚙ 设置 → 软件更新 → 检查更新」
 - 更新**不会动你的配置和 API key**；更新成功后下次启动会告诉你一声
 
@@ -779,6 +787,8 @@ build_exe.bat                                              :: 打包 + 打完自
   （顺带累积覆盖率，末尾打印摘要，**不设阈值、不阻断**）→ 再单独验一次**打包链路**（产物存在且 ≥20MB）
 - **Release**（`.github/workflows/release.yml`，推 `v*` tag 触发）：
   先对账 tag 与 `vlt/__init__.py` 的 `__version__`（不一致直接失败）→ 打包 **exe 与 Linux AppImage** →
+  **覆盖式发布到 Cloudflare R2**（`dl.kcm-nixi.cn`：客户端「检查更新 / 立即更新」的主源；传完会走公开域名
+  把两份产物整份下回来逐字节复核，复核不过就整体红、不建 Release）→
   建 Release，附件是 **exe**、**`VRChatLiveTranslate-x86_64.AppImage`** 与 `SHA256SUMS.txt`：校验值 GitHub 会在附件旁直接显示 `sha256:…`，而那份摘要文件是过渡期给 **v0.2.0 及更早客户端**用的（它们只认这个附件，缺了会静默查不到更新）
 - **下载后想自己复核**：`scripts/verify_release.py` 会把 Release 附件拉下来对账
   （SHA256、真跑 `--self-test`、版本行、字节码里搜新功能字符串、图标像素比对）：

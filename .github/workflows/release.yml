@@ -1,8 +1,11 @@
 name: Release
 
-# 打 v* 标签 → 真打包一次（Windows 单文件 exe + Linux AppImage）→ 建 Release 把两个附件都传上去。
+# 打 v* 标签 → 真打包一次（Windows 单文件 exe + Linux AppImage）→ 覆盖式发布到 Cloudflare R2
+# （客户端主更新源，走公开域名复核）→ 建 Release 把两个附件都传上去。
 # 为什么放 CI 而不是本机手工传：手工那次没人能复现「这个 exe / AppImage 到底是哪个 commit 打的」，
 # 而这里 tag 与包内 __version__ 会先对一次账，产物还带 GitHub 服务端算的 SHA256。
+# ⚠️ 顺序是**故意**的：R2 那步（publish-r2）是 release 的前置 —— R2 传不上去就整体红，
+#    因为客户端 v0.12.0 起主要从 R2 收更新（详见 publish-r2 job 上方注释）。
 on:
   push:
     tags: ["v*"]
@@ -122,8 +125,50 @@ jobs:
             dist/SHA256SUMS.txt
           if-no-files-found: error
 
-  release:
+  # ③ Cloudflare R2：覆盖式发布到公开下载域 + **走公开域名复核**（客户端主更新源）。
+  #
+  # 为什么这一步要卡在 Release 前面（下面 `release.needs` 里带着它）：
+  # 客户端 v0.12.0 起**主更新源是 R2 上的 latest.json**（GitHub 只作兜底）。R2 没传成功就等于
+  # 「发了版但没人收得到更新」—— 这种「看起来发成了」的失败必须整体红，宁可晚发一次。
+  # 真要接受「R2 挂了照发 Release」，把这个 needs 去掉即可（客户端会回落到 GitHub 源）。
+  #
+  # 键固定、对象带 no-cache（理由与实测见 scripts/publish_r2.py 头部）：
+  #   latest.json / VRChatLiveTranslate.exe / VRChatLiveTranslate-x86_64.AppImage / SHA256SUMS.txt
+  publish-r2:
     needs: [build, appimage]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      # 两个 artifact 都下到 dist/：与 release job 取附件的方式一致
+      - name: 取回 exe 产物
+        uses: actions/download-artifact@v7
+        with:
+          name: VRChatLiveTranslate-exe
+          path: dist
+      - name: 取回 AppImage 产物
+        uses: actions/download-artifact@v4
+        with:
+          name: VRChatLiveTranslate-AppImage
+          path: dist
+
+      - name: 装 boto3（R2 的 S3 端点）
+        run: python -m pip install boto3
+
+      # 一条命令干完：算 sha256 → 生成 latest.json → 上传 4 个对象 → **把两份产物整份下回来
+      # 逐字节复核**。复核不通过 → 非 0 退出 → 这一步红 → release job 不会跑。
+      - name: 发布到 R2 并复核公开域名
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python scripts/publish_r2.py publish --dist dist --tag "${GITHUB_REF_NAME}"
+
+  release:
+    needs: [build, appimage, publish-r2]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:

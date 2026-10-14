@@ -6,6 +6,22 @@
 - 网络访问走默认 opener（尊重 HTTPS_PROXY / 系统代理）——GitHub 国内直连不稳，
   与 textin.py 显式禁代理（国内端点）正好相反，别抄错。
 - 每个结论都留一行 [update] 日志（成功/跳过/失败各一行），不许静默降级。
+
+## 两个更新源：Cloudflare R2（主）→ GitHub Release（兜底）
+
+大陆用户访问 GitHub 不稳定（API 限流 60 次/小时、下载域名常被墙），所以**主源**是自家
+Cloudflare R2 上的静态清单 `MANIFEST_URL`：
+
+  * 清单由 `scripts/publish_r2.py` 在发版时生成（**那边是格式的唯一真相**，含字段说明）；
+  * 产物地址与 sha256 都在清单里 → 下载不必再问 GitHub，也不受 GitHub 附件 CDN 的影响；
+  * R2 上全是**固定键**、对象带 `no-cache` → 覆盖发布后立刻生效（理由见 publish_r2.py 头部）。
+
+主源任何一步失败（连不上 / 清单不合契约 / 那一版没有本形态的包）都**回落**到原来的 GitHub
+API 源，并各留一行 `[update]` 日志：R2 挂掉或格式升级时老路径还在，不至于让所有人收不到更新。
+反过来，GitHub 挂了不影响主路径 —— 这就是这次改动的全部目的。
+
+⚠️ 主源失败时抛的消息只进日志（用户看不到），所以那些文案**不走 `t()`**；
+   最终能到用户眼前的是兜底源（GitHub）的错误，仍按原样走词表。
 """
 from __future__ import annotations
 
@@ -29,6 +45,12 @@ from .config_io import _fmt_scalar, _write_config_text, _yaml_set_in_text
 from .i18n import t
 from .paths import is_frozen
 
+# 更新源（主）：自家 Cloudflare R2 上的静态清单。生成方 = scripts/publish_r2.py（格式的唯一真相）；
+# 域名写在客户端白名单里，改域要两边同时改（publish_r2.BASE_URL / MANIFEST_URL / ALLOWED_HOSTS）。
+MANIFEST_URL = "https://dl.kcm-nixi.cn/latest.json"
+MANIFEST_HOST = "dl.kcm-nixi.cn"
+MANIFEST_SCHEMA = 1
+# 更新源（兜底）：GitHub API。大陆不稳，只在主源失败时走。
 RELEASES_LATEST_API = "https://api.github.com/repos/nixi-agent/vrchat-livetranslate/releases/latest"
 # Release 页面基址（与上面的 API 同仓库）：拼 tag 页 = f"{RELEASES_HTML}/tag/vX.Y.Z"
 RELEASES_HTML = "https://github.com/nixi-agent/vrchat-livetranslate/releases"
@@ -47,10 +69,10 @@ PENDING_JSON = "update_pending.json"
 # APP_DIR：{"last_seen_version": "..."}（版本变化一次性提示用）
 STATE_JSON = "update_state.json"
 
-# 只允许这几个 host：查最新（api.github.com）、asset 跳转起点（github.com）、
-# asset 实际下载（两个 CDN 域）。重定向目标与最终落地地址都必须过这道白名单。
-ALLOWED_HOSTS = {"api.github.com", "github.com", "objects.githubusercontent.com",
-                 "release-assets.githubusercontent.com"}
+# 只允许这几个 host：清单与产物（dl.kcm-nixi.cn）、查最新（api.github.com）、
+# asset 跳转起点（github.com）、asset 实际下载（两个 CDN 域）。重定向目标与最终落地地址都必须过这道白名单。
+ALLOWED_HOSTS = {MANIFEST_HOST, "api.github.com", "github.com",
+                 "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
 
 _CHUNK = 256 * 1024
 
@@ -118,8 +140,12 @@ def _get_opener():
 
 
 @contextmanager
-def _mapped_errors():
-    """把 urllib/网络层的杂七杂八异常统一翻成给用户看的 UpdateCheckError。"""
+def _mapped_errors(rate_limit: str | None = None):
+    """把 urllib/网络层的杂七杂八异常统一翻成给用户看的 UpdateCheckError。
+
+    `rate_limit`：403/429 的文案。默认那句是 GitHub 的实情（未认证 60 次/小时），只有走 GitHub
+    时才对；主源（自家 CDN）撞到 403/429 是另一回事（对象/域名不对、被拦），传自己的文案进来。
+    """
     try:
         yield
     except UpdateCheckError:
@@ -127,7 +153,7 @@ def _mapped_errors():
     except HTTPError as exc:
         if exc.code in (403, 429):
             # 未认证限流 60 次/小时/IP；手动按钮被连点时最容易撞
-            raise UpdateCheckError(t("GitHub 限流（未认证 60 次/小时），稍后再试")) from exc
+            raise UpdateCheckError(rate_limit or t("GitHub 限流（未认证 60 次/小时），稍后再试")) from exc
         raise UpdateCheckError(f"HTTP {exc.code}") from exc
     except URLError as exc:
         raise UpdateCheckError(t("网络不可达：{msg}", msg=exc.reason)) from exc
@@ -137,9 +163,88 @@ def _mapped_errors():
         raise UpdateCheckError(f"{type(exc).__name__}: {exc}") from exc
 
 
+def parse_manifest(text: str, asset_name: str = EXE_ASSET_NAME) -> ReleaseInfo:
+    """把 CF 清单（`latest.json`）解析成 ReleaseInfo；不合契约的地方一律 UpdateCheckError。
+
+    清单是**发布侧与客户端之间唯一的契约**（生成方 = `scripts/publish_r2.py`）。这里严格校验的
+    理由：这里放过的每一个「奇怪但能用」的形态，最后都会变成用户机器上一次装了一半的更新 ——
+    宁可不更新（让调用方回落 GitHub），也不猜。
+    """
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise UpdateCheckError(t("响应不是合法 JSON：{msg}", msg=exc)) from exc
+    if not isinstance(data, dict):
+        raise UpdateCheckError("清单顶层不是对象")
+    schema = data.get("schema")
+    if schema != MANIFEST_SCHEMA:
+        # 出现不认识的格式版本：不猜、不兼容处理，直接回落 GitHub（将来升级格式时老客户端有救）
+        raise UpdateCheckError(f"清单的格式版本不认识：{schema!r}")
+    version = str(data.get("version") or "")
+    if parse_version(version) is None:
+        # version 会被当版本号比较，形态不对 = 永远收不到更新（或永远提示有更新）
+        raise UpdateCheckError(f"清单里的版本号不是严格 X.Y.Z：{version!r}")
+    assets = data.get("assets")
+    entry = assets.get(asset_name) if isinstance(assets, dict) else None
+    if not isinstance(entry, dict):
+        # 与 GitHub 源同一句话：那一版没有本形态要的包（Windows 单文件 exe / Linux AppImage）
+        raise UpdateCheckError(t("Release 附件不全：缺少 {name} 或校验值", name=asset_name))
+    url = str(entry.get("url") or "")
+    _check_url(url)                      # scheme + host 白名单：清单被改写/域名写错都要拦住
+    digest = str(entry.get("sha256") or "").lower()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise UpdateCheckError(f"{asset_name} 的校验值格式不对")
+    size = entry.get("size")
+    html = str(data.get("release_url") or "").strip()
+    if not html.startswith("https://"):
+        # 清单里没给（或给了个怪地址）→ 用 GitHub Release 页兜底：它只用于「看看更新了什么」
+        html = f"{RELEASES_HTML}/tag/v{version}"
+    return ReleaseInfo(tag=f"v{version}", version=version, html_url=html,
+                       asset_url=url, asset_name=asset_name, asset_digest=digest,
+                       sums_url="", asset_size=size if isinstance(size, int) and size > 0 else None)
+
+
+def fetch_latest_manifest(timeout: float = DEFAULT_TIMEOUT_S,
+                          asset_name: str = EXE_ASSET_NAME) -> ReleaseInfo:
+    """取主源（Cloudflare R2）的清单，返回**我要的那份产物**的描述。
+
+    下载器只需要 `asset_url` + `asset_digest`，两者清单里都有 —— 所以主源路径下一次网络走完，
+    不再像 GitHub 那条要先问 API 再 302 到 CDN。
+    """
+    req = Request(MANIFEST_URL, headers={
+        # UA 带上版本号：R2 侧访问日志里能看出是哪一版在查（与 GitHub 那条同口径）
+        "User-Agent": f"vrchat-livetranslate/{display_version()}",
+    })
+    with _mapped_errors(rate_limit=f"HTTP 403/429（对象不存在、被拦或限流）：{MANIFEST_HOST}"):
+        with _get_opener().open(req, timeout=timeout) as resp:
+            _check_url(_final_url(resp))     # 落地复检：跳转终点也必须在白名单
+            body = resp.read().decode("utf-8", "replace")
+    return parse_manifest(body, asset_name)
+
+
 def fetch_latest_release(timeout: float = DEFAULT_TIMEOUT_S,
                          asset_name: str = EXE_ASSET_NAME) -> ReleaseInfo:
-    """查 GitHub 最新 Release 里**我要的那份附件**（默认 exe；AppImage 传 APPIMAGE_ASSET_NAME）。
+    """查最新版本：**先主源（Cloudflare R2），失败回落 GitHub**。两条路都留一行 [update] 日志。
+
+    这是 GUI 唯一该调的入口（`check_for_updates` 用的就是它）。回落是**故意**的：
+    主源是自家对象存储、形态由我们控制，但「它挂了」不该等于「所有人都收不到更新」；
+    而 GitHub 那条老路已经跑了十几个版本、有全套用例守着，留着当兜底几乎零成本。
+    """
+    try:
+        info = fetch_latest_manifest(timeout=timeout, asset_name=asset_name)
+    except Exception as exc:  # noqa: BLE001 — 主源任何失败都只回落，绝不打断更新检查
+        print(f"[update] ⚠️ 主源（{MANIFEST_HOST}）失败：{exc} → 回落 GitHub Release", flush=True)
+    else:
+        print(f"[update] 更新源：Cloudflare（{MANIFEST_HOST}）v{info.version}", flush=True)
+        return info
+    info = fetch_latest_release_github(timeout=timeout, asset_name=asset_name)
+    print(f"[update] 更新源：GitHub Release v{info.version}（主源不可用时的兜底）", flush=True)
+    return info
+
+
+def fetch_latest_release_github(timeout: float = DEFAULT_TIMEOUT_S,
+                                asset_name: str = EXE_ASSET_NAME) -> ReleaseInfo:
+    """兜底源：查 GitHub 最新 Release 里**我要的那份附件**（默认 exe；AppImage 传 APPIMAGE_ASSET_NAME）。
     /releases/latest 天然排除 prerelease 和 draft（GitHub 语义）。
 
     失败一律 UpdateCheckError：403/429=限流、URLError/超时=网络不可达、

@@ -18,6 +18,12 @@ Grab **`VRChatLiveTranslate.exe`** from
 **[Releases](https://github.com/nixi-agent/vrchat-livetranslate/releases/latest)**
 (**single file, no install, no console window**) and double-click it.
 
+> 🌏 **If GitHub is unreachable** (common from mainland China), use the direct links below — they are
+> served from this project's own CDN and need no GitHub access:
+> - Windows: <https://dl.kcm-nixi.cn/VRChatLiveTranslate.exe>
+> - Linux: <https://dl.kcm-nixi.cn/VRChatLiveTranslate-x86_64.AppImage>
+> - Checksums: <https://dl.kcm-nixi.cn/SHA256SUMS.txt>
+
 - You still need your own **Qwen Cloud API key**: paste and save it in "⚙ Settings"
 - Config and logs live in `%APPDATA%\vrchat-livetranslate` (works even if the exe sits in a read-only folder)
 - Want a portable build (config travels with the exe) → put an **empty `portable.txt`** next to the exe
@@ -34,6 +40,10 @@ It **checks automatically**, but **never installs on its own** — whether and w
   - **Next time** → no more popups this run; it checks again on the next launch
   - **Skip this version** → ignores this version; you'll be told about the next one
 - Download failed → you can retry, or click "Open the download page" in the window and grab it from Releases yourself
+- **Where updates come from**: both the version check and the download go through this project's own CDN
+  (`dl.kcm-nixi.cn`, hosted on Cloudflare R2) — **no GitHub access needed**, which is why it keeps
+  working on mainland-China networks. If that primary source is unavailable it falls back to
+  GitHub Releases automatically (you only see "check failed" when both are unreachable)
 - Want to check when there's no popup → "⚙ Settings → Software update → Check for updates"
 - Updating **never touches your config or API key**; after a successful update the next launch tells you so
 
@@ -699,6 +709,7 @@ By default the build then really runs `exe --self-test` once; only finding `GUI_
   syntax check → static check (ruff `F,E9` tier, blocking) → credential scan → all offline tests file by file (coverage accumulated along the way, summary printed at the end, no threshold, non-blocking) → then a separate **packaging-pipeline** check (artifact exists and is ≥ 20 MB)
 - **Release** (`.github/workflows/release.yml`, triggered by pushing a `v*` tag):
   first reconciles the tag against `__version__` in `vlt/__init__.py` (mismatch = hard fail) → packages the **exe and the Linux AppImage** →
+  **publishes them to Cloudflare R2** (`dl.kcm-nixi.cn` — the primary source the client uses to check for and download updates; after the upload it re-downloads both artifacts through the public domain and verifies them byte-for-byte, and any mismatch fails the whole run instead of creating a Release) →
   creates the Release with the **exe**, **`VRChatLiveTranslate-x86_64.AppImage`** and `SHA256SUMS.txt` attached (GitHub shows a `sha256:…` digest next to every asset; the checksum file is a transition aid for clients up to v0.2.0, which only look for it)
 - **Want to verify a download yourself**: `scripts/verify_release.py` pulls the Release assets and reconciles them
   (SHA256, actually runs `--self-test`, version line, searches bytecode for new-feature strings, icon pixel comparison):

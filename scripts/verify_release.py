@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -35,6 +36,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from ctypes import wintypes
 from pathlib import Path
 
@@ -42,12 +45,20 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# 产物名 = 客户端契约（vlt/update_check.py 里的同名常量，由 tests/test_update_check.py 对着
+# release.yml 钉住）。这里 import 而不是抄一份：抄一份就会在改名时静默过期。
+from vlt.update_check import APPIMAGE_ASSET_NAME, EXE_ASSET_NAME  # noqa: E402
+
 TAG = sys.argv[1] if len(sys.argv) > 1 else "v0.0.2"
 # 本版新功能里必定出现的字符串；**逗号可给多个**（每个都要命中才算过）
 NEEDLES = [s.strip() for s in
            (sys.argv[2] if len(sys.argv) > 2 else "俄语").split(",") if s.strip()]
 ROOT = Path(__file__).resolve().parents[1]
 REPO_SLUG = "nixi-agent/vrchat-livetranslate"
+# 客户端的主更新源（Cloudflare R2 公开域）。域名与键名是**客户端契约**：
+#   vlt/update_check.py 的 MANIFEST_URL / ALLOWED_HOSTS ↔ scripts/publish_r2.py 的 BASE_URL + MANIFEST_KEY
+R2_BASE = "https://dl.kcm-nixi.cn"
+R2_MANIFEST_KEY = "latest.json"
 WORK = Path(tempfile.mkdtemp(prefix="verify_release_"))
 
 ok: list[str] = []
@@ -66,6 +77,43 @@ def sha256(p: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def r2_manifest() -> dict | None:
+    """取客户端主更新源（Cloudflare R2）上的清单；连不上返回 None（调用方按「跳过」记一笔）。"""
+    url = f"{R2_BASE}/{R2_MANIFEST_KEY}"
+    try:
+        with urllib.request.urlopen(
+                urllib.request.Request(url, headers={"User-Agent": "vlt-verify-release/1.0"}),
+                timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001 — 探针失败只记一笔，别把复核本身搞崩
+        print(f"  （R2 清单取不到：{type(exc).__name__}: {exc}）")
+        return None
+
+
+def r2_probe_size(url: str) -> int | None:
+    """Range 探针（1 字节）拿对象总字节数。
+
+    为什么不整份下回来对 sha：这两份加起来 75MB，本机（大陆直连）实测要十几分钟 ——
+    而「逐字节一致」这一步由 scripts/publish_r2.py 在**发布时**（CI，出口在美国）做过并卡门禁；
+    这里复核的是「公开域上现在确实是那一版」，存在性 + 大小 + 清单里的 sha256 已经够判。
+    """
+    try:
+        req = urllib.request.Request(url, headers={"Range": "bytes=0-0",
+                                                   "User-Agent": "vlt-verify-release/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content_range = resp.headers.get("Content-Range", "")
+            resp.read(16)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  （R2 探针失败 {url}：{type(exc).__name__}: {exc}）")
+        return None
+    if "/" in content_range:                       # "bytes 0-0/37440285"
+        try:
+            return int(content_range.rsplit("/", 1)[1])
+        except ValueError:
+            return None
+    return None
 
 
 print(f"== 复核 {TAG} ==")
@@ -115,6 +163,41 @@ declared = (_api.stdout or "").strip().removeprefix("sha256:").lower()
 check("sha256 实测 == GitHub 服务端 digest", bool(declared) and declared == mine,
       f"\n     GitHub: {declared or (_api.stderr or '取不到 digest').strip()[:120]!r}"
       f"\n     实测:   {mine}")
+
+# ---- 主更新源（Cloudflare R2）与 GitHub 附件必须是同一份字节 -------------------------------
+# 客户端 v0.12.0 起**主要从 R2 收更新**（GitHub 只是兜底），于是「发布出去的东西」有了两个落点，
+# 而本脚本前面复核的只是 GitHub 那份 —— 两边对不上，用户从主源拿到的就不是我们验过的字节。
+# 三层判据：清单版本 == 本次 tag；清单里每个产物的 sha256 == GitHub 的服务端 digest；
+# 公开域上那个对象的字节数 == GitHub 附件 size（Range 探针 1 字节拿 total，不整下）。
+_gh_assets: dict[str, tuple[int, str]] = {}
+for _line in subprocess.run(
+        ["gh", "api", f"repos/{REPO_SLUG}/releases/tags/{TAG}",
+         "--jq", '.assets[] | "\\(.name) \\(.size) \\(.digest)"'],
+        capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.splitlines():
+    _p = _line.split()
+    if len(_p) == 3:
+        _gh_assets[_p[0]] = (int(_p[1]), _p[2].removeprefix("sha256:").lower())
+
+_r2m = r2_manifest()
+if _r2m is None:
+    skipped.append(f"R2 清单取不到（{R2_BASE}/{R2_MANIFEST_KEY}）：主更新源这一次没被复核")
+else:
+    check("R2 清单版本 == 本次 tag", str(_r2m.get("version")) == TAG.lstrip("v"),
+          f"清单 {_r2m.get('version')!r} / tag {TAG!r}")
+    _r2_assets = _r2m.get("assets") if isinstance(_r2m.get("assets"), dict) else {}
+    check("R2 清单里两个平台的产物都在",
+          {EXE_ASSET_NAME, APPIMAGE_ASSET_NAME} <= set(_r2_assets), f"{sorted(_r2_assets)}")
+    for _name, _entry in _r2_assets.items():
+        _want = _gh_assets.get(_name)
+        if not _want:
+            check(f"{_name}：GitHub Release 里有同名附件", False, "R2 清单里这个附件在 GitHub 上不存在")
+            continue
+        _sha = str(_entry.get("sha256") or "").lower()
+        check(f"{_name}：R2 清单 sha256 == GitHub digest", _sha == _want[1],
+              f"R2 {_sha[:12]}… / GitHub {_want[1][:12]}…")
+        _total = r2_probe_size(str(_entry.get("url") or ""))
+        check(f"{_name}：公开域对象字节数 == GitHub 附件 size", _total == _want[0],
+              f"R2 {_total} / GitHub {_want[0]}")
 
 # 真跑一次自检
 print("  跑 --self-test（可能要十几秒）…")

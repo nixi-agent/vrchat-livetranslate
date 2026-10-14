@@ -37,6 +37,7 @@ CI 只跑 `tests/`（纯离线单元测试）与打包门禁；这里的手动�
 | `run_suite.sh` | 在指定 worktree（默认本仓库）跑全量**离线**测试并汇总（死代理 + 清 `DASHSCOPE_API_KEY`） | bash + 该 worktree 的 `.venv` | **本机已实测跑通** |
 | `verify_d3d11_shared_readback.py` | 用**独立 D3D11 设备 / 独立进程**打开手腕屏那张 `MISC_SHARED` 共享句柄并回读，量「upload 完到另一个消费者看得见新帧」的滞后；`--no-flush` 复现修复前的整帧滞后，`--png` 把生产者回读 / 消费者所见各存一张 PNG 供肉眼判 | Windows + 真 GPU（**不需要** SteamVR / 头显） | **本机已实测跑通**（RTX 4080：不 Flush 12/12 帧读到旧帧；Flush 后 12/12 新帧、跨进程滞后中位 4.4ms） |
 | `verify_overlay_degraded_note_gui.py` | 真 Tk 窗口里验「手腕屏降级说明进状态栏、恢复后消失」：往界面持有的实例（假后端，与真后端同形）翻 `degraded_note`，断言**状态栏控件**真的跟着变 —— GUI 那条 tick 与引擎 `_pump_loop` 是两条路，只跑单测抓不到「接线接错了那条」 | Windows + 真实桌面会话（GUI） | **本机已实测跑通** |
+| `verify_update_source.py` | **客户端视角**的更新链路验收：走真实入口（`check_for_updates` → 主源清单 → `download_and_verify`）真下载 + sha256 校验 + `update_pending.json` 落盘，顺带报告兜底源（GitHub）当前是否可用；`--all` 连另一个平台的产物一起跑 | **联网到 `dl.kcm-nixi.cn`**（不需要桌面会话 / 硬件） | **本机已实测跑通**（2026-10-14：主源拿到 v0.11.2、37,440,285 字节校验通过；同一时刻兜底源 GitHub API 正被限流 403 —— 旧路径当时是坏的，新主源照常） |
 
 内部助手：`_shot_window.py`（Win32 `PrintWindow` 截图的共用小工具，**不是给人单独跑的入口**，
 被 `verify_room_button.py` / `verify_room_i18n.py` 复用）；`_proxy_probe.py`（两份回环探针共用的
@@ -58,6 +59,9 @@ CI 只跑 `tests/`（纯离线单元测试）与打包门禁；这里的手动�
 
 # 需要联网到线上房间服务
 ./.venv/Scripts/python.exe scripts/verify/verify_room_button_live.py
+
+# 需要联网到主更新源（Cloudflare R2 公开域）——验收「客户端到底收不收得到更新」
+./.venv/Scripts/python.exe scripts/verify/verify_update_source.py --local-version 0.11.1
 
 # 需要虚拟声卡（VB-CABLE / VoiceMeeter）——不需要麦克风、不需要头显，麦克风那路被换成假源
 ./.venv/Scripts/python.exe scripts/verify/verify_proxy_loopback.py

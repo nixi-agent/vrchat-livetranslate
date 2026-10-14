@@ -16,6 +16,12 @@
 **[Releases](https://github.com/nixi-agent/vrchat-livetranslate/releases/latest)** 에서
 **`VRChatLiveTranslate.exe`** 를 받아(**단일 파일, 설치 불필요, 콘솔 창 없음**) 두 번 클릭하면 됩니다.
 
+> 🌏 **GitHub에 접속할 수 없을 때**(중국 본토 네트워크에서 흔합니다)는 아래 직링크를 사용하세요.
+> 이 프로젝트 자체 CDN이 배포하므로 GitHub 접속이 필요 없습니다:
+> - Windows: <https://dl.kcm-nixi.cn/VRChatLiveTranslate.exe>
+> - Linux: <https://dl.kcm-nixi.cn/VRChatLiveTranslate-x86_64.AppImage>
+> - 체크섬: <https://dl.kcm-nixi.cn/SHA256SUMS.txt>
+
 - **Qwen Cloud API key** 는 직접 준비하셔야 합니다. "⚙ 설정"에서 붙여넣고 저장하세요
 - 설정과 로그는 `%APPDATA%\vrchat-livetranslate` 에 저장됩니다(읽기 전용 폴더에 exe를 둬도 동작합니다)
 - 포터블로 쓰고 싶다면(설정이 exe 옆에 저장됨) exe 옆에 **빈 `portable.txt`** 를 두세요
@@ -32,6 +38,10 @@
   - **다음에** → 이번 실행에서는 더 이상 알리지 않고, 다음 실행 때 다시 확인합니다
   - **이 버전은 알리지 않기** → 해당 버전만 무시하고, 다음 버전은 다시 알려 줍니다
 - 다운로드 실패 시 다시 시도할 수 있고, 창 안의 "다운로드 페이지 열기"로 Releases에서 직접 받아도 됩니다
+- **업데이트를 어디서 받나**: 새 버전 확인과 다운로드는 모두 이 프로젝트 자체 CDN(`dl.kcm-nixi.cn`,
+  Cloudflare R2)을 거치므로 **GitHub에 접속할 필요가 없습니다** —— 중국 본토 네트워크에서도 업데이트를
+  받을 수 있는 이유입니다. 이 주 경로를 쓸 수 없으면 자동으로 GitHub Releases로 넘어갑니다
+  (둘 다 안 될 때만 "확인 실패"가 표시됩니다)
 - 팝업이 없을 때 확인하고 싶다면 → "⚙ 설정 → 소프트웨어 업데이트 → 업데이트 확인"
 - 업데이트로 **설정과 API key가 사라지지 않습니다**. 업데이트 후 다음 실행 때 알려 드립니다
 
@@ -667,6 +677,7 @@ build_exe.bat                                              :: 빌드 + 이후 �
   구문 검사 → **정적 검사(ruff 의 `F,E9` 등급, 차단)** → 자격 증명 스캔 → 오프라인 테스트 전체 파일 단위 실행(덤으로 커버리지를 누적해 끝에 요약을 출력, 임계값 없음·차단 없음) → 이어서 별도의 **패키징 파이프라인** 검사(산출물 존재 및 20MB 이상)
 - **릴리스**(`.github/workflows/release.yml`, `v*` 태그 푸시로 시작):
   먼저 태그와 `vlt/__init__.py` 의 `__version__` 을 대조(불일치면 즉시 실패) → **exe 와 Linux AppImage** 패키징 →
+  **Cloudflare R2 에 덮어쓰기 공개**(`dl.kcm-nixi.cn`: 클라이언트가 "업데이트 확인 / 지금 업데이트"에 쓰는 주 경로. 업로드 후 공개 도메인으로 두 산출물을 통째로 다시 받아 바이트 단위로 대조하며, 불일치면 전체를 실패로 처리하고 Release 를 만들지 않습니다) →
   **exe**, **`VRChatLiveTranslate-x86_64.AppImage`**, `SHA256SUMS.txt` 세 가지를 첨부한 Release 생성(체크섬은 GitHub가 첨부 파일 옆에 `sha256:…` 로 표시합니다. 이 파일은 **v0.2.0 이하 클라이언트**를 위한 과도기 조치로, 이 클라이언트들은 이 첨부만 인식하므로 없으면 조용히 업데이트를 찾지 못합니다)
 - **받은 파일을 직접 검증하고 싶다면**: `scripts/verify_release.py` 가 Release 산출물을 받아 대조합니다
   (SHA256, `--self-test` 실제 실행, 버전 줄, 신규 기능 문자열을 바이트코드에서 검색, 아이콘 픽셀 비교):

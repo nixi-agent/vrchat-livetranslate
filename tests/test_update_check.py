@@ -492,7 +492,7 @@ def test_download_fallback_and_guards() -> None:
         assert op.calls == [uc.RELEASES_LATEST_API], f"紧急开关没跳过主源：{op.calls}"
         assert f"{uc.ENV_UPDATE_SOURCE}=github" in buf.getvalue(), "紧急开关没留痕"
 
-        # ⑧ 摘要不符 ≠ 网络失败 → **不换源重试**（评审二审 §3：换源修不好完整性问题，只会再拖一遍）
+        # ⑧ 摘要不符 ≠ 网络失败 → **本次不自动换源**（评审二审 §3：换源救不了「源头对象就是错的」）
         mismatch = uc.parse_manifest(manifest_payload("9.9.9", sha="f" * 64).decode(), EXE_NAME)
         tampered = b"tampered-" * 1000
         uc._opener = FakeOpener([FakeResp(tampered, url=mismatch.asset_url)])
@@ -502,6 +502,7 @@ def test_download_fallback_and_guards() -> None:
             tried.append(1)
             raise AssertionError("摘要不符还去换源重试了")
 
+        uc._MISMATCH_SEEN.discard("9.9.9")          # 让这条用例从干净状态开始
         buf = io.StringIO()
         try:
             with redirect_stdout(buf):
@@ -510,10 +511,31 @@ def test_download_fallback_and_guards() -> None:
         except uc.ChecksumMismatch as e:
             assert type(e) is uc.ChecksumMismatch, "摘要不符应当抛 ChecksumMismatch（子类）"
         assert not tried, "摘要不符触发了备用源重试"
-        assert "摘要不符：不换源重试" in buf.getvalue(), f"没说明为什么不重试：{buf.getvalue()!r}"
+        assert "摘要不符：本次不自动换源" in buf.getvalue(), f"没说明为什么不重试：{buf.getvalue()!r}"
         assert not (tmp / (EXE_NAME + uc.NEW_SUFFIX)).exists(), "摘要不符的残留没清"
 
-        # ⑨ 备用源也失败（大陆常见的 403 限流）→ 两因都留痕 + 异常链指向主因（评审二审 §1）
+        # ⑨ 用户再点一次「重试」→ **直接走备用源**（评审三审 R3：给这类失败留一条用户可达的出口）
+        alt_bytes = b"fallback-after-mismatch-" * 100
+        alt_sha = hashlib.sha256(alt_bytes).hexdigest()
+        gh_url = f"{DL_BASE}/v9.9.9/{EXE_NAME}"
+        op = FakeOpener([
+            FakeResp(payload("v9.9.9", digest="sha256:" + alt_sha)),   # ① github_fallback 查 API
+            FakeResp(alt_bytes, url=gh_url),                            # ② GitHub 附件
+        ])
+        uc._opener = op
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            out = uc.download_and_verify(mismatch, tmp, fallback=lambda: uc.github_fallback(mismatch))
+        assert op.calls == [uc.RELEASES_LATEST_API, gh_url], \
+            f"重试时又去下了主源（应当直接换源）：{op.calls}"
+        assert out.read_bytes() == alt_bytes, "换源后落的不是备用源那份字节"
+        assert "上一次是摘要不符 → 这次直接走备用源" in buf.getvalue(), \
+            f"这次重试没留痕：{buf.getvalue()!r}"
+        out.unlink()
+        (tmp / uc.PENDING_JSON).unlink(missing_ok=True)
+        uc._MISMATCH_SEEN.clear()
+
+        # ⑩ 备用源也失败（大陆常见的 403 限流）→ 两因都留痕 + 异常链指向主因（评审二审 §1）
         prim2 = uc.parse_manifest(manifest_payload("9.9.9").decode(), EXE_NAME)
         uc._opener = FakeOpener([URLError("主源连不上：connection reset")])
         buf = io.StringIO()
@@ -530,9 +552,44 @@ def test_download_fallback_and_guards() -> None:
             assert isinstance(e.__cause__, uc.UpdateCheckError), \
                 f"没有把主因串进异常链（__cause__={e.__cause__!r}）"
             assert "connection reset" in str(e.__cause__), f"链上的主因不对：{e.__cause__}"
-        print("  下载回落 / 收窄异常 / release_url / 端口 / 紧急开关 / 摘要不重试 / 两因留痕 OK")
+        assert "9.9.9" not in uc._MISMATCH_SEEN, "网络类失败不该记进「摘要不符」名单"
+
+        # ⑪ 非 Exception 的 BaseException（如 asyncio.CancelledError）**不该**被当成网络失败去兜底
+        #    （评审三审 R1：`except BaseException` 会把这类信号误判成下载失败，白跑一次 37MB）
+        class _NotAnException(BaseException):
+            pass
+
+        called2: list[int] = []
+
+        def boom_alt() -> uc.ReleaseInfo:
+            called2.append(1)
+            raise AssertionError("非 Exception 的 BaseException 触发了备用源")
+
+        class _WeirdResp:
+            url = mismatch_prim_url = cf_url
+            headers: dict = {}
+
+            def read(self, n: int = -1) -> bytes:
+                raise _NotAnException()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        uc._MISMATCH_SEEN.clear()
+        uc._opener = MapOpener({cf_url: _WeirdResp()})
+        try:
+            uc.download_and_verify(prim, tmp, fallback=boom_alt)
+            raise AssertionError("BaseException 被吞了")
+        except _NotAnException:
+            pass
+        assert not called2, "非 Exception 的 BaseException 不该触发备用源重试"
+        print("  下载回落 / 收窄异常 / release_url / 端口 / 紧急开关 / 摘要不重试 / 重试换源 / 两因留痕 / BaseException 不兜底 OK")
     finally:
         uc._opener = old
+        uc._MISMATCH_SEEN.clear()       # 模块级状态：别泄给后面的用例
 
 
 # ---------------------------------------------------------------- Task 3：忽略列表读写

@@ -258,10 +258,12 @@ else:
         skipped.append(f"公开域上的 {SUMS_ASSET_NAME} 取不到：校验值清单这一次没被复核")
     else:
         for _name in (EXE_ASSET_NAME, APPIMAGE_ASSET_NAME):
-            _want_sha = str((_r2_assets.get(_name) or {}).get("sha256") or "").lower()
+            _ent = _r2_assets.get(_name)
+            # 只读 dict（同一轮循环前面已经对非 dict 条目报过红了，这里别崩得难看）
+            _want_sha = str(_ent.get("sha256") or "").lower() if isinstance(_ent, dict) else ""
             check(f"{SUMS_ASSET_NAME} 里有 {_name} 一行且与清单一致",
                   _sums.get(_name) == _want_sha,
-                  f"文件里 {(_sums.get(_name) or '缺这一行')[:12]}… / 清单 {_want_sha[:12]}…")
+                  f"文件里 {(_sums.get(_name) or '缺这一行')[:12]}… / 清单 {_want_sha[:12] or '清单里没有可用的值'}…")
 
 # 真跑一次自检
 print("  跑 --self-test（可能要十几秒）…")

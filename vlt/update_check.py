@@ -567,6 +567,13 @@ def github_fallback(info: ReleaseInfo, timeout: float = DEFAULT_TIMEOUT_S) -> Re
     return alt
 
 
+#: 出现过「摘要不符」的版本号（进程内记着）。用途只有一个（评审三审 R3）：给这类失败留一条
+#: **用户可达**的出口 —— 第一次摘要不符**不**自动换源（换源救不了「源头对象就是错的」），
+#: 但用户在同一版本上再点一次「重试」时就**直接走备用源**（能救「中间缓存/传输把它改坏了」）。
+#: 不做持久化：重启程序后这个版本会重新走主源一次，那本来就是合理的默认。
+_MISMATCH_SEEN: set[str] = set()
+
+
 def _is_download_cancel(exc: BaseException) -> bool:
     """是不是「用户取消了下载」——`vlt/ui_text.py::_DownloadCancelled` 由 GUI 的 progress 回调抛出。
 
@@ -619,7 +626,7 @@ def download_and_verify(info: ReleaseInfo, dest_dir: Path,
         try:
             expected = _expected_sha256(src, timeout)
             actual = _stream_to_file(src.asset_url, dest, timeout, progress)
-        except BaseException as exc:  # noqa: BLE001 — 任何失败（含取消）都要清理残留 + 留痕
+        except BaseException as exc:  # noqa: BLE001 — 任何失败（含 Ctrl+C / 取消）都要清残留 + 留痕
             dest.unlink(missing_ok=True)
             if _is_download_cancel(exc):
                 # 取消不是失败，别和网络错误混在一行（评审二审 §4：日志里要能一眼分清）
@@ -641,19 +648,31 @@ def download_and_verify(info: ReleaseInfo, dest_dir: Path,
                   flush=True)
         return dest
 
+    # 走备用源之前先把「这次是从主源起步的」这件事定下来：上一次同一版本是摘要不符时
+    # （用户又点了一次重试），直接跳过主源走备用源 —— 见 `_MISMATCH_SEEN` 的说明。
+    _from_fallback = fallback is not None and info.version in _MISMATCH_SEEN
+    primary: BaseException | None = None
+    if _from_fallback:
+        print(f"[update] ⚠️ v{info.version} 上一次是摘要不符 → 这次直接走备用源（用户重试）",
+              flush=True)
     try:
-        return _once(info)
-    except BaseException as exc:
-        # BaseException：用户取消不是 Exception 的子类（见 _is_download_cancel 的契约）。
-        # 解释器自己的退出信号（Ctrl+C / SystemExit / 生成器关闭）不归这条链管，直接放行。
-        if isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)) or fallback is None:
-            raise
-        if _is_download_cancel(exc):
+        if not _from_fallback:
+            return _once(info)
+    except Exception as exc:
+        # 只接 Exception：取消（`ui_text._DownloadCancelled`）**是** Exception 的子类，靠
+        # `_is_download_cancel` 认它；而 KeyboardInterrupt / SystemExit / asyncio.CancelledError
+        # 这类非 Exception 的 BaseException 不该被当成「网络失败」去白跑一次 37MB 兜底
+        # （评审三审 R1：原先写 `except BaseException` + 手动排除三个，行为等价但理由写反了）。
+        if fallback is None or _is_download_cancel(exc):
             raise
         if isinstance(exc, ChecksumMismatch):
-            # 摘要不符是完整性问题：换个源再下一遍修不好它，只会让用户多等一次（评审二审 §3）
-            print("[update] ⚠️ 摘要不符：不换源重试（换源修不好完整性问题，只会再拖一遍时间）",
-                  flush=True)
+            # 摘要不符**本次不自动换源**（评审二审 §3，理由见 ChecksumMismatch docstring），
+            # 但要留一条**用户可达**的出口（评审三审 R3）：记下这个版本，用户再点一次「重试」
+            # 就直接走备用源 —— 换源确实救不了「源头对象就是错的」，但**能救**「中间缓存/传输
+            # 把它改坏了」，而后者是更常见的形态；每次点重试都白下一遍 37MB 才是要避免的。
+            _MISMATCH_SEEN.add(info.version)
+            print("[update] ⚠️ 摘要不符：本次不自动换源；再点一次「重试」会直接走备用源"
+                  "（换源救不了源头就错的对象，但能救中间缓存/传输改坏的）", flush=True)
             raise
         primary = exc
         print(f"[update] ⚠️ 主源下载失败（{exc}）→ 换备用源重试一次", flush=True)
@@ -662,6 +681,8 @@ def download_and_verify(info: ReleaseInfo, dest_dir: Path,
     except Exception as exc:  # noqa: BLE001 — 备用源也失败：把两因都留下，再原样上抛
         if not isinstance(exc, UpdateCheckError):
             raise
+        if primary is None:
+            raise                       # 这一轮是从备用源起步的（用户重试那个分支），没有主因可串
         # 只报备用源那个错会把真正的原因埋掉（大陆场景下备用源经常正是那个 403 限流），
         # 所以：日志里先主因后备用源，异常链 `from primary` 也串上（评审二审 §1）。
         print(f"[update] ⚠️ 备用源也失败：{exc}（主因仍是主源那次：{primary}）", flush=True)

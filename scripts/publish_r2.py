@@ -151,7 +151,15 @@ def _check_sums_file(dist: Path, assets: dict[str, dict]) -> None:
     for line in raw.splitlines():
         parts = line.split()
         if len(parts) >= 2:
-            seen[parts[1].lstrip("*")] = parts[0].lower()
+            name = parts[1].lstrip("*")
+            if name in seen:
+                # 同名重复的取舍在两处会**相反**（客户端命中即取第一条，这里若取最后一条），
+                # 评审三审 R4 点出的口径不一致。生成侧不会产生重复行，那就直接判错，
+                # 别留一个「两边读法不同」的隐患。
+                raise PublishError(f"{SUMS_NAME} 里 {name} 出现了不止一行："
+                                   f"同名重复时客户端取第一条、这里若取最后一条就会对不上，"
+                                   f"请让每个附件只占一行")
+            seen[name] = parts[0].lower()
     for name in REQUIRED_ASSETS:
         got, want = seen.get(name), str(assets.get(name, {}).get("sha256") or "")
         if got != want:

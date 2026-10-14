@@ -253,12 +253,23 @@ def test_sums_file_gate() -> None:
     except pr.PublishError as e:
         assert "CRLF" in str(e), f"提示没说清是行尾问题：{e}"
 
+    # 同名重复一行 → 判红：客户端命中即取**第一条**，门禁若取最后一条就会「两边读法不同」
+    # （评审三审 R4）。生成侧不会产生重复行，所以直接判错，不留隐患。
+    dist = make_dist(tmp, sums_mode="both")
+    with (dist / pr.SUMS_NAME).open("ab") as f:
+        f.write(f"{'f' * 64}  {pr.EXE_NAME}\n".encode())
+    try:
+        pr.build_manifest(dist, "v9.9.9")
+        raise AssertionError("同名重复行的 sums 居然通过了")
+    except pr.PublishError as e:
+        assert "不止一行" in str(e), f"提示没说清是重复行：{e}"
+
     # 多余的行（如将来加第三个产物）→ 忽略，不影响判据（与老客户端的解析口径一致）
     dist = make_dist(tmp, sums_mode="both")
     with (dist / pr.SUMS_NAME).open("ab") as f:
         f.write(b"deadbeef  something-else.bin\n")
     pr.build_manifest(dist, "v9.9.9")
-    print("  SHA256SUMS.txt 门禁 OK（两行齐全 / 缺行 / 值错 / 缺失 / CRLF / 多余行）")
+    print("  SHA256SUMS.txt 门禁 OK（两行齐全 / 缺行 / 值错 / 缺失 / CRLF / 同名重复 / 多余行）")
 
 
 def test_published_manifest_parses_by_client() -> None:

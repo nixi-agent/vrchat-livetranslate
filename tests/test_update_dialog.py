@@ -351,7 +351,7 @@ def test_download_window_progress_and_done() -> None:
         gate = threading.Event()
         seen: list[tuple] = []
 
-        def fake_dl(info, dest_dir, timeout=None, progress=None):  # noqa: ANN001, ANN201
+        def fake_dl(info, dest_dir, timeout=None, progress=None, fallback=None):  # noqa: ANN001, ANN201
             progress(2 * MB, 10 * MB)
             seen.append(("progress", 2 * MB, 10 * MB, threading.get_ident()))
             assert gate.wait(5), "测试门闩超时"
@@ -432,7 +432,7 @@ def test_download_error_then_retry_and_skip() -> None:
         residue = fake_dir / EXE_NEW
         state = {"fail": True}
 
-        def fake_dl(info, dest_dir, timeout=None, progress=None):  # noqa: ANN001, ANN201
+        def fake_dl(info, dest_dir, timeout=None, progress=None, fallback=None):  # noqa: ANN001, ANN201
             if state["fail"]:
                 state["fail"] = False
                 Path(dest_dir, EXE_NEW).write_bytes(b"partial")     # 模拟半截残留
@@ -646,7 +646,7 @@ def _quick_done_gui(name: str, info=INFO):
     fake_dir = fake_dir_cm.__enter__()
     gui = _make_gui()
     try:
-        gui._update_downloader = lambda i, dest_dir, timeout=None, progress=None: (
+        gui._update_downloader = lambda i, dest_dir, timeout=None, progress=None, fallback=None: (
             Path(dest_dir) / EXE_NEW)
         gui._on_update_now(info)
         assert _pump_until(gui, lambda: gui._dl_new_exe is not None), "没进到完成态"
@@ -719,7 +719,7 @@ def test_postpone_then_exit_replaces_without_relaunch() -> None:
     bat（relaunch=False，不含拉起行）→ 分离启动 → 退出。这条路径绝不自动拉起新版。"""
     body = b"new-exe-" * 500
 
-    def fake_dl(info, dest_dir, timeout=None, progress=None):  # noqa: ANN001, ANN201
+    def fake_dl(info, dest_dir, timeout=None, progress=None, fallback=None):  # noqa: ANN001, ANN201
         # 模拟 download_and_verify 的真实落盘：写 .new + update_pending.json
         p = Path(dest_dir) / EXE_NEW
         p.write_bytes(body)
@@ -843,7 +843,7 @@ def test_appimage_reload_replaces_and_relaunches() -> None:
     """
     body = b"new-appimage-" * 500
 
-    def fake_dl(info, dest_dir, timeout=None, progress=None):  # noqa: ANN001, ANN201
+    def fake_dl(info, dest_dir, timeout=None, progress=None, fallback=None):  # noqa: ANN001, ANN201
         p = Path(dest_dir) / IMG_NEW
         p.write_bytes(body)
         uc.write_pending(Path(dest_dir), info.version, uc.file_sha256(p))
@@ -887,7 +887,7 @@ def test_appimage_postpone_then_exit_replaces() -> None:
     """AppImage：【稍后更新】→ 退出时直接把文件换好（不拉起、也不要外部脚本兜着）。"""
     body = b"new-appimage-" * 500
 
-    def fake_dl(info, dest_dir, timeout=None, progress=None):  # noqa: ANN001, ANN201
+    def fake_dl(info, dest_dir, timeout=None, progress=None, fallback=None):  # noqa: ANN001, ANN201
         p = Path(dest_dir) / IMG_NEW
         p.write_bytes(body)
         uc.write_pending(Path(dest_dir), info.version, uc.file_sha256(p))

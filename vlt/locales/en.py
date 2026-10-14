@@ -403,6 +403,8 @@ STRINGS: dict[str, str] = {
     "下载的文件与发布页的摘要对不上，已删除（请重试）":
         "The downloaded file doesn't match the checksum on the release page; "
         "it has been deleted (please retry)",
+    "备用源上的版本是 v{got}，与要装的 v{want} 不同：已放弃回退":
+        "The fallback source has v{got} while v{want} is needed — not falling back",
     "手腕屏已开启（位置 / 字号等见「设置 → 手腕屏」）":
         "Wrist overlay is on — position, font size and more are under "
         "\"Settings → Wrist Overlay\"",

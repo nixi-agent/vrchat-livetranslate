@@ -173,6 +173,18 @@ def test_build_manifest() -> None:
         except pr.PublishError:
             pass
 
+    # 大小写前缀都认，且**只规范化一次**：`V9.9.9` 不能生成 `tag: "vV9.9.9"`（评审 §三）
+    up = pr.build_manifest(dist, "V9.9.9")
+    assert up["tag"] == "v9.9.9" and up["version"] == "9.9.9", up
+    assert up["release_url"].endswith("/tag/v9.9.9"), up["release_url"]
+    assert pr.build_manifest(dist, "9.9.9")["tag"] == "v9.9.9"
+
+    # 域名/端口口径（评审 §三）：`same_host` 比的是完整 origin，不是前缀、也不放过非默认端口
+    assert pr.same_host(f"{pr.BASE_URL}/{pr.EXE_NAME}", pr.BASE_URL)
+    assert not pr.same_host("https://dl.kcm-nixi.cn.evil.com/x", pr.BASE_URL)
+    assert not pr.same_host("https://dl.kcm-nixi.cn:8443/x", pr.BASE_URL)
+    assert not pr.same_host("http://dl.kcm-nixi.cn/x", pr.BASE_URL)
+
     # SHA256SUMS.txt 是可选的：Release 里没带它也不该拦住发布
     (dist / pr.SUMS_NAME).unlink()
     assert set(pr.build_manifest(dist, "v9.9.9")["assets"]) == {pr.EXE_NAME, pr.APPIMAGE_NAME}

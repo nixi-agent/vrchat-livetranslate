@@ -359,6 +359,143 @@ def test_manifest_source() -> None:
         uc._opener = old
 
 
+# ---------------------------------------------------------------- Task 2c：下载回落与各处守卫（评审 §3~§5）
+
+
+def test_download_fallback_and_guards() -> None:
+    """评审 §3（下载阶段回落）/§4（只回落主源、不吞自己的 bug）/§5（release_url 白名单）
+    以及端口口径与紧急开关。全部离线（假 opener 按顺序回应）。"""
+    old = uc._opener
+    tmp = OUT / "dl_fallback"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        # ① 主源产物下不动 → 用**同一版本**的 GitHub 附件重试一次
+        alt_bytes = b"fallback-" * 100
+        alt_sha = hashlib.sha256(alt_bytes).hexdigest()
+        prim = uc.parse_manifest(manifest_payload("9.9.9").decode(), EXE_NAME)
+        cf_url = prim.asset_url
+        gh_url = f"{DL_BASE}/v9.9.9/{EXE_NAME}"
+        op = FakeOpener([
+            URLError("主源下到一半断了"),          # ① 主源产物
+            # ② github_fallback 查 API：校验值就是备用源那份（同一版本的两个落点，字节一致）
+            FakeResp(payload("v9.9.9", digest="sha256:" + alt_sha)),
+            FakeResp(alt_bytes, url=gh_url),       # ③ GitHub 附件
+        ])
+        uc._opener = op
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            out = uc.download_and_verify(prim, tmp, fallback=lambda: uc.github_fallback(prim))
+        assert op.calls == [cf_url, uc.RELEASES_LATEST_API, gh_url], f"请求序列不对：{op.calls}"
+        assert out.read_bytes() == alt_bytes, "换源之后落盘的不是备用源那份字节"
+        meta = json.loads((tmp / uc.PENDING_JSON).read_text(encoding="utf-8"))
+        assert meta == {"version": "9.9.9", "sha256": alt_sha}, meta
+        logs = buf.getvalue()
+        for needle in ("主源下载失败", "换备用源重试", "备用源（GitHub）"):
+            assert needle in logs, f"回落没留痕（缺 {needle}）：{logs!r}"
+        out.unlink()
+        (tmp / uc.PENDING_JSON).unlink(missing_ok=True)
+
+        # ② 备用源版本对不上 → 宁可失败，绝不跨版本装
+        uc._opener = FakeOpener([FakeResp(payload("v8.8.8"))])
+        try:
+            uc.github_fallback(prim)
+            raise AssertionError("版本不一致居然放行")
+        except uc.UpdateCheckError as e:
+            assert "v8.8.8" in str(e) and "9.9.9" in str(e), f"提示没点名两个版本：{e}"
+
+        # ③ 用户取消 ≠ 失败：不许再发起第二次传输（否则点了关闭还去下一遍 37MB）
+        class _DownloadCancelled(Exception):
+            pass
+
+        assert uc._is_download_cancel(_DownloadCancelled()), "取消异常的类名契约变了"
+        from vlt.ui_text import _DownloadCancelled as RealCancel
+        assert uc._is_download_cancel(RealCancel()), \
+            "ui_text 里的 _DownloadCancelled 改名/改结构了：取消会被当成失败去重试"
+
+        called: list[int] = []
+
+        def boom_fallback():
+            called.append(1)
+            raise AssertionError("用户取消了还去回退")
+
+        class _CancelResp:
+            url = cf_url
+            headers: dict = {}
+
+            def read(self, n: int = -1) -> bytes:
+                raise _DownloadCancelled()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        uc._opener = MapOpener({cf_url: _CancelResp()})
+        try:
+            uc.download_and_verify(prim, tmp, fallback=boom_fallback)
+            raise AssertionError("取消居然没抛出去")
+        except _DownloadCancelled:
+            pass
+        assert not called, "用户取消后仍然发起了第二次传输"
+        assert not (tmp / (EXE_NAME + uc.NEW_SUFFIX)).exists(), "取消后残留没清"
+
+        # ④ 我们**自己的代码**坏了（TypeError）→ 必须原样冒出来 + 不许去向 GitHub 回落
+        real_parse = uc.parse_manifest
+
+        def boom(text, asset_name=EXE_NAME):  # noqa: ANN001, ANN202
+            raise TypeError("注入的代码 bug")
+
+        try:
+            uc.parse_manifest = boom
+            op = FakeOpener([FakeResp(manifest_payload("9.9.9"), url=uc.MANIFEST_URL)])
+            uc._opener = op
+            try:
+                uc.fetch_latest_release()
+                raise AssertionError("解析里的 TypeError 被吞成「回落 GitHub」了")
+            except TypeError:
+                pass
+            assert op.calls == [uc.MANIFEST_URL], f"代码 bug 不该触发回落：{op.calls}"
+        finally:
+            uc.parse_manifest = real_parse
+
+        # ⑤ release_url 会直接交给浏览器打开 → 与别的 URL 同口径（白名单外的换掉）
+        evil = json.loads(manifest_payload("9.9.9", release_url="https://evil.example.com/x"))
+        assert uc.parse_manifest(json.dumps(evil), EXE_NAME).html_url == \
+            f"{uc.RELEASES_HTML}/tag/v9.9.9"
+        good_url = f"{uc.RELEASES_HTML}/tag/v9.9.9"
+        keep = json.loads(manifest_payload("9.9.9", release_url=good_url))
+        assert uc.parse_manifest(json.dumps(keep), EXE_NAME).html_url == good_url
+
+        # ⑥ 端口/协议也算白名单口径（`host:8443` 不是我们发布东西的地方）
+        for bad in ("https://dl.kcm-nixi.cn:8443/x.exe", "http://dl.kcm-nixi.cn/x.exe"):
+            try:
+                uc.parse_manifest(manifest_payload("9.9.9", url=bad).decode(), EXE_NAME)
+                raise AssertionError(f"非默认端口 / 非 https 居然放行：{bad}")
+            except uc.UpdateCheckError:
+                pass
+        assert uc._is_allowed_url(uc.MANIFEST_URL)
+        assert not uc._is_allowed_url("https://dl.kcm-nixi.cn:8443/x")
+
+        # ⑦ 紧急开关：VLT_UPDATE_SOURCE=github → 直接跳过主源（评审要求「可吊销手段」）
+        buf = io.StringIO()
+        op = FakeOpener([FakeResp(payload("v9.9.9"))])
+        uc._opener = op
+        os.environ[uc.ENV_UPDATE_SOURCE] = "github"
+        try:
+            with redirect_stdout(buf):
+                forced = uc.fetch_latest_release()
+        finally:
+            os.environ.pop(uc.ENV_UPDATE_SOURCE, None)
+        assert forced.version == "9.9.9"
+        assert op.calls == [uc.RELEASES_LATEST_API], f"紧急开关没跳过主源：{op.calls}"
+        assert f"{uc.ENV_UPDATE_SOURCE}=github" in buf.getvalue(), "紧急开关没留痕"
+        print("  下载回落 / 收窄异常 / release_url / 端口 / 紧急开关 OK")
+    finally:
+        uc._opener = old
+
+
 # ---------------------------------------------------------------- Task 3：忽略列表读写
 
 
@@ -972,6 +1109,7 @@ def main() -> int:
         test_is_newer,
         test_fetch_latest_release_github,
         test_manifest_source,
+        test_download_fallback_and_guards,
         test_fmt_scalar,
         test_ignore_list_roundtrip,
         test_should_prompt_and_check,

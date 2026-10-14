@@ -30,6 +30,11 @@ R2 公共桶的对象默认 `Cache-Control: max-age=14400`，Cloudflare 会缓�
 带 `no-cache` 后实测每次 `REVALIDATED`、覆盖后立刻拿到新内容（`no-store` 亦可，走 `BYPASS`）。
 → 也就是说：**「替换式发布」必须配 `no-cache`**，这不是可选优化。
 
+⚠️ 代价（评审 §三 要求写明）：固定键 ⇒ 主源上**没有历史版本可回滚**，「退到上一版」只能去
+GitHub 的 tag 页拿附件（Release 里每一个版本都留着）。所以别把 R2 当归档，它只是**当前版**的分发点。
+⚠️ 另一个已知窗口：清单里的 `release_url`（GUI「看看这次更新了什么」跳的页）指向本次 tag 的
+GitHub Release 页，而 `publish-r2` 跑在 `release` 之前 —— 那几分钟里点它会看到 404，随后自愈。
+
 ## 客户端契约（`latest.json`）
 
 ```json
@@ -128,11 +133,14 @@ def build_manifest(dist: Path, tag: str, published_at: str | None = None,
 
     `tag` 必须是 `vX.Y.Z`（与 `release.yml` 的 tag / `__version__` 对账同口径）：清单里的
     `version` 会被客户端当版本号比较，形态不对 = 这一版永远收不到更新（或永远提示有更新）。
+    ⚠️ 前缀只在这里规范化一次（`v`/`V` 都认）—— 别在 `version` 与 `tag` 两处各判一次，
+    评审指出过 `V9.9.9` 会生成 `tag: "vV9.9.9"` 的旧写法。
     """
-    version = tag[1:] if tag.startswith(("v", "V")) else tag
+    version = tag[1:] if tag[:1] in ("v", "V") else tag
     parts = version.split(".")
     if len(parts) != 3 or not all(p.isdigit() and (p == "0" or not p.startswith("0")) for p in parts):
         raise PublishError(f"tag 不是严格 vX.Y.Z（客户端只认这个形态）：{tag!r}")
+    tag_field = f"v{version}"
     dist = Path(dist)
     assets: dict[str, dict] = {}
     for name in REQUIRED_ASSETS:
@@ -153,9 +161,9 @@ def build_manifest(dist: Path, tag: str, published_at: str | None = None,
     return {
         "schema": MANIFEST_SCHEMA,
         "version": version,
-        "tag": tag if tag.startswith("v") else f"v{tag}",
+        "tag": tag_field,
         "published_at": published_at,
-        "release_url": release_url(tag if tag.startswith("v") else f"v{tag}"),
+        "release_url": release_url(tag_field),
         "assets": assets,
     }
 
@@ -197,8 +205,12 @@ def make_uploader(endpoint: str = ENDPOINT, bucket: str = BUCKET):
                                         retries={"max_attempts": 5, "mode": "standard"}))
 
     def upload(local: Path, key: str, content_type: str) -> None:
-        client.upload_file(str(local), bucket, key,
-                           ExtraArgs={"ContentType": content_type, "CacheControl": CACHE_CONTROL})
+        try:
+            client.upload_file(str(local), bucket, key,
+                               ExtraArgs={"ContentType": content_type, "CacheControl": CACHE_CONTROL})
+        except Exception as exc:  # noqa: BLE001 — 凭据/桶名/网络错都要变成一句 [r2] ❌，
+            # 而不是让 boto3 的 ClientError 抛一屏栈（评审 §三）
+            raise PublishError(f"上传 {key} 失败：{type(exc).__name__}: {exc}") from exc
 
     return upload
 
@@ -234,10 +246,26 @@ def _http_stream_sha256(url: str, timeout: float = 300.0, opener=None) -> tuple[
 def same_host(url: str, base_url: str) -> bool:
     """清单里的产物地址是否落在公开域下。
 
-    ⚠️ 用**主机名逐字相等**而不是 `startswith`：`https://dl.kcm-nixi.cn.evil.com/x` 也能通过
-    startswith 那一关（前缀匹配的经典坑），而主机名相等没有这个缝。
+    ⚠️ 两处口径（评审 §三 提到第一处，本次一并收紧）：
+
+    * 用**主机名逐字相等**而不是 `startswith`：`https://dl.kcm-nixi.cn.evil.com/x` 也能通过
+      startswith 那一关（前缀匹配的经典坑），而主机名相等没有这个缝；
+    * 比的是**完整 origin**（scheme + host + 有效端口）：`https://dl.kcm-nixi.cn:8443/x` 与
+      `http://dl.kcm-nixi.cn/x` 都不该算「在公开域下」。
     """
-    return urlsplit(url).hostname == urlsplit(base_url).hostname
+    return _origin(url) == _origin(base_url)
+
+
+def _origin(url: str) -> tuple[str, str, int] | None:
+    """(scheme, hostname, 端口) —— 端口缺省按 scheme 补 80/443；畸形值统一给 None（判不相等）。"""
+    parts = urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is None:
+        port = 443 if parts.scheme == "https" else 80
+    return (parts.scheme, parts.hostname or "", port)
 
 
 def verify_public(tag: str, *, base_url: str = BASE_URL, with_assets: bool = True,
@@ -417,6 +445,10 @@ def main(argv: list[str] | None = None) -> int:
         return int(args.func(args))
     except PublishError as exc:
         print(f"[r2] ❌ {exc}", flush=True)
+        return 1
+    except OSError as exc:
+        # 网络/磁盘层的错（DNS、超时、写不进去）同样给一句人话，别抛栈
+        print(f"[r2] ❌ {type(exc).__name__}: {exc}", flush=True)
         return 1
 
 

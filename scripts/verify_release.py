@@ -92,8 +92,14 @@ def r2_manifest() -> dict | None:
         return None
 
 
-def r2_probe_size(url: str) -> int | None:
-    """Range 探针（1 字节）拿对象总字节数。
+def r2_probe_size(url: str) -> tuple[int | None, str]:
+    """Range 探针（1 字节）拿对象总字节数：返回 `(总长, 说明)`。
+
+    ⚠️ **别只认 `Content-Range`**（评审 §7）：这条域名下实测回的是 `206` + `Content-Range`，
+    但缓存层级策略一变就可能回 `200` 全量 —— 那时总长在 `Content-Length` 里（206 的
+    `Content-Length` 只有 1 字节，所以必须先看 `Content-Range`）。两条都读，
+    读不到就把原因交回去，让调用方能区分「拿不到」和「对不上」（否则日志只会印一个
+    `R2 None`，看着像文件有问题）。
 
     为什么不整份下回来对 sha：这两份加起来 75MB，本机（大陆直连）实测要十几分钟 ——
     而「逐字节一致」这一步由 scripts/publish_r2.py 在**发布时**（CI，出口在美国）做过并卡门禁；
@@ -103,17 +109,21 @@ def r2_probe_size(url: str) -> int | None:
         req = urllib.request.Request(url, headers={"Range": "bytes=0-0",
                                                    "User-Agent": "vlt-verify-release/1.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
+            status = getattr(resp, "status", None)
             content_range = resp.headers.get("Content-Range", "")
+            content_length = resp.headers.get("Content-Length", "")
             resp.read(16)
     except Exception as exc:  # noqa: BLE001
         print(f"  （R2 探针失败 {url}：{type(exc).__name__}: {exc}）")
-        return None
-    if "/" in content_range:                       # "bytes 0-0/37440285"
+        return None, f"探针失败 {type(exc).__name__}"
+    if "/" in content_range:                             # "bytes 0-0/37440285"
         try:
-            return int(content_range.rsplit("/", 1)[1])
+            return int(content_range.rsplit("/", 1)[1]), f"{status} Content-Range"
         except ValueError:
-            return None
-    return None
+            pass
+    if status == 200 and content_length.isdigit():       # 缓存层回了全量：总长就是 Content-Length
+        return int(content_length), "200 Content-Length"
+    return None, f"响应头里没有可用的总长（status={status} Content-Range={content_range!r}）"
 
 
 print(f"== 复核 {TAG} ==")
@@ -188,6 +198,10 @@ else:
     check("R2 清单里两个平台的产物都在",
           {EXE_ASSET_NAME, APPIMAGE_ASSET_NAME} <= set(_r2_assets), f"{sorted(_r2_assets)}")
     for _name, _entry in _r2_assets.items():
+        if not isinstance(_entry, dict):
+            # 清单被写坏时给「判红」而不是 AttributeError 崩掉（评审 §三）
+            check(f"{_name}：清单条目是个对象", False, f"拿到的是 {type(_entry).__name__}")
+            continue
         _want = _gh_assets.get(_name)
         if not _want:
             check(f"{_name}：GitHub Release 里有同名附件", False, "R2 清单里这个附件在 GitHub 上不存在")
@@ -195,9 +209,9 @@ else:
         _sha = str(_entry.get("sha256") or "").lower()
         check(f"{_name}：R2 清单 sha256 == GitHub digest", _sha == _want[1],
               f"R2 {_sha[:12]}… / GitHub {_want[1][:12]}…")
-        _total = r2_probe_size(str(_entry.get("url") or ""))
+        _total, _how = r2_probe_size(str(_entry.get("url") or ""))
         check(f"{_name}：公开域对象字节数 == GitHub 附件 size", _total == _want[0],
-              f"R2 {_total} / GitHub {_want[0]}")
+              f"R2 {_total}（{_how}）/ GitHub {_want[0]}")
 
 # 真跑一次自检
 print("  跑 --self-test（可能要十几秒）…")

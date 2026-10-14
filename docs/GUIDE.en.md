@@ -43,7 +43,8 @@ It **checks automatically**, but **never installs on its own** — whether and w
 - **Where updates come from**: both the version check and the download go through this project's own CDN
   (`dl.kcm-nixi.cn`, hosted on Cloudflare R2) — **no GitHub access needed**, which is why it keeps
   working on mainland-China networks. If that primary source is unavailable it falls back to
-  GitHub Releases automatically (you only see "check failed" when both are unreachable)
+  GitHub Releases automatically (you only see "check failed" when both are unreachable); and if a
+  download breaks off halfway it retries once from the fallback source
 - Want to check when there's no popup → "⚙ Settings → Software update → Check for updates"
 - Updating **never touches your config or API key**; after a successful update the next launch tells you so
 

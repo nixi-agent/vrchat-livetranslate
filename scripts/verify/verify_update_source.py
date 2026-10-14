@@ -15,10 +15,13 @@
 
 判据（缺一不可）：
 
-  1. 日志里出现 `[update] 更新源：Cloudflare`，即这次真的走主源、没有回落；
+  1. 日志里出现 `[update] 更新源：Cloudflare`，即这次真的走主源、没有回落
+     （评审 §6 之前这里只打印不断言，主源全挂而 GitHub 可用时脚本照样 exit 0 = 假绿）；
   2. 拿到的版本 == 公开域清单里的版本（给了 `--expect` 就对，不给只打印）；
   3. 真下载 + sha256 校验通过，并写出 `update_pending.json`（GUI「立即更新」走的就是这条路）；
   4. 本机形态要的是正确的附件（Windows → exe；Linux → AppImage）；`--all` 时两份都要过。
+
+判据 1 只有一种豁免：`--allow-fallback`（明确接受「主源这次不可用、护栏按预期回落了」）。
 
 另外会**报告**（不算失败）兜底源 GitHub 现在通不通 —— 大陆出口常被限流/墙，这条信息对
 「用户到底能不能收到更新」很关键。
@@ -28,10 +31,12 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import shutil
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]          # 不写死本机路径
@@ -48,6 +53,8 @@ def main() -> int:
                     help="假装自己正在跑这个版本（要低于线上版本才有「发现新版本」）")
     ap.add_argument("--expect", default="", help="期望的最新版本（给了就断言一致）")
     ap.add_argument("--all", action="store_true", help="两个平台的产物都下载校验")
+    ap.add_argument("--allow-fallback", action="store_true",
+                    help="主源本次不可用、护栏按预期回落时不算失败（判据 1 的唯一豁免）")
     ap.add_argument("--keep", action="store_true", help="保留下载物（默认复核完删掉，省磁盘）")
     args = ap.parse_args()
 
@@ -55,9 +62,22 @@ def main() -> int:
     print(f"[验收] 更新链路（客户端视角）  沙箱={sandbox}")
     print(f"[验收] 本机形态：{uc.update_mode()}；假装当前版本 v{args.local_version}")
 
-    # ① 真跑 GUI 用的那个入口（真网络：主源 → 必要时兜底）
-    status, info = uc.check_for_updates(args.local_version, sandbox / "config.yaml")
+    # ① 真跑 GUI 用的那个入口（真网络：主源 → 必要时兜底），并把判据 ① 落到实处：
+    #    「走的是不是主源」必须**断言**，不能只看打印 —— 否则主源全挂时脚本照样绿。
     ok = True
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        status, info = uc.check_for_updates(args.local_version, sandbox / "config.yaml")
+    log = buf.getvalue()
+    print(log, end="")                       # 日志照旧给用户看
+    if f"更新源：Cloudflare（{uc.MANIFEST_HOST}）" in log:
+        print(f"[验收] ✅ 判据 1：本次检查走的是主源（{uc.MANIFEST_HOST}）")
+    elif args.allow_fallback:
+        print("[验收] ⚠️ 判据 1 放宽（--allow-fallback）：本次没走主源/发生了回落")
+    else:
+        print(f"[验收] ❌ 判据 1：本次检查**没有走主源**（日志里没有「更新源：Cloudflare"
+              f"（{uc.MANIFEST_HOST}）」那一行）；确实主源不可用就加 --allow-fallback")
+        ok = False
     if info is None:
         print(f"[验收] ❌ 检查更新失败（status={status}）：连清单都拿不到，先看网络/域名")
         print(f"[验收]    主源地址：{uc.MANIFEST_URL}")

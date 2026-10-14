@@ -483,7 +483,12 @@ def start_download(gui, info) -> None:
 
     def _work() -> None:
         try:
-            new_exe = gui._update_downloader(info, dest_dir, progress=_progress)
+            # 第二次机会（评审 §3）：主源上 37 MB 产物下不动时，用**同一版本**的 GitHub 附件
+            # 再试一次 —— 大陆最常见的失败形态就是「清单拿得到、产物断在半路」。
+            # 决定「要不要回退」在这里传下去；版本一致性、留痕、残留清理都在 update_check 那边。
+            new_exe = gui._update_downloader(
+                info, dest_dir, progress=_progress,
+                fallback=lambda: update_check.github_fallback(info))
         except _DownloadCancelled:
             print("[update] 下载已取消（残留已清理）", flush=True)
             return

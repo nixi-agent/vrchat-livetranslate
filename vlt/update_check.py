@@ -86,6 +86,9 @@ STATE_JSON = "update_state.json"
 #: 用途只有一个：主源被判定不可信（域名/桶失守、清单异常）时，让人能立刻绕开它 ——
 #: 这是本次评审要求的「可吊销手段」。它不是日常开关（除了排障没人该设它），所以**不写进 config.yaml**
 #: （配置会随用户数据长期留着，而这是运维侧的临时决定）。
+#: ⚠️ 边界（评审二审 §6）：它只管**检查**这一步（拿版本/地址）。已经打开的更新窗口里那次下载
+#: 用的是当时取到的那份清单，**不受这个开关影响** —— 要彻底断掉主源，得在域名/DNS 侧动手
+#: （或让桶里那份清单失效），别指望一个环境变量包打天下。
 ENV_UPDATE_SOURCE = "VLT_UPDATE_SOURCE"
 
 # 只允许这几个 host：清单与产物（dl.kcm-nixi.cn）、查最新（api.github.com）、
@@ -98,6 +101,15 @@ _CHUNK = 256 * 1024
 
 class UpdateCheckError(RuntimeError):
     """检查/下载更新失败。消息直接给用户看，不带堆栈。"""
+
+
+class ChecksumMismatch(UpdateCheckError):
+    """下载下来的字节与清单/Release 声明的 sha256 不一致。
+
+    单独一类是为了**不触发备用源重试**（评审二审 §3）：摘要不符是完整性问题，
+    换个源再下一遍修不好它（同一个版本在两个源上本该是同一份字节），只会拖时间；
+    而网络类失败（超时 / 连接重置）换个源确实常常能好。
+    """
 
 
 # ---------------------------------------------------------------- 版本解析与比较
@@ -591,8 +603,14 @@ def download_and_verify(info: ReleaseInfo, dest_dir: Path,
 
     `fallback`：这个附件在**主源上下不动时的第二次机会**（GUI 传 `lambda: github_fallback(info)`）。
     只在「下载/校验」失败时用一次；**用户取消不算失败**（点了关闭就别再发起第二次传输）；
-    它自己抛的异常原样上抛。
+    **摘要不符也不算"网络失败"**（`ChecksumMismatch` → 不重试，见该类 docstring）；
+    它自己抛的异常原样上抛，但会把主源那次的原因串进异常链 + 日志（否则最后一行只剩备用源的错）。
     返回校验通过的文件路径（<dest_dir>/<asset_name>.new）。
+
+    ⚠️ 超时口径：这里的 `timeout` 是**每次 socket 操作的超时**，不是整条链的总时限 ——
+    一个「慢但在推进」的连接可以合法地跑很久（大陆到 CF 实测过 100~700 KB/s 的波动，
+    硬加总时限会把这种用户直接卡死在下不动）。真正的兜底是：一次失败后**只**重试一次，
+    且摘要不符不重试（那类问题换源修不好）。
     """
     dest = Path(dest_dir) / (info.asset_name + NEW_SUFFIX)
 
@@ -601,14 +619,18 @@ def download_and_verify(info: ReleaseInfo, dest_dir: Path,
         try:
             expected = _expected_sha256(src, timeout)
             actual = _stream_to_file(src.asset_url, dest, timeout, progress)
-        except Exception as exc:  # noqa: BLE001 — 任何失败都要清理残留 + 留痕，再原样上抛
+        except BaseException as exc:  # noqa: BLE001 — 任何失败（含取消）都要清理残留 + 留痕
             dest.unlink(missing_ok=True)
-            print(f"[update] 下载失败：{exc}（残留已清理）", flush=True)
+            if _is_download_cancel(exc):
+                # 取消不是失败，别和网络错误混在一行（评审二审 §4：日志里要能一眼分清）
+                print("[update] 下载已取消（残留已清理）", flush=True)
+            else:
+                print(f"[update] 下载失败：{exc}（残留已清理）", flush=True)
             raise
         if actual != expected:
             dest.unlink(missing_ok=True)
             print("[update] 校验失败已删除", flush=True)
-            raise UpdateCheckError(t("下载的文件与发布页的摘要对不上，已删除（请重试）"))
+            raise ChecksumMismatch(t("下载的文件与发布页的摘要对不上，已删除（请重试）"))
         print(f"[update] 下载完成 sha256 校验通过（v{src.version}）", flush=True)
         try:
             write_pending(Path(dest_dir), src.version, actual)
@@ -621,11 +643,29 @@ def download_and_verify(info: ReleaseInfo, dest_dir: Path,
 
     try:
         return _once(info)
-    except Exception as exc:  # noqa: BLE001 — 只在「有备用源且不是用户取消」时兜一层
-        if fallback is None or _is_download_cancel(exc):
+    except BaseException as exc:
+        # BaseException：用户取消不是 Exception 的子类（见 _is_download_cancel 的契约）。
+        # 解释器自己的退出信号（Ctrl+C / SystemExit / 生成器关闭）不归这条链管，直接放行。
+        if isinstance(exc, (KeyboardInterrupt, SystemExit, GeneratorExit)) or fallback is None:
             raise
+        if _is_download_cancel(exc):
+            raise
+        if isinstance(exc, ChecksumMismatch):
+            # 摘要不符是完整性问题：换个源再下一遍修不好它，只会让用户多等一次（评审二审 §3）
+            print("[update] ⚠️ 摘要不符：不换源重试（换源修不好完整性问题，只会再拖一遍时间）",
+                  flush=True)
+            raise
+        primary = exc
         print(f"[update] ⚠️ 主源下载失败（{exc}）→ 换备用源重试一次", flush=True)
-    return _once(fallback())          # 备用源自己失败 → 它的异常原样上抛
+    try:
+        return _once(fallback())
+    except Exception as exc:  # noqa: BLE001 — 备用源也失败：把两因都留下，再原样上抛
+        if not isinstance(exc, UpdateCheckError):
+            raise
+        # 只报备用源那个错会把真正的原因埋掉（大陆场景下备用源经常正是那个 403 限流），
+        # 所以：日志里先主因后备用源，异常链 `from primary` 也串上（评审二审 §1）。
+        print(f"[update] ⚠️ 备用源也失败：{exc}（主因仍是主源那次：{primary}）", flush=True)
+        raise type(exc)(str(exc)) from primary
 
 
 

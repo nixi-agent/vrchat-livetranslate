@@ -22,7 +22,7 @@ Grab **`VRChatLiveTranslate.exe`** from
 > served from this project's own CDN and need no GitHub access:
 > - Windows: <https://dl.kcm-nixi.cn/VRChatLiveTranslate.exe>
 > - Linux: <https://dl.kcm-nixi.cn/VRChatLiveTranslate-x86_64.AppImage>
-> - Checksums: <https://dl.kcm-nixi.cn/SHA256SUMS.txt>
+> - Checksums: <https://dl.kcm-nixi.cn/SHA256SUMS.txt> (one line each for the exe and the AppImage)
 
 - You still need your own **Qwen Cloud API key**: paste and save it in "⚙ Settings"
 - Config and logs live in `%APPDATA%\vrchat-livetranslate` (works even if the exe sits in a read-only folder)
@@ -711,7 +711,7 @@ By default the build then really runs `exe --self-test` once; only finding `GUI_
 - **Release** (`.github/workflows/release.yml`, triggered by pushing a `v*` tag):
   first reconciles the tag against `__version__` in `vlt/__init__.py` (mismatch = hard fail) → packages the **exe and the Linux AppImage** →
   **publishes them to Cloudflare R2** (`dl.kcm-nixi.cn` — the primary source the client uses to check for and download updates; after the upload it re-downloads both artifacts through the public domain and verifies them byte-for-byte, and any mismatch fails the whole run instead of creating a Release) →
-  creates the Release with the **exe**, **`VRChatLiveTranslate-x86_64.AppImage`** and `SHA256SUMS.txt` attached (GitHub shows a `sha256:…` digest next to every asset; the checksum file is a transition aid for clients up to v0.2.0, which only look for it)
+  creates the Release with the **exe**, **`VRChatLiveTranslate-x86_64.AppImage`** and `SHA256SUMS.txt` attached (GitHub shows a `sha256:…` digest next to every asset; the checksum file is what the guides point users at to verify a download (one line per asset; the publish script refuses to release unless both lines match the artifacts))
 - **Want to verify a download yourself**: `scripts/verify_release.py` pulls the Release assets and reconciles them
   (SHA256, actually runs `--self-test`, version line, searches bytecode for new-feature strings, icon pixel comparison):
 

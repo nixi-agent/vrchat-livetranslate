@@ -63,6 +63,11 @@ CI 只跑 `tests/`（纯离线单元测试）与打包门禁；这里的手动�
 # 需要联网到主更新源（Cloudflare R2 公开域）——验收「客户端到底收不收得到更新」
 ./.venv/Scripts/python.exe scripts/verify/verify_update_source.py --local-version 0.11.1
 
+# 发布后复核（发布侧视角）：含对主源的清单/产物/校验值清单三路对账
+./.venv/Scripts/python.exe scripts/verify_release.py v0.11.2 "<本次改动独有的字符串>"
+#   其中 `SHA256SUMS.txt` 判据是语义比对（线上那份两个平台各一行且与清单一致），不与 GitHub
+#   附件比字节 —— R2 侧自 2026-10 起是两行，而已发布旧 Release 的附件仍是一行（旧附件不改）。
+
 # 需要虚拟声卡（VB-CABLE / VoiceMeeter）——不需要麦克风、不需要头显，麦克风那路被换成假源
 ./.venv/Scripts/python.exe scripts/verify/verify_proxy_loopback.py
 ./.venv/Scripts/python.exe scripts/verify/verify_proxy_app_start.py    # 这个还要真实桌面会话（要开窗）

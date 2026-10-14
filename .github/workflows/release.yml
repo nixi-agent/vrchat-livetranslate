@@ -95,13 +95,6 @@ jobs:
           Write-Host ("产物：{0}  {1:N1} MB" -f $f.Name, ($f.Length / 1MB))
           if ($f.Length -lt 20MB) { Write-Error "产物体积异常（<20MB），大概率没打全"; exit 1 }
           $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
-          # ⚠️ 过渡期必须继续产出 SHA256SUMS.txt：**≤ v0.2.0 的老客户端把「exe + SHA256SUMS.txt
-          #    两个附件」写死在更新检查里**，缺一个就静默地永远查不到新版本（v0.2.0 → v0.2.1 实测踩到）。
-          #    新客户端优先用 GitHub 的 asset digest，这个文件纯粹给老客户端兜底。
-          #    ★ 只写 exe 一行：老客户端是拿 exe 的名字去这个文件里找校验值的；往里塞 AppImage
-          #      没有好处还有风险。AppImage 的校验值看 GitHub 附件旁的 digest（点一下即可复制）。
-          "$hash  VRChatLiveTranslate.exe" | Out-File -Encoding ascii dist/SHA256SUMS.txt
-          Write-Host ("sha256：{0}" -f $hash)
 
           # Linux 附件必须**真的在这儿**：`needs: appimage` 只保证那个 job 成功，
           # 取回来这一步要是没落进 dist/，就得在这里炸掉，而不是发一个只有 exe 的 Release。
@@ -115,6 +108,20 @@ jobs:
           #    真正的完整性由 appimage job 的 scripts/verify_appimage.py（模块对账 +
           #    平台纯度 + 离线渲染）负责；这里只是一道「别把半截文件发出去」的体积哨兵。
           if ($i.Length -lt 30MB) { Write-Error "AppImage 体积异常（<30MB），大概率没打全"; exit 1 }
+          $img_hash = (Get-FileHash $img -Algorithm SHA256).Hash.ToLower()
+
+          # ⚠️ SHA256SUMS.txt 是**给用户看的校验值清单**：GUIDE 让用户拿它核下载物，
+          #    所以 **exe 与 AppImage 各一行**（2026-10 起；AppImage 的 sha256 以前只写在
+          #    latest.json 里 → Linux 用户照文档核不了）。发布侧 `publish_r2.py` 有门禁：
+          #    这个文件若在，两行必须与真实产物逐项一致且**不许有 CR**，否则不发版。
+          #    ★ 行尾必须是 LF：`Out-File` 在 Windows runner 上写 CRLF，Linux 侧
+          #      `sha256sum -c SHA256SUMS.txt` 会把 "\r" 当成文件名的一部分 → 全部“找不到文件”。
+          #      这份文件就是给 Linux 用户核对用的，所以走 WriteAllText 显式写 LF。
+          #    （格式：`<sha256>  <附件名>` 两列、空白分隔；客户端按附件名逐行找，多余行忽略。）
+          $sums = "$hash  VRChatLiveTranslate.exe`n$img_hash  VRChatLiveTranslate-x86_64.AppImage`n"
+          [System.IO.File]::WriteAllText((Join-Path $PWD "dist/SHA256SUMS.txt"), $sums,
+                                         [System.Text.Encoding]::ASCII)
+          Write-Host ("sha256：exe={0}  appimage={1}" -f $hash, $img_hash)
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v7

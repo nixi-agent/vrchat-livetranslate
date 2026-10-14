@@ -8,6 +8,12 @@
 [![Python](https://img.shields.io/badge/python-3.11-blue)](GUIDE.ja.md#1-前提条件)
 [![License](https://img.shields.io/badge/license-MIT-green)](../LICENSE)
 
+> 📥 **中国本土からの直リンク**（GitHub 不要。アプリ内の「更新を確認」も同じ配信元を使います）：
+> [Windows exe](https://dl.kcm-nixi.cn/VRChatLiveTranslate.exe) ·
+> [Linux AppImage](https://dl.kcm-nixi.cn/VRChatLiveTranslate-x86_64.AppImage) ·
+> [チェックサム](https://dl.kcm-nixi.cn/SHA256SUMS.txt) ·
+> [GitHub Releases](https://github.com/nixi-agent/vrchat-livetranslate/releases/latest)
+
 VRChat の中で**リアルタイム同時通訳**を行うツールです：マイク／ゲーム音声を取り込み →
 Qwen Cloud のリアルタイム通訳モデルへ送信 → 訳文を **chatbox の吹き出し**と
 **VR 手首オーバーレイ**に表示します。オプションで、翻訳音声を仮想サウンドカードに戻して

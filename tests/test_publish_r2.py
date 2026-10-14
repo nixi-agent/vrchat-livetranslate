@@ -81,13 +81,32 @@ class FakeNet:
 
 
 def make_dist(tmp: Path, *, exe: bytes = b"fake-exe-" * 100, img: bytes = b"fake-image-" * 100,
-              sums: bytes | None = b"deadbeef  x\n") -> Path:
-    """铺一个 dist/：两个必需产物 + 可选 SHA256SUMS.txt。"""
+              sums: bytes | None = None, sums_mode: str = "both") -> Path:
+    """铺一个 dist/：两个必需产物 + `SHA256SUMS.txt`。
+
+    `sums_mode` 决定那个文件长什么样（本仓库 2026-10 起的口径是**两个平台各一行**）：
+      * `both`（默认）：exe + AppImage 各一行，值都对；
+      * `exe-only`    ：老口径（只有 exe 一行）→ 现在的门禁应当判红；
+      * `wrong`       ：exe 那行的值写错 → 判红；
+      * `none`        ：不带这个文件（它是可选对象，不该拦住发布）。
+    """
     tmp.mkdir(parents=True, exist_ok=True)
     (tmp / pr.EXE_NAME).write_bytes(exe)
     (tmp / pr.APPIMAGE_NAME).write_bytes(img)
-    if sums is not None:
-        (tmp / pr.SUMS_NAME).write_bytes(sums)
+    if sums_mode == "none":
+        (tmp / pr.SUMS_NAME).unlink(missing_ok=True)
+        return tmp
+    if sums is None:
+        h_exe = hashlib.sha256(exe).hexdigest()
+        h_img = hashlib.sha256(img).hexdigest()
+        if sums_mode == "wrong":
+            h_exe = "0" * 64
+        lines = [f"{h_exe}  {pr.EXE_NAME}"]
+        if sums_mode in ("both", "crlf"):
+            lines.append(f"{h_img}  {pr.APPIMAGE_NAME}")
+        sep = "\r\n" if sums_mode == "crlf" else "\n"
+        sums = (sep.join(lines) + sep).encode()
+    (tmp / pr.SUMS_NAME).write_bytes(sums)
     return tmp
 
 
@@ -186,9 +205,60 @@ def test_build_manifest() -> None:
     assert not pr.same_host("http://dl.kcm-nixi.cn/x", pr.BASE_URL)
 
     # SHA256SUMS.txt 是可选的：Release 里没带它也不该拦住发布
-    (dist / pr.SUMS_NAME).unlink()
+    make_dist(dist, sums_mode="none")
     assert set(pr.build_manifest(dist, "v9.9.9")["assets"]) == {pr.EXE_NAME, pr.APPIMAGE_NAME}
     print("  build_manifest OK（含缺产物 / 空文件 / 坏 tag / 可选 sums）")
+
+
+def test_sums_file_gate() -> None:
+    """`SHA256SUMS.txt` 的门禁（评审二审 §2）：两个平台各一行、值必须与产物一致。
+
+    背景：GUIDE 让用户拿这个文件核校验值，而 AppImage 的 sha256 以前只在 `latest.json` 里 ——
+    Linux 用户照文档核不了。现在追加了这一行，于是**内容错了比没有更坏**，必须卡门禁。
+    """
+    tmp = OUT / "sums_gate"
+
+    # 两行都对 → 通过，且清单里也带上了这个可选对象
+    dist = make_dist(tmp, sums_mode="both")
+    m = pr.build_manifest(dist, "v9.9.9")
+    assert pr.SUMS_NAME in m["assets"], "两行齐全时这个文件仍应作为可选对象进清单"
+
+    # 只有 exe 一行（老口径）→ 判红，且点名缺的是哪一行
+    dist = make_dist(tmp, sums_mode="exe-only")
+    try:
+        pr.build_manifest(dist, "v9.9.9")
+        raise AssertionError("只有 exe 一行的 sums 居然通过了")
+    except pr.PublishError as e:
+        assert pr.APPIMAGE_NAME in str(e) and "缺这一行" in str(e), f"提示没点名缺哪行：{e}"
+
+    # 值写错 → 判红
+    dist = make_dist(tmp, sums_mode="wrong")
+    try:
+        pr.build_manifest(dist, "v9.9.9")
+        raise AssertionError("校验值写错的 sums 居然通过了")
+    except pr.PublishError as e:
+        assert "不一致" in str(e), f"提示没说清是对不上：{e}"
+
+    # 不带这个文件 → 不拦（可选对象）
+    dist = make_dist(tmp, sums_mode="none")
+    pr.build_manifest(dist, "v9.9.9")
+
+    # CRLF 行尾 → 判红：Linux 侧 `sha256sum -c` 会把 "\r" 当成文件名的一部分，整份核不过 ——
+    # 而这份文件的读者正是 Linux 用户（GUIDE 让他们拿它核 AppImage）。CI 里 `Out-File`
+    # 写的恰好就是 CRLF（实测踩到），所以生成侧改成显式写 LF，这里钉住不许退回去。
+    dist = make_dist(tmp, sums_mode="crlf")
+    try:
+        pr.build_manifest(dist, "v9.9.9")
+        raise AssertionError("CRLF 行尾的 sums 居然通过了")
+    except pr.PublishError as e:
+        assert "CRLF" in str(e), f"提示没说清是行尾问题：{e}"
+
+    # 多余的行（如将来加第三个产物）→ 忽略，不影响判据（与老客户端的解析口径一致）
+    dist = make_dist(tmp, sums_mode="both")
+    with (dist / pr.SUMS_NAME).open("ab") as f:
+        f.write(b"deadbeef  something-else.bin\n")
+    pr.build_manifest(dist, "v9.9.9")
+    print("  SHA256SUMS.txt 门禁 OK（两行齐全 / 缺行 / 值错 / 缺失 / CRLF / 多余行）")
 
 
 def test_published_manifest_parses_by_client() -> None:
@@ -319,6 +389,7 @@ def main() -> int:
         test_published_manifest_parses_by_client,
         test_verify_public_catches_bad_publishes,
         test_manifest_cli_writes_file,
+        test_sums_file_gate,
     ]
     bad = []
     for fn in tests:

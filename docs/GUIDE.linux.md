@@ -61,7 +61,7 @@ Linux 侧的实现依据（为什么这么做、哪些路试过不通）都在
 
 > 🌏 **GitHub 打不开时**（大陆网络常见）直接用本项目自己的 CDN：
 > <https://dl.kcm-nixi.cn/VRChatLiveTranslate-x86_64.AppImage>
-> （校验值 <https://dl.kcm-nixi.cn/SHA256SUMS.txt>；程序里的「检查更新 / 立即更新」也走这个源，
+> （校验值 <https://dl.kcm-nixi.cn/SHA256SUMS.txt>，**exe 与 AppImage 各一行**；程序里的「检查更新 / 立即更新」也走这个源，
 > 不依赖 GitHub）
 
 ```bash

@@ -491,7 +491,46 @@ def test_download_fallback_and_guards() -> None:
         assert forced.version == "9.9.9"
         assert op.calls == [uc.RELEASES_LATEST_API], f"紧急开关没跳过主源：{op.calls}"
         assert f"{uc.ENV_UPDATE_SOURCE}=github" in buf.getvalue(), "紧急开关没留痕"
-        print("  下载回落 / 收窄异常 / release_url / 端口 / 紧急开关 OK")
+
+        # ⑧ 摘要不符 ≠ 网络失败 → **不换源重试**（评审二审 §3：换源修不好完整性问题，只会再拖一遍）
+        mismatch = uc.parse_manifest(manifest_payload("9.9.9", sha="f" * 64).decode(), EXE_NAME)
+        tampered = b"tampered-" * 1000
+        uc._opener = FakeOpener([FakeResp(tampered, url=mismatch.asset_url)])
+        tried: list[int] = []
+
+        def must_not_run() -> uc.ReleaseInfo:
+            tried.append(1)
+            raise AssertionError("摘要不符还去换源重试了")
+
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                uc.download_and_verify(mismatch, tmp, fallback=must_not_run)
+            raise AssertionError("摘要不符居然装上了")
+        except uc.ChecksumMismatch as e:
+            assert type(e) is uc.ChecksumMismatch, "摘要不符应当抛 ChecksumMismatch（子类）"
+        assert not tried, "摘要不符触发了备用源重试"
+        assert "摘要不符：不换源重试" in buf.getvalue(), f"没说明为什么不重试：{buf.getvalue()!r}"
+        assert not (tmp / (EXE_NAME + uc.NEW_SUFFIX)).exists(), "摘要不符的残留没清"
+
+        # ⑨ 备用源也失败（大陆常见的 403 限流）→ 两因都留痕 + 异常链指向主因（评审二审 §1）
+        prim2 = uc.parse_manifest(manifest_payload("9.9.9").decode(), EXE_NAME)
+        uc._opener = FakeOpener([URLError("主源连不上：connection reset")])
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                uc.download_and_verify(prim2, tmp,
+                                       fallback=lambda: uc.github_fallback(prim2))  # API 被限流 → 抛
+            raise AssertionError("备用源也失败时居然返回了文件")
+        except uc.UpdateCheckError as e:
+            logs = buf.getvalue()
+            assert "主源下载失败（" in logs, f"主源那次没留痕：{logs!r}"
+            assert "备用源也失败" in logs, f"备用源那次没留痕：{logs!r}"
+            assert "connection reset" in logs, f"主因被埋掉了：{logs!r}"
+            assert isinstance(e.__cause__, uc.UpdateCheckError), \
+                f"没有把主因串进异常链（__cause__={e.__cause__!r}）"
+            assert "connection reset" in str(e.__cause__), f"链上的主因不对：{e.__cause__}"
+        print("  下载回落 / 收窄异常 / release_url / 端口 / 紧急开关 / 摘要不重试 / 两因留痕 OK")
     finally:
         uc._opener = old
 
@@ -633,6 +672,18 @@ def test_download_and_verify() -> None:
         meta = json.loads((tmp / uc.PENDING_JSON).read_text(encoding="utf-8"))
         assert meta == {"version": "9.9.9", "sha256": good}, f"pending json 不对：{meta}"
         out.unlink()
+
+        # sums 里多一行（AppImage；2026-10 起 `release.yml` 就是这么写的）→ 仍按附件名找到 exe 那行。
+        # 这条钉的是**解析口径**：客户端是按附件名逐行找的，多出来的行不该影响取值
+        # （维护者 2026-10 明确：< v0.2.0 的老客户端不在考虑范围内，这里只保自己这套口径不歪）
+        two_line = (f"{good}  {EXE_NAME}\n"
+                    f"{'0' * 64}  {APPIMAGE_NAME}\n").encode()
+        uc._opener = MapOpener({sums_url: FakeResp(two_line, url=sums_url),
+                                exe_url: FakeResp(exe_bytes, url=exe_url)})
+        out = uc.download_and_verify(info, tmp)
+        assert out.read_bytes() == exe_bytes, "两行 sums 里没取到 exe 的校验值"
+        out.unlink()
+        (tmp / uc.PENDING_JSON).unlink(missing_ok=True)
 
         # 没有 Content-Length → total=None（进度条降级显示，绝不除零）
         uc._opener = MapOpener({sums_url: FakeResp(sums, url=sums_url),

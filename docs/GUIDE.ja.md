@@ -21,7 +21,7 @@
 > 本プロジェクト自身の CDN が配信するので GitHub への接続は不要です：
 > - Windows：<https://dl.kcm-nixi.cn/VRChatLiveTranslate.exe>
 > - Linux：<https://dl.kcm-nixi.cn/VRChatLiveTranslate-x86_64.AppImage>
-> - チェックサム：<https://dl.kcm-nixi.cn/SHA256SUMS.txt>
+> - チェックサム：<https://dl.kcm-nixi.cn/SHA256SUMS.txt>（exe と AppImage の 2 行）
 
 - **Qwen Cloud の API key** はご自身で用意してください。「⚙ 設定」で貼り付けて保存します
 - 設定とログは `%APPDATA%\vrchat-livetranslate` に置かれます（読み取り専用フォルダに exe を置いても動作します）
@@ -685,7 +685,7 @@ build_exe.bat                                              :: ビルド + その
 - **リリース**（`.github/workflows/release.yml`、`v*` タグの push で起動）：
   まずタグと `vlt/__init__.py` の `__version__` を突き合わせ（不一致なら即失敗）→ **exe と Linux の AppImage** をパッケージ →
   **Cloudflare R2 へ上書き公開**（`dl.kcm-nixi.cn`：クライアントが「更新を確認／今すぐ更新」で使う主系統。公開後は公開ドメイン経由で両方の成果物を丸ごと取得して逐バイト突き合わせ、不一致なら全体を失敗として Release を作りません）→
-  **exe**、**`VRChatLiveTranslate-x86_64.AppImage`**、`SHA256SUMS.txt` を添付した Release を作成（チェックサムは GitHub が添付の横に `sha256:…` として表示します。このファイルは v0.2.0 以前のクライアント向けの移行措置です）
+  **exe**、**`VRChatLiveTranslate-x86_64.AppImage`**、`SHA256SUMS.txt` を添付した Release を作成（チェックサムは GitHub が添付の横に `sha256:…` として表示します。このファイルは**ユーザーがダウンロードを検証するため**のもので、exe と AppImage の 2 行を含みます（発行スクリプトが実物と突き合わせ、一致しなければリリースできません））
 - **ダウンロードしたものを自分で検証したい場合**：`scripts/verify_release.py` が Release の成果物を取得して突き合わせます
   （SHA256、`--self-test` の実実行、バージョン行、新機能の文字列をバイトコードから検索、アイコンのピクセル比較）：
 

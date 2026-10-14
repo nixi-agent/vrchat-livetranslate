@@ -19,7 +19,7 @@
 > 🌏 **大陆网络打不开 GitHub 时**，直接下这两个直链（本项目自己的 CDN，不用连 GitHub）：
 > - Windows：<https://dl.kcm-nixi.cn/VRChatLiveTranslate.exe>
 > - Linux：<https://dl.kcm-nixi.cn/VRChatLiveTranslate-x86_64.AppImage>
-> - 校验值：<https://dl.kcm-nixi.cn/SHA256SUMS.txt>（exe 的 SHA256；`certutil -hashfile <文件> SHA256` 可自查）
+> - 校验值：<https://dl.kcm-nixi.cn/SHA256SUMS.txt>（**exe 与 AppImage 各一行**；`certutil -hashfile <文件> SHA256` 可自查）
 
 - 仍然要自备一个**千问云 API key**：界面里的「⚙ 设置」粘贴保存
 - 配置与日志写在 `%APPDATA%\vrchat-livetranslate`（exe 放在只读目录也能跑）
@@ -789,7 +789,7 @@ build_exe.bat                                              :: 打包 + 打完自
   先对账 tag 与 `vlt/__init__.py` 的 `__version__`（不一致直接失败）→ 打包 **exe 与 Linux AppImage** →
   **覆盖式发布到 Cloudflare R2**（`dl.kcm-nixi.cn`：客户端「检查更新 / 立即更新」的主源；传完会走公开域名
   把两份产物整份下回来逐字节复核，复核不过就整体红、不建 Release）→
-  建 Release，附件是 **exe**、**`VRChatLiveTranslate-x86_64.AppImage`** 与 `SHA256SUMS.txt`：校验值 GitHub 会在附件旁直接显示 `sha256:…`，而那份摘要文件是过渡期给 **v0.2.0 及更早客户端**用的（它们只认这个附件，缺了会静默查不到更新）
+  建 Release，附件是 **exe**、**`VRChatLiveTranslate-x86_64.AppImage`** 与 `SHA256SUMS.txt`：校验值 GitHub 会在附件旁直接显示 `sha256:…`，而那份摘要文件是**给用户核校验值用的**（exe 与 AppImage 各一行；发布脚本会拿它跟真实产物逐个对账，对不上就不许发版）
 - **下载后想自己复核**：`scripts/verify_release.py` 会把 Release 附件拉下来对账
   （SHA256、真跑 `--self-test`、版本行、字节码里搜新功能字符串、图标像素比对）：
 

@@ -47,7 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # 产物名 = 客户端契约（vlt/update_check.py 里的同名常量，由 tests/test_update_check.py 对着
 # release.yml 钉住）。这里 import 而不是抄一份：抄一份就会在改名时静默过期。
-from vlt.update_check import APPIMAGE_ASSET_NAME, EXE_ASSET_NAME  # noqa: E402
+from vlt.update_check import APPIMAGE_ASSET_NAME, EXE_ASSET_NAME, SUMS_ASSET_NAME  # noqa: E402
 
 TAG = sys.argv[1] if len(sys.argv) > 1 else "v0.0.2"
 # 本版新功能里必定出现的字符串；**逗号可给多个**（每个都要命中才算过）
@@ -124,6 +124,32 @@ def r2_probe_size(url: str) -> tuple[int | None, str]:
     if status == 200 and content_length.isdigit():       # 缓存层回了全量：总长就是 Content-Length
         return int(content_length), "200 Content-Length"
     return None, f"响应头里没有可用的总长（status={status} Content-Range={content_range!r}）"
+
+
+def r2_sums_lines() -> dict[str, str] | None:
+    """取公开域上那份 `SHA256SUMS.txt`，按附件名切成 `{名字: sha256}`；取不到返回 None。
+
+    为什么值得单独对一次账：这份文件是 GUIDE 让**用户自己核校验值**用的，
+    AppImage 的 sha256 以前只存在于 `latest.json` 里（Linux 用户照文档核不了）——
+    所以「线上那份里两个平台各一行、且值与清单一致」值得在发布后复核一遍，
+    而不是只信发布时那一刻的本地文件（对象可能被换掉、CDN 可能回旧内容）。
+    它只有 200 字节上下，整份下回来比 exe 便宜得多。
+    """
+    url = f"{R2_BASE}/{SUMS_ASSET_NAME}"
+    try:
+        with urllib.request.urlopen(
+                urllib.request.Request(url, headers={"User-Agent": "vlt-verify-release/1.0"}),
+                timeout=30) as resp:
+            text = resp.read().decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001 — 探针失败只记一笔
+        print(f"  （R2 上的 {SUMS_ASSET_NAME} 取不到：{type(exc).__name__}: {exc}）")
+        return None
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            out[parts[1].lstrip("*")] = parts[0].lower()
+    return out
 
 
 print(f"== 复核 {TAG} ==")
@@ -207,11 +233,35 @@ else:
             check(f"{_name}：GitHub Release 里有同名附件", False, "R2 清单里这个附件在 GitHub 上不存在")
             continue
         _sha = str(_entry.get("sha256") or "").lower()
+        _total, _how = r2_probe_size(str(_entry.get("url") or ""))
+        if _name == SUMS_ASSET_NAME:
+            # 这个文件不按字节跟 GitHub 那比：R2 那份自 2026-10 起是**两个平台各一行**，
+            # 而**已发布**的旧 Release（v0.11.2 及更早）附件里仍是一行 —— 旧附件改不了
+            # （发布动作要维护者点头），所以「R2 与 GitHub 逐字节相等」在这份文件上不再成立。
+            # 真正要守的两条在下面单独判（两个平台的 sha256 都要在、且等于清单里的值），
+            # 而清单里那两个值又各自与 GitHub digest 强比对 —— 内容是有传递约束的，
+            # 不是"放水"。唯一不允许的方向是 R2 那份**少行**（少了某个附件的校验值）。
+            check(f"{SUMS_ASSET_NAME}：R2 那份不少于 GitHub 那份（R2 可能多行）",
+                  isinstance(_total, int) and _total >= _want[0],
+                  f"R2 {_total}（{_how}）/ GitHub {_want[0]}"
+                  + (f"；行内容不同（R2 {_sha[:12]}… / GitHub {_want[1][:12]}…）"
+                     f"，属 2026-10 口径变更后的预期差异" if _sha != _want[1] else ""))
+            continue
         check(f"{_name}：R2 清单 sha256 == GitHub digest", _sha == _want[1],
               f"R2 {_sha[:12]}… / GitHub {_want[1][:12]}…")
-        _total, _how = r2_probe_size(str(_entry.get("url") or ""))
         check(f"{_name}：公开域对象字节数 == GitHub 附件 size", _total == _want[0],
               f"R2 {_total}（{_how}）/ GitHub {_want[0]}")
+
+    # 那份人人都能下、要拿去核校验值的文件：线上这两个平台必须各占一行、值对得上
+    _sums = r2_sums_lines()
+    if _sums is None:
+        skipped.append(f"公开域上的 {SUMS_ASSET_NAME} 取不到：校验值清单这一次没被复核")
+    else:
+        for _name in (EXE_ASSET_NAME, APPIMAGE_ASSET_NAME):
+            _want_sha = str((_r2_assets.get(_name) or {}).get("sha256") or "").lower()
+            check(f"{SUMS_ASSET_NAME} 里有 {_name} 一行且与清单一致",
+                  _sums.get(_name) == _want_sha,
+                  f"文件里 {(_sums.get(_name) or '缺这一行')[:12]}… / 清单 {_want_sha[:12]}…")
 
 # 真跑一次自检
 print("  跑 --self-test（可能要十几秒）…")

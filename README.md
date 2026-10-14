@@ -8,6 +8,12 @@
 [![Python](https://img.shields.io/badge/python-3.11-blue)](docs/GUIDE.md#一前置条件windows)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
+> 📥 **国内直连下载**（不依赖 GitHub；程序里的「检查更新 / 立即更新」也走这个源）：
+> [Windows exe](https://dl.kcm-nixi.cn/VRChatLiveTranslate.exe) ·
+> [Linux AppImage](https://dl.kcm-nixi.cn/VRChatLiveTranslate-x86_64.AppImage) ·
+> [校验值](https://dl.kcm-nixi.cn/SHA256SUMS.txt) ·
+> [GitHub Releases](https://github.com/nixi-agent/vrchat-livetranslate/releases/latest)
+
 在 VRChat 里做**实时同声传译**：采集麦克风 / 游戏音频 → 千问云实时同传模型 →
 译文送到 **chatbox 气泡**、**VR 手腕屏**，可选把译音回灌进虚拟麦克风**让对方直接听见**。
 

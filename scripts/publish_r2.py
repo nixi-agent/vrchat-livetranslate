@@ -127,6 +127,40 @@ def release_url(tag: str, slug: str = REPO_SLUG) -> str:
     return f"https://github.com/{slug}/releases/tag/{tag}"
 
 
+def _check_sums_file(dist: Path, assets: dict[str, dict]) -> None:
+    """`SHA256SUMS.txt` 若在，必须与真实产物**逐项一致**，且两个平台各一行。
+
+    为什么值得在这里拦（评审二审 §2 引出的口径）：GUIDE 让用户拿这个文件核校验值，
+    而 AppImage 的 sha256 以前只写在 `latest.json` 里 → Linux 用户照文档核不了。
+    现在两个平台各一行（生成方 = `release.yml`），于是内容错了比没有更坏，必须门禁。
+    解析口径与客户端一致：**按附件名逐行找**（多余行忽略）。
+    """
+    p = Path(dist) / SUMS_NAME
+    if not p.is_file():
+        return                       # 可选对象：Release 里没带它就不拦（见 OPTIONAL_ASSETS）
+    # ⚠️ 必须按**字节**读再自己解码：`Path.read_text()` 会做通用换行归一化（\r\n → \n），
+    # 那样下面这条「不许有 CR」的判据永远不会触发（实测踩到，注入用例直接假绿）。
+    raw = p.read_bytes().decode("utf-8", "replace")
+    if "\r" in raw:
+        # 实测踩到：CI 里 `Out-File` 写的是 CRLF，Linux 侧 `sha256sum -c` 会把 "\r" 当成
+        # 文件名的一部分 → 每一行都「找不到文件」。这份文件的读者正是 Linux 用户（GUIDE 让
+        # 他们拿它核 AppImage），所以行尾必须是 LF —— 生成侧走 WriteAllText 显式写 `\n`。
+        raise PublishError(f"{SUMS_NAME} 里有 CR（CRLF 行尾）：Linux 侧 `sha256sum -c` 会"
+                           f"因此整份核不过，请用 LF 行尾重新生成")
+    seen: dict[str, str] = {}
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            seen[parts[1].lstrip("*")] = parts[0].lower()
+    for name in REQUIRED_ASSETS:
+        got, want = seen.get(name), str(assets.get(name, {}).get("sha256") or "")
+        if got != want:
+            raise PublishError(
+                f"{SUMS_NAME} 里 {name} 的校验值与产物不一致"
+                f"（文件里：{got or '缺这一行'}；实测：{want[:12]}…）："
+                f"用户会拿这个文件核校验值，内容错了比没有更坏")
+
+
 def build_manifest(dist: Path, tag: str, published_at: str | None = None,
                    base_url: str = BASE_URL) -> dict:
     """扫 dist/ 里的产物 → `latest.json` 的内容（不联网、不写盘）。
@@ -158,6 +192,7 @@ def build_manifest(dist: Path, tag: str, published_at: str | None = None,
                             "sha256": sha256_file(p)}
     if published_at is None:
         published_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _check_sums_file(dist, assets)
     return {
         "schema": MANIFEST_SCHEMA,
         "version": version,

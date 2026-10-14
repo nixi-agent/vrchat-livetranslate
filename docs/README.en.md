@@ -8,6 +8,13 @@
 [![Python](https://img.shields.io/badge/python-3.11-blue)](GUIDE.en.md#1-prerequisites-windows)
 [![License](https://img.shields.io/badge/license-MIT-green)](../LICENSE)
 
+> 📥 **Direct download (mainland-China friendly, GitHub not required)** — the in-app
+> "check for updates" uses the same source:
+> [Windows exe](https://dl.kcm-nixi.cn/VRChatLiveTranslate.exe) ·
+> [Linux AppImage](https://dl.kcm-nixi.cn/VRChatLiveTranslate-x86_64.AppImage) ·
+> [checksums](https://dl.kcm-nixi.cn/SHA256SUMS.txt) ·
+> [GitHub Releases](https://github.com/nixi-agent/vrchat-livetranslate/releases/latest)
+
 Real-time simultaneous interpretation inside VRChat: capture your microphone / game audio →
 Qwen Cloud real-time interpretation model → translation goes to the **chatbox bubble** and a
 **VR wrist display**, with an optional path that feeds the translated voice back into a virtual

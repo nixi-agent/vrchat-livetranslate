@@ -8,6 +8,12 @@
 [![Python](https://img.shields.io/badge/python-3.11-blue)](GUIDE.ko.md#1-사전-준비)
 [![License](https://img.shields.io/badge/license-MIT-green)](../LICENSE)
 
+> 📥 **중국 본토 직통 다운로드**（GitHub 없이 내려받기, 앱의 "업데이트 확인"도 같은 소스를 씁니다）：
+> [Windows exe](https://dl.kcm-nixi.cn/VRChatLiveTranslate.exe) ·
+> [Linux AppImage](https://dl.kcm-nixi.cn/VRChatLiveTranslate-x86_64.AppImage) ·
+> [체크섬](https://dl.kcm-nixi.cn/SHA256SUMS.txt) ·
+> [GitHub Releases](https://github.com/nixi-agent/vrchat-livetranslate/releases/latest)
+
 VRChat 안에서 **실시간 동시 통역**을 해 주는 도구입니다: 마이크 / 게임 오디오를 캡처 →
 Qwen Cloud 실시간 통역 모델로 전송 → 번역문을 **chatbox 말풍선**과
 **VR 손목 오버레이**에 표시합니다. 선택적으로 번역 음성을 가상 사운드카드로 되돌려

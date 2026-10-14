@@ -8,6 +8,13 @@
 [![Python](https://img.shields.io/badge/python-3.11-blue)](GUIDE.ru.md#1-что-нужно-заранее)
 [![License](https://img.shields.io/badge/license-MIT-green)](../LICENSE)
 
+> 📥 **Прямая загрузка (без GitHub, удобно из Китая)** — проверка обновлений в приложении
+> идёт оттуда же:
+> [Windows exe](https://dl.kcm-nixi.cn/VRChatLiveTranslate.exe) ·
+> [Linux AppImage](https://dl.kcm-nixi.cn/VRChatLiveTranslate-x86_64.AppImage) ·
+> [контрольные суммы](https://dl.kcm-nixi.cn/SHA256SUMS.txt) ·
+> [GitHub Releases](https://github.com/nixi-agent/vrchat-livetranslate/releases/latest)
+
 **Синхронный перевод прямо в VRChat**: захватывает микрофон / звук игры → отправляет в модель
 синхронного перевода Qwen Cloud → перевод уходит в **пузырь chatbox** и на
 **экран на запястье в VR**; дополнительно можно вернуть переведённый голос в виртуальную

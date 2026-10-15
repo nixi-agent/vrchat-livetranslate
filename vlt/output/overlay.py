@@ -122,45 +122,65 @@ def resolve_font_path(configured: str) -> str | None:
     return _font_cache[key]
 
 
-# 泰文字体解析结果缓存（与 _font_cache 同口径，避免每次渲染都去 spawn 一个 fc-match）。
-_thai_font_cache: dict[str, str | None] = {}
-# 「找不到泰文字体」的告警只打一次（禁静默降级，但也不要刷屏）。
-_thai_font_warned = False
+# 非主书写系统的专用字体：解析结果缓存（与 `_font_cache` 同口径，避免每次渲染都去 spawn 一个 fc-list）。
+# 键 = (书写系统, 配置里写的字体) —— 配置会影响兜底分支，所以两维都要进键。
+_script_font_cache: dict[tuple[str, str], str | None] = {}
+# 「找不到某书写系统的字体」的告警**每个书写系统只打一次**（禁静默降级，但也不要刷屏）。
+_script_font_warned: set[str] = set()
+
+# 书写系统 → 平台门面里的探测函数名（见 `vlt/platform/__init__.py`，两端各一条实现）。
+# ⚠️ 按**名字**在调用时取，而不是 import 时就绑成函数对象：用例会打桩门面
+#    （`platform.find_thai_font = lambda: None`），绑定死的函数对象会绕过打桩 → 用例失去分辨力。
+_SCRIPT_FINDERS: dict[str, str] = {"thai": "find_thai_font", "hangul": "find_korean_font"}
+# 书写系统的中文名（留痕文案用）。
+_SCRIPT_NAMES: dict[str, str] = {"thai": "泰文", "hangul": "韩文"}
 
 
-def _warn_thai_font_missing() -> None:
-    """降级留痕：找不到含泰文字形的字体时打一行告警（只打一次）。"""
-    global _thai_font_warned
-    if _thai_font_warned:
+def _warn_script_font_missing(script: str) -> None:
+    """降级留痕：找不到含该书写系统字形的字体时打一行告警（同一书写系统只打一次）。"""
+    if script in _script_font_warned:
         return
-    _thai_font_warned = True
+    _script_font_warned.add(script)
+    name = _SCRIPT_NAMES.get(script, script)
     try:
-        print("[overlay] 找不到含泰文字形的字体 → 泰语文本将渲染为豆腐块"
-              "（CJK 字体不含泰文字形，降级）", flush=True)
+        print(f"[overlay] 找不到含{name}字形的字体 → {name}文本将渲染为豆腐块"
+              f"（CJK 字体不含{name}字形，降级）", flush=True)
     except Exception:  # noqa: BLE001 — 日志本身绝不能把主流程搞挂
         pass
 
 
-def resolve_thai_font_path(configured: str) -> str | None:
-    """决定泰语文本用哪个字体文件；找不到返回 None（调用方回落 CJK 字体 → 豆腐块）。
+def resolve_script_font_path(script: str, configured: str) -> str | None:
+    """决定某个**非主书写系统**（`thai` / `hangul`）的文本用哪个字体文件。
 
-    优先级：平台自动探测（`find_thai_font()`，保证含泰文字形）→ 用户配置的字体
-    （兜底：用户可能配了一个多脚本字体，但也可能不含泰文 → 豆腐块，降级留痕）→ None。
+    优先级：平台自动探测（`find_thai_font()` / `find_korean_font()`，保证含该书写系统字形）
+    → 用户配置的字体（兜底：用户可能配了一个多脚本字体，但也可能不含该书写系统 → 豆腐块，
+    降级留痕）→ None（调用方回落 CJK 字体 → 豆腐块）。
 
-    ⚠️ **不能复用 `resolve_font_path`**：CJK 字体（雅黑 / Noto Sans CJK 等）不含泰文字形，
-    实测用 msyh.ttc 渲染 `สวัสดี` 与渲染缺字位 U+E000 的位图**完全相同**（= 豆腐块）。
-    所以泰语必须走这条独立探测，渲染侧按书写系统切 run、各用各的字体画。
+    ⚠️ **不能复用 `resolve_font_path`**：CJK 字体（雅黑 / Noto Sans CJK 等）**不一定**含这些字形 ——
+    实测 `msyh.ttc` 渲染 `สวัสดี` / `안녕하세요` 得到的位图与渲染缺字位 U+E000 **完全相同**（= 豆腐块）。
+    所以每种书写系统都要独立探测，渲染侧按书写系统切 run、各用各的字体画。
     """
-    key = configured or ""
-    if key not in _thai_font_cache:
-        from ..platform import find_thai_font
-        resolved: str | None = find_thai_font()
+    key = (script, configured or "")
+    if key not in _script_font_cache:
+        from .. import platform as _platform
+        finder = getattr(_platform, _SCRIPT_FINDERS.get(script, ""), None)
+        resolved: str | None = finder() if finder else None
         if resolved is None and configured and Path(configured).exists():
-            resolved = configured          # 用户配置的字体兜底（可能不含泰文 → 豆腐块）
+            resolved = configured          # 用户配置的字体兜底（可能不含该书写系统 → 豆腐块）
         if resolved is None:
-            _warn_thai_font_missing()
-        _thai_font_cache[key] = resolved
-    return _thai_font_cache[key]
+            _warn_script_font_missing(script)
+        _script_font_cache[key] = resolved
+    return _script_font_cache[key]
+
+
+def resolve_thai_font_path(configured: str) -> str | None:
+    """泰文文本用哪个字体文件（口径见 `resolve_script_font_path`；门面 = `find_thai_font`）。"""
+    return resolve_script_font_path("thai", configured)
+
+
+def resolve_korean_font_path(configured: str) -> str | None:
+    """韩文文本用哪个字体文件（口径见 `resolve_script_font_path`；门面 = `find_korean_font`）。"""
+    return resolve_script_font_path("hangul", configured)
 
 
 # ---------------------------------------------------------------- 配置
@@ -284,37 +304,53 @@ def _is_cjk(ch: str) -> bool:
     return any(lo <= o <= hi for lo, hi in _CJK_RANGES)
 
 
-# 泰文 Unicode 块（U+0E00–U+0E7F）。与 CJK 是**两个独立**的书写系统：
-# CJK 字体不含泰文字形、泰文字体不含中日韩字形 —— 混排时必须按书写系统切 run、
-# 各用各的字体画，否则会出豆腐块（实测 msyh.ttc 渲染泰文 = 渲染 U+E000 的位图）。
-_THAI_RANGES = ((0x0E00, 0x0E7F),)
+# 非主书写系统的 Unicode 块。与 CJK 是**彼此独立**的书写系统：CJK 字体不含泰文/韩文字形，
+# 泰文字体也不含中日韩字形 —— 混排时必须按书写系统切 run、各用各的字体画，
+# 否则会出豆腐块（实测 `msyh.ttc` 渲染 `สวัสดี` / `안녕하세요` = 渲染缺字位 U+E000 的位图）。
+#
+# 每条 = (起, 止, 书写系统名)；`_script_of` 落在表外的字符一律算主书写系统（cjk）。
+# 韩文那几条覆盖「音节（正文）/ 字母 Jamo / 兼容字母 / 字母扩展 A、B / 半角字母」——
+# 只认音节块会漏掉 `ㄱㄴㄷ` 这类用字母写的韩文（实测与缺字位同形，也是豆腐块）。
+_SCRIPT_RANGES: tuple[tuple[int, int, str], ...] = (
+    (0x0E00, 0x0E7F, "thai"),     # 泰文
+    (0x1100, 0x11FF, "hangul"),   # 韩文字母（Jamo）
+    (0x3130, 0x318F, "hangul"),   # 韩文兼容字母（ㄱㄴㄷ…）
+    (0xA960, 0xA97F, "hangul"),   # 韩文字母扩展-A
+    (0xAC00, 0xD7A3, "hangul"),   # 韩文音节（现代韩文正文都在这里）
+    (0xD7B0, 0xD7FF, "hangul"),   # 韩文字母扩展-B
+    (0xFFA0, 0xFFDC, "hangul"),   # 韩文半角字母
+)
 
 
-def _is_thai(ch: str) -> bool:
+def _script_of(ch: str) -> str:
+    """该字符属于哪个书写系统：`"cjk"`（= 主字体）/ `"thai"` / `"hangul"`。"""
     o = ord(ch)
-    return any(lo <= o <= hi for lo, hi in _THAI_RANGES)
+    for lo, hi, name in _SCRIPT_RANGES:
+        if lo <= o <= hi:
+            return name
+    return "cjk"
 
 
-def _split_script_runs(text: str) -> list[tuple[str, bool]]:
-    """按书写系统切 run：返回 `[(chunk, is_thai), ...]`，相邻同系统的字符合并成一个 run。
+def _split_script_runs(text: str) -> list[tuple[str, str]]:
+    """按书写系统切 run：返回 `[(chunk, script), ...]`，相邻同系统的字符合并成一个 run。
 
-    混排行（中文 + 泰文）会被切成多个 run，渲染/测量时各用各的字体；
-    纯 CJK 或纯泰文的行只有一个 run，走原来的单字体路径（行为不变）。
+    混排行（中文 + 泰文/韩文）会被切成多个 run，渲染/测量时各用各的字体；
+    纯 CJK / 纯泰文 / 纯韩文的行只有一个 run，走原来的单字体路径（行为不变）。
     """
     if not text:
         return []
-    runs: list[tuple[str, bool]] = []
+    runs: list[tuple[str, str]] = []
     cur = text[0]
-    cur_is_thai = _is_thai(text[0])
+    cur_script = _script_of(text[0])
     for ch in text[1:]:
-        is_thai = _is_thai(ch)
-        if is_thai == cur_is_thai:
+        script = _script_of(ch)
+        if script == cur_script:
             cur += ch
         else:
-            runs.append((cur, cur_is_thai))
+            runs.append((cur, cur_script))
             cur = ch
-            cur_is_thai = is_thai
-    runs.append((cur, cur_is_thai))
+            cur_script = script
+    runs.append((cur, cur_script))
     return runs
 
 
@@ -352,29 +388,65 @@ def _tokens(text: str) -> list[str]:
     return tokens
 
 
+def _load_font(path: str | None, size: int) -> ImageFont.FreeTypeFont:
+    """按路径开字体；打不开 / 没有路径 → 回落 PIL 位图字体（画不了中日韩，但至少不抛）。"""
+    if path:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:  # noqa: BLE001 — 字体文件坏了也别让整条腿挂掉
+            pass
+    return ImageFont.load_default()
+
+
+def load_script_fonts(cfg: OverlayConfig, size: int) -> dict[str, ImageFont.FreeTypeFont]:
+    """该字号下**各非主书写系统**的专用字体（键 = `"thai"` / `"hangul"`）。
+
+    解析不到（本机没装覆盖该书写系统的字体）/ 字体文件坏了的，**不进字典** ——
+    调用方回落主字体（那一段会渲染成豆腐块，`resolve_script_font_path` 已经留痕）。
+    于是「一个都没解析出来」时字典为空 → 渲染走单字体路径，行为与引入本机制之前
+    **逐字节一致**（有用例钉住这条不变量）。
+    """
+    out: dict[str, ImageFont.FreeTypeFont] = {}
+    for script in _SCRIPT_FINDERS:
+        path = resolve_script_font_path(script, cfg.font)
+        if not path:
+            continue
+        try:
+            out[script] = ImageFont.truetype(path, size)
+        except Exception:  # noqa: BLE001 — 一个字体坏了不该把另一个书写系统也拖下水
+            continue
+    return out
+
+
+def _pick_font(script: str, cjk_font: ImageFont.FreeTypeFont,
+               fonts: dict[str, ImageFont.FreeTypeFont]) -> ImageFont.FreeTypeFont:
+    """该 run 用哪份字体：有专用字体就用它，否则回落主字体（= 该书写系统会出豆腐块）。"""
+    return fonts.get(script, cjk_font)
+
+
 def _measure_line(draw: ImageDraw.ImageDraw, text: str,
                   cjk_font: ImageFont.FreeTypeFont,
-                  thai_font: ImageFont.FreeTypeFont | None) -> float:
+                  script_fonts: dict[str, ImageFont.FreeTypeFont] | None) -> float:
     """run-aware 宽度测量：混排行按书写系统分段，各用各的字体量，再加总。
 
-    `thai_font is None` 时退化成原来的单字体测量（行为不变）。
+    `script_fonts` 为空/None 时退化成原来的单字体测量（行为不变）。
     """
-    if thai_font is None:
+    if not script_fonts:
         return draw.textlength(text, font=cjk_font)
-    return sum(draw.textlength(chunk, font=(thai_font if is_thai else cjk_font))
-               for chunk, is_thai in _split_script_runs(text))
+    return sum(draw.textlength(chunk, font=_pick_font(script, cjk_font, script_fonts))
+               for chunk, script in _split_script_runs(text))
 
 
 def _draw_line(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str,
                cjk_font: ImageFont.FreeTypeFont,
-               thai_font: ImageFont.FreeTypeFont | None,
+               script_fonts: dict[str, ImageFont.FreeTypeFont] | None,
                fill, anchor: str = "la") -> None:
     """run-aware 渲染：混排行按书写系统分段，各用各的字体画，**基线对齐**。
 
     取舍说明：
-    - 纯 CJK / 纯泰文 / 没有泰文字体 → 走原来的单字体路径（`draw.text` 一次画完，
-      行为与改动前逐像素一致，满足「中文/日文/韩文渲染行为不变」的要求）。
-    - 混排行（同一行里既有中文又有泰文）→ 按 run 切分，各用各的字体画。
+    - 纯 CJK / 纯泰文 / 纯韩文 / 没有对应专用字体 → 走原来的单字体路径
+      （`draw.text` 一次画完，行为与改动前逐像素一致，满足「中文/日文/韩文渲染行为不变」的要求）；
+    - 混排行（同一行里既有中文又有泰文/韩文）→ 按 run 切分，各用各的字体画。
       垂直方向用**基线对齐**（每个 run 都按 anchor="ls" 画）而不是原来的 ascender 对齐：
       泰文有上标元音/声调符号，ascender 对齐会让泰文与 CJK 的视觉基线错开；
       基线对齐是混排的标准做法。y_baseline 用 CJK 字体的 ascender 换算
@@ -385,30 +457,30 @@ def _draw_line(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str,
       render_conversation 用 "la"/"ra"），其它 anchor 不在扫描面内。
     """
     x, y = xy
-    if thai_font is None:
+    if not script_fonts:
         draw.text((x, y), text, font=cjk_font, fill=fill, anchor=anchor)
         return
     runs = _split_script_runs(text)
     if len(runs) <= 1:
-        # 单 run（纯 CJK / 纯泰文 / 空行）→ 用对应字体、原 anchor，行为不变。
-        font = thai_font if (runs and runs[0][1]) else cjk_font
+        # 单 run（纯 CJK / 纯泰文 / 纯韩文 / 空行）→ 用对应字体、原 anchor，行为不变。
+        font = _pick_font(runs[0][1], cjk_font, script_fonts) if runs else cjk_font
         draw.text((x, y), text, font=font, fill=fill, anchor=anchor)
         return
     # 多 run（混排）→ 基线对齐，逐 run 画。
     y_baseline = y + cjk_font.getmetrics()[0]
-    total_w = _measure_line(draw, text, cjk_font, thai_font)
+    total_w = _measure_line(draw, text, cjk_font, script_fonts)
     x_cursor = x - total_w if anchor.startswith("r") else x
-    for chunk, is_thai in runs:
-        font = thai_font if is_thai else cjk_font
+    for chunk, script in runs:
+        font = _pick_font(script, cjk_font, script_fonts)
         draw.text((x_cursor, y_baseline), chunk, font=font, fill=fill, anchor="ls")
         x_cursor += draw.textlength(chunk, font=font)
 
 
 def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont,
-              max_w: int, thai_font: ImageFont.FreeTypeFont | None = None) -> list[str]:
+              max_w: int, script_fonts: dict[str, ImageFont.FreeTypeFont] | None = None) -> list[str]:
     """按像素宽度折行，带拉丁整词保护 + 中文避头尾（行首禁则标点）。
 
-    `thai_font` 非 None 时，测量走 run-aware 路径（混排行按书写系统分段量宽度），
+    `script_fonts` 非空时，测量走 run-aware 路径（混排行按书写系统分段量宽度），
     避免「用错字体会量错」→ 换行位置跑偏。纯 CJK / 纯拉丁的行测量结果与原来一致。
     """
     lines: list[str] = []
@@ -420,7 +492,7 @@ def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont
             continue
         if tk == " " and not cur:          # 行首不留空格
             continue
-        if _measure_line(draw, cur + tk, font, thai_font) <= max_w:
+        if _measure_line(draw, cur + tk, font, script_fonts) <= max_w:
             cur += tk
             continue
         # 放不下：若该 token 是禁则标点 → 悬挂在本行末尾（避免行首标点）
@@ -436,9 +508,9 @@ def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont
             continue
         # 单个整词就比整行还宽（超长单词 / 一长串无空格字符）→ 按字符硬切，
         # 否则整词独占一行会直接溢出面板边缘（比断词更难看）。
-        while len(tk) > 1 and _measure_line(draw, tk, font, thai_font) > max_w:
+        while len(tk) > 1 and _measure_line(draw, tk, font, script_fonts) > max_w:
             cut = 1
-            while cut < len(tk) and _measure_line(draw, tk[:cut + 1], font, thai_font) <= max_w:
+            while cut < len(tk) and _measure_line(draw, tk[:cut + 1], font, script_fonts) <= max_w:
                 cut += 1
             lines.append(tk[:cut])
             tk = tk[cut:]
@@ -462,23 +534,7 @@ def render_panel(text: str, source: str = "", cfg: OverlayConfig | None = None) 
                         outline=(*cfg.color_border, cfg.border_alpha), width=3)
 
     def _font(size: int) -> ImageFont.FreeTypeFont:
-        path = resolve_font_path(cfg.font)
-        if path:
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:  # noqa: BLE001 — 字体文件坏了也别让整条腿挂掉
-                pass
-        return ImageFont.load_default()
-
-    def _thai_font(size: int) -> ImageFont.FreeTypeFont:
-        """泰文字体（与 _font 同口径）；找不到时回落 CJK 字体（泰文会出豆腐块，已留痕）。"""
-        path = resolve_thai_font_path(cfg.font)
-        if path:
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:  # noqa: BLE001
-                pass
-        return _font(size)
+        return _load_font(resolve_font_path(cfg.font), size)
 
     inner_w = w - 4 * pad
     y = pad * 2
@@ -486,10 +542,10 @@ def render_panel(text: str, source: str = "", cfg: OverlayConfig | None = None) 
     # 原文（小字、灰蓝）—— 3.8 默认就会返回源语言识别结果，双行显示零额外成本
     if cfg.show_source and source:
         sf = _font(cfg.source_font_size)
-        sf_thai = _thai_font(cfg.source_font_size)
-        src_lines = wrap_text(d, source, sf, inner_w, thai_font=sf_thai)[-2:]
+        sf_extra = load_script_fonts(cfg, cfg.source_font_size)
+        src_lines = wrap_text(d, source, sf, inner_w, script_fonts=sf_extra)[-2:]
         for ln in src_lines:
-            _draw_line(d, (pad * 2, y), ln, sf, sf_thai,
+            _draw_line(d, (pad * 2, y), ln, sf, sf_extra,
                        fill=(*cfg.color_source, cfg.source_alpha))
             y += cfg.source_font_size + 8
         y += 6
@@ -500,12 +556,12 @@ def render_panel(text: str, source: str = "", cfg: OverlayConfig | None = None) 
 
     # 译文（大字、白）
     tf = _font(cfg.font_size)
-    tf_thai = _thai_font(cfg.font_size)
-    text_lines = wrap_text(d, text, tf, inner_w, thai_font=tf_thai)
+    tf_extra = load_script_fonts(cfg, cfg.font_size)
+    text_lines = wrap_text(d, text, tf, inner_w, script_fonts=tf_extra)
     if len(text_lines) > cfg.max_lines:      # 同传场景保留最新内容
         text_lines = text_lines[-cfg.max_lines:]
     for ln in text_lines:
-        _draw_line(d, (pad * 2, y), ln, tf, tf_thai,
+        _draw_line(d, (pad * 2, y), ln, tf, tf_extra,
                    fill=(*cfg.color_translation, 255))
         y += cfg.font_size + 10
     return img
@@ -585,26 +641,11 @@ def render_conversation(entries, cfg: OverlayConfig | None = None) -> Image.Imag
                         outline=(*cfg.color_border, cfg.border_alpha), width=3)
 
     def _f(size: int) -> ImageFont.FreeTypeFont:
-        path = resolve_font_path(cfg.font)
-        if path:
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:  # noqa: BLE001
-                pass
-        return ImageFont.load_default()
-
-    def _tf(size: int) -> ImageFont.FreeTypeFont:
-        """泰文字体（与 _f 同口径）；找不到时回落 CJK 字体（泰文会出豆腐块，已留痕）。"""
-        path = resolve_thai_font_path(cfg.font)
-        if path:
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:  # noqa: BLE001
-                pass
-        return _f(size)
+        return _load_font(resolve_font_path(cfg.font), size)
 
     tf, sf = _f(cfg.font_size), _f(cfg.source_font_size)
-    tf_thai, sf_thai = _tf(cfg.font_size), _tf(cfg.source_font_size)
+    tf_extra = load_script_fonts(cfg, cfg.font_size)
+    sf_extra = load_script_fonts(cfg, cfg.source_font_size)
     inner_w = w - 4 * pad
     asc_t = cfg.font_size + 10
     asc_s = cfg.source_font_size + 6
@@ -617,16 +658,16 @@ def render_conversation(entries, cfg: OverlayConfig | None = None) -> Image.Imag
         t = (text or "").strip()
         if not t:
             continue
-        tl = wrap_text(d, t, tf, inner_w - 24, thai_font=tf_thai)
+        tl = wrap_text(d, t, tf, inner_w - 24, script_fonts=tf_extra)
         # 小字区：昵称（标明谁在说，始终画）+ 原文（受 show_source 控制）。
         # mine/theirs 没有 label → 这一段与改版前逐像素一致。
         sl: list[str] = []
         lab = (label or "").strip()
         if lab:
-            sl += wrap_text(d, lab, sf, inner_w - 24, thai_font=sf_thai)
+            sl += wrap_text(d, lab, sf, inner_w - 24, script_fonts=sf_extra)
         src = (source or "").strip()
         if cfg.show_source and src:
-            sl += wrap_text(d, src, sf, inner_w - 24, thai_font=sf_thai)
+            sl += wrap_text(d, src, sf, inner_w - 24, script_fonts=sf_extra)
         blk_h = len(sl) * asc_s + (4 if sl else 0) + len(tl) * asc_t + 14
         if shown and used + blk_h > budget:      # 塞不下更早的就停（保留最新）
             break
@@ -648,13 +689,13 @@ def render_conversation(entries, cfg: OverlayConfig | None = None) -> Image.Imag
             tx, anchor = pad * 2 + 16, "la"
         yy = y
         for ln in sl:                            # 昵称 / 原文小字在上
-            _draw_line(d, (tx, yy), ln, sf, sf_thai,
+            _draw_line(d, (tx, yy), ln, sf, sf_extra,
                        fill=(*cfg.color_source, cfg.source_alpha), anchor=anchor)
             yy += asc_s
         if sl:
             yy += 4
         for ln in tl:                            # 译文（房间里=源文）大字在下
-            _draw_line(d, (tx, yy), ln, tf, tf_thai,
+            _draw_line(d, (tx, yy), ln, tf, tf_extra,
                        fill=(*cfg.color_translation, 255), anchor=anchor)
             yy += asc_t
         y += blk_h

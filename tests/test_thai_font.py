@@ -20,8 +20,12 @@
 这条会打印提示（说明本机不需要泰文字体兜底），后面的「不是豆腐块」断言也就失去意义 ——
 所以两条要一起看，绝不单独绿。
 
-测试**不复用**被测模块的 `_is_thai` / `_split_script_runs`：判据必须独立于实现，
+测试**不复用**被测模块的 `_script_of` / `_split_script_runs`：判据必须独立于实现，
 否则实现一坏、判据跟着一起坏（同 `tests/test_wrap.py` 的做法）。
+
+⚠️ 本文件只钉**泰文**（外加「这套机制不波及 CJK」这条不变量）。韩文走的是同一套「按书写系统
+切 run、各用各的字体」机制，但判据、字体候选、降级文案都不同，由 `tests/test_korean_font.py`
+单独钉住 —— 两边共用的是机制，不是用例。
 """
 from __future__ import annotations
 
@@ -42,6 +46,7 @@ from vlt.output.overlay import (                    # noqa: E402
     OverlayConfig,
     _draw_line,
     _measure_line,
+    load_script_fonts,
     render_conversation,
     render_panel,
     resolve_font_path,
@@ -71,6 +76,15 @@ INK_TOLERANCE_PX = 3
 
 
 # ---------------------------------------------------------------- 小工具（判据独立于实现）
+
+
+def _thai_only(font: ImageFont.FreeTypeFont) -> dict[str, ImageFont.FreeTypeFont]:
+    """「只带泰文那一格」的专用字体字典。
+
+    生产入口是 `load_script_fonts(cfg, size)`（泰文/韩文…各一格）；用例只关心泰文，
+    所以显式只给泰文 —— 这样「泰文那一段换了字体」这件事就是唯一变量。
+    """
+    return {"thai": font}
 
 
 def _is_thai_char(ch: str) -> bool:
@@ -154,22 +168,30 @@ def _skip(name: str) -> None:
     print(f"  ⏭ 跳过 {name}：{_NO_FONT_WHY}")
 
 
-def _stub_thai_font(value):
-    """上下文管理器：把 `resolve_thai_font_path` 打桩成固定返回值（绕过缓存）。"""
-    class _Ctx:
-        def __enter__(self):
-            self.orig = overlay.resolve_thai_font_path
-            self.cache = dict(overlay._thai_font_cache)
-            overlay._thai_font_cache.clear()
-            overlay.resolve_thai_font_path = lambda _c: value   # type: ignore[assignment]
-            return self
+@contextlib.contextmanager
+def _stub_script_fonts(values: dict[str, str | None]):
+    """让指定书写系统解析到固定值（None = 本机没有覆盖该书写系统的字体）。
 
-        def __exit__(self, *exc):
-            overlay.resolve_thai_font_path = self.orig          # type: ignore[assignment]
-            overlay._thai_font_cache.clear()
-            overlay._thai_font_cache.update(self.cache)
-            return False
-    return _Ctx()
+    ⚠️ 打桩的是**通用入口** `overlay.resolve_script_font_path`（`resolve_thai_font_path` /
+    `resolve_korean_font_path` 都只是它的薄包装）—— 打桩包装函数在实现搬家时会静默失效。
+    同时清一次解析缓存：缓存会把上一次的真实结果留住，让打桩看不见。
+    """
+    cache = dict(overlay._script_font_cache)
+    orig = overlay.resolve_script_font_path
+    overlay._script_font_cache.clear()
+
+    def _fake(script: str, configured: str) -> str | None:
+        if script in values:
+            return values[script]
+        return orig(script, configured)
+
+    overlay.resolve_script_font_path = _fake       # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        overlay.resolve_script_font_path = orig    # type: ignore[assignment]
+        overlay._script_font_cache.clear()
+        overlay._script_font_cache.update(cache)
 
 
 # 夹具自检：THAI_SENTENCE 必须是纯泰文码位（理由见上面的注释）。
@@ -253,11 +275,11 @@ def test_thai_font_resolved_through_platform_facade() -> None:
         print("  ⏭ 本机没有泰文字体 → 跳过「路径有效 / 与门面一致 / 不在共享模块里」三条；"
               "降级留痕那半条照跑")
 
-    saved_flag = overlay._thai_font_warned
+    saved_warned = set(overlay._script_font_warned)
     orig_facade = platform_mod.find_thai_font
     try:
-        overlay._thai_font_cache.clear()
-        overlay._thai_font_warned = False
+        overlay._script_font_cache.clear()
+        overlay._script_font_warned.discard("thai")
         platform_mod.find_thai_font = lambda: None       # type: ignore[assignment]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -277,8 +299,9 @@ def test_thai_font_resolved_through_platform_facade() -> None:
         assert img.getextrema()[3][1] > 0
     finally:
         platform_mod.find_thai_font = orig_facade        # type: ignore[assignment]
-        overlay._thai_font_cache.pop("", None)
-        overlay._thai_font_warned = saved_flag
+        overlay._script_font_cache.clear()
+        overlay._script_font_warned.clear()
+        overlay._script_font_warned.update(saved_warned)
     assert resolve_thai_font_path("") == path, "打桩复原后解析结果应回到真实字体"
     if path:
         print(f"  ✓ 泰文字体经平台门面解析（{Path(path).name}），overlay.py 不含该文件名；"
@@ -292,12 +315,16 @@ def test_thai_font_resolved_through_platform_facade() -> None:
 
 
 def test_cjk_font_not_swapped_for_thai() -> None:
-    """★ 防回退：不能为了泰语把默认 CJK 字体换掉。
+    """★ 防回退：不能为了泰语（或别的书写系统）把默认 CJK 字体换掉。
 
     两条判据：
     ① `resolve_font_path("")` 仍然等于 `find_cjk_font()`（默认字体没被动过）；
-    ② 非泰语文本走 `_draw_line`（泰文字体在场）与**改动前的写法**
-       `d.text(..., font=cjk, anchor="la")` 逐字节相同。
+    ② 非泰语文本走 `_draw_line` 与**改动前的写法** `d.text(..., font=cjk, anchor="la")`
+       逐字节相同 —— 两种字体字典都试：只带泰文那格、以及**生产口径**
+       `load_script_fonts(cfg, size)`（泰文+韩文…全都带上）。
+
+    ⚠️ 样本里**不放泰文/韩文**：它们在生产口径下本来就该换字体（那是修复，不是回归），
+       各自的行为由本文件后面的用例与 `tests/test_korean_font.py` 钉。
     """
     if _no_thai_font():
         return _skip("test_cjk_font_not_swapped_for_thai")
@@ -306,17 +333,24 @@ def test_cjk_font_not_swapped_for_thai() -> None:
          f"find_cjk_font()={platform_mod.find_cjk_font()!r}")
 
     cjk, thai = _fonts()
-    samples = [CJK_WORD, CJK_SENTENCE, "こんにちは、ニキシです",
-               "안녕하세요, 저는 니키입니다", "Привет! Я из России."]
-    for text in samples:
-        ref = _render(lambda d, t=text: d.text(ORIGIN, t, font=cjk, fill=255, anchor="la"))
-        got = _render(lambda d, t=text: _draw_line(d, ORIGIN, t, cjk, thai, fill=255))
-        assert ref.tobytes() == got.tobytes(), \
-            f"非泰语文本 {text[:12]!r} 的渲染位图变了（CJK 行为被泰语改动波及）"
+    cfg = OverlayConfig()
+    dicts = {"只带泰文格": _thai_only(thai), "生产口径": load_script_fonts(cfg, FONT_SIZE)}
+    assert dicts["生产口径"], "生产口径的专用字体字典是空的，这条判据失去意义"
+    samples = [CJK_WORD, CJK_SENTENCE, "こんにちは、ニキシです", "Привет! Я из России.",
+               "Hello, world — 123."]
+    checked = 0
+    for label, fonts in dicts.items():
+        for text in samples:
+            ref = _render(lambda d, t=text: d.text(ORIGIN, t, font=cjk, fill=255, anchor="la"))
+            got = _render(lambda d, t=text, ff=fonts: _draw_line(d, ORIGIN, t, cjk, ff,
+                                                                 fill=255))
+            assert ref.tobytes() == got.tobytes(), \
+                f"非泰语文本 {text[:12]!r} 的渲染位图变了（{label}：CJK 行为被波及）"
+            checked += 1
     assert not _is_tofu(cjk, CJK_WORD), \
         "前提不成立：CJK 字体连中文都是豆腐块，上面的位图相同断言没有意义"
-    print(f"  ✓ 默认字体仍是 find_cjk_font()；{len(samples)} 条中/日/韩/俄 样本"
-          "单 run 渲染与改动前逐字节相同")
+    print(f"  ✓ 默认字体仍是 find_cjk_font()；{len(samples)} 条中/日/俄/拉丁样本 × "
+          f"{len(dicts)} 种字体字典（共 {checked} 条）单 run 渲染与改动前逐字节相同")
 
 
 def test_pure_cjk_panel_bitmap_unchanged() -> None:
@@ -326,7 +360,7 @@ def test_pure_cjk_panel_bitmap_unchanged() -> None:
     text, source = CJK_SENTENCE, "こんにちは、ニキシです。"
 
     with_thai = render_panel(text, source, cfg)
-    with _stub_thai_font(None):
+    with _stub_script_fonts({"thai": None}):
         without = render_panel(text, source, cfg)
     assert with_thai.tobytes() == without.tobytes(), \
         "纯 CJK 面板的位图因泰文字体逻辑而改变（CJK 渲染行为必须不变）"
@@ -335,7 +369,7 @@ def test_pure_cjk_panel_bitmap_unchanged() -> None:
 
     entries = [("mine", source, text), ("theirs", "Привет! Я из России.", "你好，我是逆袭")]
     conv_a = render_conversation(entries, cfg)
-    with _stub_thai_font(None):
+    with _stub_script_fonts({"thai": None}):
         conv_b = render_conversation(entries, cfg)
     assert conv_a.tobytes() == conv_b.tobytes(), \
         "纯 CJK 对话视图的位图因泰文字体逻辑而改变"
@@ -363,9 +397,9 @@ def test_mixed_line_uses_both_fonts() -> None:
     assert _thai_chars(MIXED_LINE) and any(_is_hanzi(c) for c in MIXED_LINE), \
         "用例本身必须同时含中文与泰文"
 
-    fixed = _render(lambda d: _draw_line(d, ORIGIN, MIXED_LINE, cjk, thai, fill=255))
+    fixed = _render(lambda d: _draw_line(d, ORIGIN, MIXED_LINE, cjk, _thai_only(thai), fill=255))
     # 修复前的效果：泰文段也用 CJK 字体画 → 豆腐块
-    before = _render(lambda d: _draw_line(d, ORIGIN, MIXED_LINE, cjk, cjk, fill=255))
+    before = _render(lambda d: _draw_line(d, ORIGIN, MIXED_LINE, cjk, _thai_only(cjk), fill=255))
     assert fixed.tobytes() != before.tobytes(), \
         "混排行渲染与「泰文用 CJK 字体画」完全相同 —— 泰文字体没被用上，泰文全是豆腐块"
 
@@ -374,7 +408,7 @@ def test_mixed_line_uses_both_fonts() -> None:
 
     assert fixed.getbbox(), "混排行整行没有墨迹"
     d_probe = ImageDraw.Draw(_blank())
-    want = _measure_line(d_probe, MIXED_LINE, cjk, thai)
+    want = _measure_line(d_probe, MIXED_LINE, cjk, _thai_only(thai))
     got = _ink_bbox(fixed)[1]
     assert abs(got - want) <= INK_TOLERANCE_PX, \
         f"测量与实际墨迹不符（换行会算错）：测量 {want:.1f}px，实画 {got}px"
@@ -396,7 +430,7 @@ def _hang_allowance(d: ImageDraw.ImageDraw, ln: str,
     多留就会漏掉真的溢出。
     """
     if len(ln) > 1 and ln[-1] in CLOSING_PUNCT:
-        return _measure_line(d, ln[-1], cjk, thai)
+        return _measure_line(d, ln[-1], cjk, _thai_only(thai))
     return 0.0
 
 
@@ -411,14 +445,15 @@ def test_mixed_wrap_respects_max_width() -> None:
     assert _thai_chars(text) and any(_is_hanzi(c) for c in text)
     report = []
     for max_w in (900, 400, 220):
-        lines = wrap_text(d_probe, text, cjk, max_w, thai_font=thai)
+        lines = wrap_text(d_probe, text, cjk, max_w, script_fonts=_thai_only(thai))
         assert len(lines) >= 2, f"max_w={max_w} 时没有折行（{len(lines)} 行）"
         for ln in lines:
             slack = _hang_allowance(d_probe, ln, cjk, thai)
-            m = _measure_line(d_probe, ln, cjk, thai)
+            m = _measure_line(d_probe, ln, cjk, _thai_only(thai))
             assert m <= max_w + slack + 1, \
                 f"max_w={max_w}：测量就超宽 {m:.0f}px（允许的悬挂 {slack:.0f}px）：{ln[:24]!r}"
-            ink = _ink_bbox(_render(lambda dd, t=ln: _draw_line(dd, ORIGIN, t, cjk, thai,
+            ink = _ink_bbox(_render(lambda dd, t=ln: _draw_line(dd, ORIGIN, t, cjk,
+                                                               _thai_only(thai),
                                                                fill=255)))[1]
             assert ink <= max_w + slack + INK_TOLERANCE_PX, \
                 f"max_w={max_w}：实画墨迹 {ink}px 超出面板（悬挂 {slack:.0f}px）：{ln[:24]!r}"
@@ -434,7 +469,7 @@ def test_mixed_wrap_respects_max_width() -> None:
         if not _thai_chars(ln):
             continue
         naive_m = _measure_line(d_probe, ln, cjk, None)          # 旧口径：一律用 CJK 字体量
-        real = _measure_line(d_probe, ln, cjk, thai)             # 真实：按 run 各用各的字体
+        real = _measure_line(d_probe, ln, cjk, _thai_only(thai))  # 真实：按 run 各用各的字体
         errs.append((ln, naive_m - real))
     assert errs, "混排长句里一行含泰文的都没折出来？对照失效"
     worst_ln, worst = max(errs, key=lambda e: abs(e[1]))
@@ -462,11 +497,11 @@ def test_mixed_line_end_to_end_in_panel() -> None:
     d_probe = ImageDraw.Draw(_blank())
     tf, tf_thai = _fonts_at(cfg.font_size)
     checked = 0
-    for ln in wrap_text(d_probe, MIXED_LINE, tf, inner_w, thai_font=tf_thai):
+    for ln in wrap_text(d_probe, MIXED_LINE, tf, inner_w, script_fonts=_thai_only(tf_thai)):
         if not _thai_chars(ln):
             continue
-        a = _render(lambda d, t=ln: _draw_line(d, ORIGIN, t, tf, tf_thai, fill=255))
-        b = _render(lambda d, t=ln: _draw_line(d, ORIGIN, t, tf, tf, fill=255))
+        a = _render(lambda d, t=ln: _draw_line(d, ORIGIN, t, tf, _thai_only(tf_thai), fill=255))
+        b = _render(lambda d, t=ln: _draw_line(d, ORIGIN, t, tf, _thai_only(tf), fill=255))
         assert a.tobytes() != b.tobytes(), f"面板里这一行的泰文仍是豆腐块：{ln[:24]!r}"
         checked += 1
     assert checked, f"混排句在面板字号下一行含泰文的都没折出来？{MIXED_LINE!r}"
@@ -489,11 +524,11 @@ def test_right_anchor_mixed_line_stays_inside() -> None:
     if _no_thai_font():
         return _skip("test_right_anchor_mixed_line_stays_inside")
     cjk, thai = _fonts()
-    want = _measure_line(ImageDraw.Draw(_blank()), MIXED_LINE, cjk, thai)
+    want = _measure_line(ImageDraw.Draw(_blank()), MIXED_LINE, cjk, _thai_only(thai))
     assert RIGHT_ANCHOR_X - want >= 0, \
         f"用例本身有问题：锚点 {RIGHT_ANCHOR_X} 放不下 {want:.0f}px 的行，会被画布裁掉"
-    img = _render(lambda d: _draw_line(d, (RIGHT_ANCHOR_X, ORIGIN[1]), MIXED_LINE, cjk, thai,
-                                       fill=255, anchor="ra"))
+    img = _render(lambda d: _draw_line(d, (RIGHT_ANCHOR_X, ORIGIN[1]), MIXED_LINE, cjk,
+                                       _thai_only(thai), fill=255, anchor="ra"))
     bb = img.getbbox()
     assert bb, "右对齐混排行没有墨迹"
     left, right = bb[0], bb[2]
@@ -503,7 +538,8 @@ def test_right_anchor_mixed_line_stays_inside() -> None:
     assert abs((right - left) - want) <= INK_TOLERANCE_PX * 2, \
         f"右对齐混排行宽度异常：{right - left}px，测量 {want:.1f}px"
     # 与左对齐版本比：同一行、同样的 run 切分，只是整体平移 → 墨迹宽度必须一致
-    left_img = _render(lambda d: _draw_line(d, ORIGIN, MIXED_LINE, cjk, thai, fill=255))
+    left_img = _render(lambda d: _draw_line(d, ORIGIN, MIXED_LINE, cjk,
+                                            _thai_only(thai), fill=255))
     lb = left_img.getbbox()
     assert abs((right - left) - (lb[2] - lb[0])) <= INK_TOLERANCE_PX, \
         f"右对齐与左对齐的行宽不一致：{right - left}px vs {lb[2] - lb[0]}px"
@@ -516,7 +552,8 @@ def test_thai_only_line_uses_thai_font() -> None:
     if _no_thai_font():
         return _skip("test_thai_only_line_uses_thai_font")
     cjk, thai = _fonts()
-    got = _render(lambda d: _draw_line(d, ORIGIN, THAI_SENTENCE, cjk, thai, fill=255))
+    got = _render(lambda d: _draw_line(d, ORIGIN, THAI_SENTENCE, cjk, _thai_only(thai),
+                                       fill=255))
     ref_thai = _render(lambda d: d.text(ORIGIN, THAI_SENTENCE, font=thai, fill=255,
                                         anchor="la"))
     ref_tofu = _render(lambda d: d.text(ORIGIN, THAI_SENTENCE, font=cjk, fill=255,

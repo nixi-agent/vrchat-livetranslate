@@ -159,7 +159,11 @@ PR 描述请按仓库的 **[PR 模板](.github/pull_request_template.md)** 填�
 **加一门新语言**远不止加一个词表文件，至少还要动 `vlt/gui.py` 的 `SOURCE_LANGS` / `TARGET_LANGS`
 （**两边都要加**）、`vlt/tts.py` 的 `LANG_NAMES`、其它 `locales/*.py` 里补上这门语言的译名，
 以及**字体覆盖**（很多 CJK 字体不含某些语言的字形，缺字体就是一排豆腐块）。动手前先开个 issue
-说一声，维护者会告诉你当前的口径。
+说一声，维护者会告诉你当前的口径。字体那一步的做法（以泰文/韩文为样板）：
+`vlt/platform/{win,linux}.py` 各加一张候选/探测表（Windows 列已知字体路径，Linux 用
+`fc-list :lang=<code>`），渲染侧在 `vlt/output/overlay.py` 的 `_SCRIPT_RANGES` 登记该语言占的
+Unicode 块 —— **两处都要改**，只加候选表不会生效；守卫照 `tests/test_thai_font.py` /
+`tests/test_korean_font.py` 的形态写（判据是「渲染目标文字 vs 渲染缺字位，位图相同就是豆腐块」）。
 
 ---
 

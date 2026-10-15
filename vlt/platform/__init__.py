@@ -27,7 +27,8 @@ IS_LINUX = sys.platform.startswith("linux")
 __all__ = [
     "IS_WINDOWS", "IS_LINUX",
     "backend", "device_backend",
-    "child_env", "open_path", "find_cjk_font", "find_thai_font", "detect_ui_language",
+    "child_env", "open_path", "find_cjk_font", "find_thai_font", "find_korean_font",
+    "detect_ui_language",
     # 桌面叠加窗（issue #11）：缺失实现的平台会拿到下面的安全默认值
     "desktop_window_backend", "find_game_window", "window_client_rect", "is_window",
     "set_click_through", "set_tool_window", "set_window_shape",
@@ -261,9 +262,22 @@ def find_thai_font() -> str | None:
     混排时必须按书写系统切 run、各用各的字体画，否则会出豆腐块。
 
     Windows 侧在 `win.py` 的 `_THAI_FONT_CANDIDATES`（LeelawUI.ttf → tahoma.ttf → …），
-    Linux 侧在 `linux.py` 用 `fc-match "Noto Sans Thai:lang=th"` + 已知路径兜底。
+    Linux 侧在 `linux.py` 用 `fc-list :lang=th` + 已知路径兜底。
     """
     return backend().find_thai_font()
+
+
+def find_korean_font() -> str | None:
+    """找一个含韩文字形的字体文件路径；找不到返回 None（由调用方回落）。
+
+    与 `find_cjk_font()` / `find_thai_font()` 是**三条独立**的探测：CJK 字体不一定含韩文字形
+    （Windows 的默认 CJK 字体 msyh.ttc 实测**不含** → 韩文全是方框，用户报过的现象），
+    韩文字体（Malgun Gothic 等）不含中日文字形 —— 混排时必须按书写系统切 run、各用各的字体画。
+
+    Windows 侧在 `win.py` 的 `_KOREAN_FONT_CANDIDATES`（malgun.ttf → gulim.ttc → …），
+    Linux 侧在 `linux.py` 用 `fc-list :lang=ko` + 已知路径兜底。
+    """
+    return backend().find_korean_font()
 
 
 def detect_ui_language() -> str:

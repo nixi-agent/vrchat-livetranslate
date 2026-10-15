@@ -471,6 +471,64 @@ def find_thai_font() -> str | None:
     return None
 
 
+# 韩文字体兜底路径（fc-list 找不到时用）。
+#
+# ⚠️ **不能复用 CJK 字体**：与泰文同因（Windows 侧实测 msyh.ttc 渲染 `안녕하세요`
+# 就是豆腐块）。这里要注意一点**平台差异**：Linux 上 `find_cjk_font()` 常见的落点是
+# Noto Sans CJK（**pan-CJK 族，含韩文音节**），所以韩文在不少 Linux 机器上本来就画得出来；
+# 但那只保证「恰好拿到 Noto CJK」，换成别的中日韩字体（如文泉驿 / 思源简中单字重）
+# 就未必有韩文字形 —— 所以仍走这条独立探测，**以 `fc-list :lang=ko` 为准**。
+#
+# 常见 Linux 韩文字体包：
+#   * `fonts-noto-cjk` / `noto-fonts-cjk` → NotoSansCJK-Regular.ttc（含韩文）
+#   * `fonts-noto-core` → NotoSansKR-Regular.otf
+#   * `fonts-unfonts-core` → UnDotum.ttf / UnBatang.ttf（Debian/Ubuntu）
+#   * `fonts-baekmuk` → gulim.ttf / batang.ttf / dotum.ttf
+_KOREAN_FONT_FALLBACKS = (
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/TTF/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto/NotoSansKR-Regular.otf",
+    "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.otf",
+    "/usr/share/fonts/truetype/unfonts-core/UnDotum.ttf",
+    "/usr/share/fonts/truetype/unfonts-core/UnBatang.ttf",
+    "/usr/share/fonts/truetype/baekmuk/gulim.ttf",
+    "/usr/share/fonts/truetype/baekmuk/batang.ttf",
+)
+
+
+def find_korean_font() -> str | None:
+    """用 fontconfig 找一个**确实含韩文字形**的字体；找不到返回 None。
+
+    ⚠️ 判据同泰文：必须是 `fc-list :lang=ko`（只列**覆盖韩文**的字体），**不能只信 `fc-match`**
+    —— `fc-match` 永远会返回一个字体（哪怕它不含韩文字形），于是「拿到路径」≠「能画韩文」
+    → 既不告警、渲染出来还是豆腐块，属于**静默降级**。
+    fc-list 拿不到 → 再走下面的已知路径兜底 → 都没有就返回 None，
+    由调用方（`overlay.resolve_korean_font_path`）打一次性告警后回落 CJK 字体。
+
+    Windows 侧对应的是 `malgun.ttf` / `gulim.ttc`（见 win.py）。
+    """
+    if shutil.which("fc-list"):
+        try:
+            res = subprocess.run(
+                ["fc-list", ":lang=ko", "-f", "%{file}\n"],
+                capture_output=True, timeout=5,
+                env=child_env(),
+            )
+            if res.returncode == 0:
+                for line in res.stdout.decode("utf-8", "replace").splitlines():
+                    cand = line.strip()
+                    cand = re.sub(r":(?:index|face)=\d+$", "", cand)
+                    if cand and Path(cand).exists():
+                        return cand
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    for cand in _KOREAN_FONT_FALLBACKS:
+        if Path(cand).exists():
+            return cand
+    return None
+
+
 # ---------------------------------------------------------------- 界面语言
 
 # 语言代码前缀 → 本项目支持的界面语言。与 win.py 的口径必须一致：

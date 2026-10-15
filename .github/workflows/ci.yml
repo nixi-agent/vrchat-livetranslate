@@ -150,10 +150,14 @@ jobs:
           # xdotool / imagemagick / picom —— X11 原生叠加窗测试（真指针 / 截图 / 合成）
           # fonts-thai-tlwg —— 泰语用例需要「含泰文字形的字体」；CJK 字体（fonts-noto-cjk）
           #                    不含泰文，缺了它 tests/test_thai_font.py 只能整组跳过
+          # fonts-unfonts-core —— 韩语用例需要「含韩文字形的字体」。⚠️ 这里刻意装一份**韩文专用**
+          #                    字体：fonts-noto-cjk 是 pan-CJK 族、自带韩文，只装它的话
+          #                    「韩文换了字体」这件事在 Linux 上不可观测（test_korean_font.py
+          #                    会把相关断言判为跳过），装了 un 字体两条口径都能落地。
           # ⚠️ 不装 libportaudio2：2026-10 起 Linux 全程走 PipeWire 的 `pw-*` 子进程，
           #    sounddevice/PortAudio 已是 Windows 独占（见 requirements-linux.txt）。
           sudo apt-get install -y --no-install-recommends \
-            xvfb fonts-noto-cjk fonts-thai-tlwg tk libegl1 libwayland-client0 \
+            xvfb fonts-noto-cjk fonts-thai-tlwg fonts-unfonts-core tk libegl1 libwayland-client0 \
             xdotool imagemagick picom
 
       - name: 安装依赖

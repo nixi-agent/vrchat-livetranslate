@@ -6,29 +6,37 @@
 ## 为什么必须有这个测试
 
 用户 2026-10 报：**韩语译文在手腕屏 / 桌面字幕上显示成一排方框**。
-实测根因与泰文同因：默认 CJK 字体 `C:/Windows/Fonts/msyh.ttc`（微软雅黑）**不含韩文字形** ——
-用 PIL 渲染 `안녕하세요` 得到的位图与渲染「私有区缺字位 U+E000 × 5」的位图
-**逐字节完全相同**（= 豆腐块，本文件把这条判据固化成断言；`out/render_ko_demo.py` 出的
-`panel_ko.png` 就是用户看到的那个样子）。
+实测根因：默认主字体 `C:/Windows/Fonts/msyh.ttc`（微软雅黑）**不含韩文字形** ——
+用 PIL 渲染 `안녕하세요` 得到的位图与渲染「私有区缺字位 U+E000 × 5」的位图**逐字节完全相同**
+（= 豆腐块）。这类 bug 是**静默**的：没有异常、没有告警，界面上什么都对，只有贴图是方块。
+（泰文同因，机制共用，用例分开：见 `tests/test_thai_font.py`。）
 
-而这类 bug 是**静默**的：没有异常、没有告警，界面上什么都对，只有贴图是方块。
-所以必须用位图比对钉住，光靠「跑一遍不崩」根本发现不了。
-（泰文走的是同一套「按书写系统切 run、各用各的字体」的机制，由 `tests/test_thai_font.py` 钉；
-两个文件共用机制、不共用用例。）
+## ★ 决定「换不换字体」的是**字形覆盖**，不是「书写系统」（评审 2026-10-15 纠正）
 
-## ⚠️ 平台差异决定了本文件的判据必须**条件化**
+* 主字体**画得出**这个书写系统 → **不换**。Linux 上主字体常见落点是 Noto Sans CJK 这类 pan-CJK 族
+  （自带韩文）：按书写系统无脑换只会换成同族另一个字重 —— 实测纯白像素 +37%，
+  等于在本来没毛病的机器上把韩文**变粗一档**（假阳性）。
+* 主字体**画不出**（Windows/msyh 的现场）→ 才去找专用字体，且那份要**打开 + 覆盖**双校验。
 
-* **Windows**：CJK 字体 = msyh.ttc，**不含韩文** → 缺韩文字体就是一排方框（本次修复的现场）；
-* **Linux**：`find_cjk_font()` 常见落点是 Noto Sans CJK（**pan-CJK 族，含韩文**），
-  于是「解析出的韩文字体」可能**就是同一份文件** —— 此时「换了字体」这件事在本机
-  **不可观测**，相关断言会**明确跳过并打印原因**（口径同 `tests/test_wayland_window.py`
-  缺 sway 时），而不是判红。真正要钉死的是「韩文落在韩文格、别蹭主字体」这条接线。
+所以本文件**不按「本机是哪种机器」跳过**，而是把两种决策都用打桩测出来
+（`test_no_switch_when_main_font_covers` / `test_switch_when_main_font_lacks`），
+外加一条按**本机真实事实**（`font_covers`，不是「字体路径是否相同」）分派的行为断言 ——
+「路径相等」曾经被当成跳过判据，结果在 Noto CJK 的 Regular vs Medium 上判成「不是同一份字体」
+而硬红（评审实测），这条路别再走。
+
+## 判据为什么可信
+
+`test_tofu_probe_has_teeth` 先证明**判据本身有分辨力**（主字体渲染韩文必须真的得到豆腐块），
+`test_coverage_probe_matches_independent_criterion` 再把 `font_covers()` 与「独立复算的豆腐块口径」
+双向对齐 —— 否则「不是豆腐块」那些断言可能全是空转。
+本文件**不复用**被测模块的 `_script_of` / `_split_script_runs` 做判据（实现一坏判据跟着坏）。
 """
 from __future__ import annotations
 
 import contextlib
 import io
 import sys
+import unicodedata
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -43,6 +51,7 @@ from vlt.output.overlay import (                    # noqa: E402
     OverlayConfig,
     _draw_line,
     _measure_line,
+    font_covers,
     load_script_fonts,
     render_conversation,
     render_panel,
@@ -68,12 +77,57 @@ RIGHT_ANCHOR_X = CANVAS[0] - 100     # 右对齐用例的锚点（留出整行�
 INK_TOLERANCE_PX = 3                 # run-aware 绘制的最右墨迹与测量值的实测差在 ±1px 内
 
 
-# ---------------------------------------------------------------- 小工具（判据独立于实现）
+# ---------------------------------------------------------------- 环境事实（**按覆盖判，不按路径判**）
+
+CJK_FONT_PATH: str | None = resolve_font_path("")
+KO_FONT_PATH: str | None = resolve_korean_font_path("")
+THAI_FONT_PATH: str | None = overlay.resolve_thai_font_path("")
+
+# 本机主字体到底能不能画韩文 —— 这是决定「该不该换字体」的**唯一**环境事实。
+MAIN_COVERS_KO: bool = font_covers("hangul", CJK_FONT_PATH)
+
+# 主字体与韩文字体是不是**同一份文件**（同文件 + 同字号 ⇒ 位图必然逐字节相同）。
+# ⚠️ 只用来说明「拿它当对照物没有分辨力」，**不用来跳过整组用例**（评审踩过的坑：
+#    同族不同字重的两份文件路径不同、量宽却可能完全相同 → 拿路径当判据会误红）。
+SAME_FONT_FILE: bool = bool(KO_FONT_PATH and CJK_FONT_PATH
+                           and Path(KO_FONT_PATH) == Path(CJK_FONT_PATH))
+
+_SKIPPED: list[str] = []
+_TYPE_WHY = ("本机没有含韩文字形的专用字体（装了韩文字体后会自动跑；"
+             "Windows 自带 malgun.ttf，Linux 见 docs/GUIDE.linux.md 的韩语一节）")
+_SAME_WHY = "主字体与韩文字体是同一份文件（它当对照物必然位图相同，这一半没有分辨力）"
+
+
+def _skip(name: str, why: str = "") -> None:
+    _SKIPPED.append(name)
+    print(f"  ⏭ 跳过 {name}：{why or _TYPE_WHY}")
+
+
+def _no_ko_font() -> bool:
+    """True = 本机没有含韩文字形的**专用**字体，依赖它的用例应跳过。"""
+    return not KO_FONT_PATH
+
+
+def _fonts_at(size: int) -> tuple[ImageFont.FreeTypeFont, ImageFont.FreeTypeFont]:
+    """(主字体, 韩文专用字体) @ 指定字号，都走平台门面解析 —— 不写死任何平台路径。"""
+    assert CJK_FONT_PATH, "平台层没能解析出主字体，后续判据无从谈起"
+    assert KO_FONT_PATH, (f"平台层没能解析出韩文字体"
+                          f"（find_korean_font()={platform_mod.find_korean_font()!r}）"
+                          " —— 韩语会渲染成豆腐块")
+    return (ImageFont.truetype(CJK_FONT_PATH, size),
+            ImageFont.truetype(KO_FONT_PATH, size))
+
+
+def _fonts() -> tuple[ImageFont.FreeTypeFont, ImageFont.FreeTypeFont]:
+    return _fonts_at(FONT_SIZE)
 
 
 def _korean_only(font: ImageFont.FreeTypeFont) -> dict[str, ImageFont.FreeTypeFont]:
     """「只带韩文那一格」的专用字体字典（生产入口是 `load_script_fonts(cfg, size)`）。"""
     return {"hangul": font}
+
+
+# ---------------------------------------------------------------- 小工具（判据独立于实现）
 
 
 def _is_hangul_char(ch: str) -> bool:
@@ -111,51 +165,39 @@ def _is_tofu(font: ImageFont.FreeTypeFont, text: str) -> bool:
     return ref.tobytes() == got.tobytes()
 
 
+def _has_ink(font: ImageFont.FreeTypeFont, text: str) -> bool:
+    return bool(_render(lambda d: d.text(ORIGIN, text, font=font, fill=255)).getbbox())
+
+
 def _ink_bbox(img: Image.Image) -> tuple[int, int]:
     """相对 ORIGIN 的 (最左, 最右) 墨迹位置（px）。空图返回 (0, 0)。"""
     bb = img.getbbox()
     return (bb[0] - ORIGIN[0], bb[2] - ORIGIN[0]) if bb else (0, 0)
 
 
-# 本机解析出来的三份字体：主字体（CJK）/ 韩文 / 泰文。
-CJK_FONT_PATH: str | None = resolve_font_path("")
-KO_FONT_PATH: str | None = resolve_korean_font_path("")
-THAI_FONT_PATH: str | None = overlay.resolve_thai_font_path("")
+def _expected_coverage(font_path: str | None, samples: tuple[str, ...]) -> bool:
+    """**独立复算**「这份字体覆盖不覆盖这些样本」（不复用 `overlay._probe_coverage`）。
 
-# 韩文字体与主字体是**同一份文件**（Linux 上 Noto Sans CJK 既有中日韩、也有韩文）→
-# 「韩文换了字体」在本机不可观测。相关断言跳过并打印原因，不判红。
-KO_IS_CJK = bool(KO_FONT_PATH and CJK_FONT_PATH
-                 and Path(KO_FONT_PATH) == Path(CJK_FONT_PATH))
-
-_SKIPPED: list[str] = []
-_FONT_WHY = ("本机没有含韩文字形的字体（装了韩文字体后会自动跑；"
-             "Windows 自带 malgun.ttf，Linux 见 docs/GUIDE.linux.md 的韩语一节）")
-_SAME_FONT_WHY = ("本机解析出的韩文字体与主字体是同一份文件"
-                  "（Noto Sans CJK 这类 pan-CJK 字体自带韩文）→「换了字体」不可观测")
-
-
-def _skip(name: str, why: str = "") -> None:
-    _SKIPPED.append(name)
-    print(f"  ⏭ 跳过 {name}：{why or _FONT_WHY}")
-
-
-def _no_ko_font() -> bool:
-    """True = 本机没有含韩文字形的字体，依赖它的用例应跳过。"""
-    return not KO_FONT_PATH
+    口径与实现同源但独立写：整串 != 缺字位整串；且非组合符号的单字必须有墨迹。
+    """
+    if not font_path or not Path(font_path).exists():
+        return False
+    try:
+        font = ImageFont.truetype(font_path, 32)
+    except Exception:  # noqa: BLE001
+        return False
+    for sample in samples:
+        if _is_tofu(font, sample):
+            return False
+        for ch in sample:
+            if unicodedata.category(ch).startswith("M"):
+                continue
+            if not _has_ink(font, ch):
+                return False
+    return True
 
 
-def _fonts_at(size: int) -> tuple[ImageFont.FreeTypeFont, ImageFont.FreeTypeFont]:
-    """(主字体, 韩文字体) @ 指定字号，都走平台门面解析 —— 不写死任何平台路径。"""
-    assert CJK_FONT_PATH, "平台层没能解析出主字体，后续判据无从谈起"
-    assert KO_FONT_PATH, (f"平台层没能解析出韩文字体"
-                          f"（find_korean_font()={platform_mod.find_korean_font()!r}）"
-                          " —— 韩语会渲染成豆腐块")
-    return (ImageFont.truetype(CJK_FONT_PATH, size),
-            ImageFont.truetype(KO_FONT_PATH, size))
-
-
-def _fonts() -> tuple[ImageFont.FreeTypeFont, ImageFont.FreeTypeFont]:
-    return _fonts_at(FONT_SIZE)
+# ---------------------------------------------------------------- 打桩工具
 
 
 @contextlib.contextmanager
@@ -163,14 +205,14 @@ def _stub_script_fonts(values: dict[str, str | None]):
     """让指定书写系统解析到固定值（None = 本机没有覆盖该书写系统的字体）。
 
     ⚠️ 打桩的是**通用入口** `overlay.resolve_script_font_path`（`resolve_korean_font_path`
-    只是它的薄包装）—— 打桩包装函数在实现搬家时会静默失效；同时清缓存，
-    否则上一次的真实结果会把打桩盖住。
+    只是它的薄包装）—— 打桩包装函数在实现搬家时会静默失效；同时清缓存，否则上一次的真实
+    结果会把打桩盖住。
     """
     cache = dict(overlay._script_font_cache)
     orig = overlay.resolve_script_font_path
     overlay._script_font_cache.clear()
 
-    def _fake(script: str, configured: str) -> str | None:
+    def _fake(script: str, configured: str = "") -> str | None:
         if script in values:
             return values[script]
         return orig(script, configured)
@@ -182,6 +224,47 @@ def _stub_script_fonts(values: dict[str, str | None]):
         overlay.resolve_script_font_path = orig    # type: ignore[assignment]
         overlay._script_font_cache.clear()
         overlay._script_font_cache.update(cache)
+
+
+@contextlib.contextmanager
+def _stub_coverage(values: dict[str, bool]):
+    """打桩「**主字体**覆盖不覆盖某书写系统」（= 强制造出 pan-CJK 主机 / Windows 两种场景）。
+
+    ⚠️ 只打桩 `main_font_covers`（决策点），**不要**打桩 `font_covers`：后者也负责
+    「候选字体的覆盖校验」，一起打桩会让真能用的专用字体被误判成不合格 →
+    「主字体画不出却不换字体」的假红（实测踩过）。
+    """
+    orig = overlay.main_font_covers
+
+    def _fake(script: str, main_path: str | None = None) -> bool:
+        if script in values:
+            return values[script]
+        return orig(script, main_path)
+
+    overlay.main_font_covers = _fake                # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        overlay.main_font_covers = orig             # type: ignore[assignment]
+
+
+@contextlib.contextmanager
+def _stub_main_font(path: str | None):
+    """打桩「主字体解析结果」（不动真实缓存）。"""
+    orig = overlay.resolve_font_path
+    overlay.resolve_font_path = lambda _configured: path     # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        overlay.resolve_font_path = orig                     # type: ignore[assignment]
+
+
+def _clear_warned(script: str) -> set[str]:
+    """清掉该书写系统的留痕标志（返回快照，调用方负责还原）。"""
+    saved = set(overlay._script_font_warned)
+    overlay._script_font_warned.clear()
+    overlay._script_font_warned.update(k for k in saved if not k.startswith(f"{script}:"))
+    return saved
 
 
 # 夹具自检：谁改了夹具、把拉丁字母或空格塞进「纯韩文」样本，这里立刻红，
@@ -200,34 +283,59 @@ assert _hangul_chars(KO_WITH_LATIN) and not all(_is_hangul_char(c) for c in KO_W
 
 
 def test_tofu_probe_has_teeth() -> None:
-    """★ 元测试：本机解析出的 **主字体渲染韩文必须是豆腐块**（Windows/msyh 就是本 bug 的现场）。
+    """★ 元测试：本机主字体渲染韩文 → 与 `font_covers` 的结论必须一致。
 
-    这条不成立的话，下面「不是豆腐块」的断言都是空转。
-    主字体**自带**韩文字形（Linux 的 Noto Sans CJK）属于环境特例：不算失败，但必须显式说出来 ——
-    那种机器上本来就没这个 bug，真正的守卫是「韩文落韩文格」那条接线断言。
+    Windows/msyh 上主字体就是画不出（本 bug 的现场）→ `font_covers` 必须是 False、
+    渲染必须是豆腐块；pan-CJK 主机（Noto Sans CJK 等）上反过来。两边都是断言，没有「跳过」。
     """
     assert CJK_FONT_PATH, "平台层没解析出主字体"
     cjk = ImageFont.truetype(CJK_FONT_PATH, FONT_SIZE)
-    if not _is_tofu(cjk, KO_WORD):
-        print(f"  ⚠ 本机主字体（{Path(CJK_FONT_PATH).name}）自带韩文字形，"
-              "「豆腐块判据」在本机没有分辨力（环境特例，不判失败）")
-        return
-    assert _is_tofu(cjk, KO_SENTENCE), "换个更长的韩文句子判据就失效了？"
-    if KO_FONT_PATH:
-        ko = ImageFont.truetype(KO_FONT_PATH, FONT_SIZE)
-        assert not _is_tofu(ko, KO_WORD), \
-            f"韩文字体（{Path(KO_FONT_PATH).name}）渲染 {KO_WORD!r} 也是豆腐块 —— 判据认不出对照物"
-    assert not _is_tofu(cjk, CJK_WORD), \
-        f"主字体连 {CJK_WORD!r} 都渲染成豆腐块 —— 参照物选错了，判据不可用"
-    print(f"  ✓ 判据有分辨力：主字体 {Path(CJK_FONT_PATH).name} 渲染 {KO_WORD!r} "
-          f"== 渲染 {TOFU!r}×{len(KO_WORD)}（中文非豆腐块；韩文字体在场时结果相反）")
+    tofu = _is_tofu(cjk, KO_WORD)
+    assert tofu == (not MAIN_COVERS_KO), \
+        (f"主字体渲染 {KO_WORD!r} 是不是豆腐块（{tofu}）与 font_covers 的结论"
+         f"（覆盖={MAIN_COVERS_KO}）不一致 —— 覆盖判据与渲染判据打架了")
+    if tofu:
+        assert _is_tofu(cjk, KO_SENTENCE), "换个更长的韩文句子判据就失效了？"
+        if KO_FONT_PATH:
+            ko = ImageFont.truetype(KO_FONT_PATH, FONT_SIZE)
+            assert not _is_tofu(ko, KO_WORD), \
+                f"韩文字体（{Path(KO_FONT_PATH).name}）渲染 {KO_WORD!r} 也是豆腐块 —— 判据认不出对照物"
+        assert not _is_tofu(cjk, CJK_WORD), \
+            f"主字体连 {CJK_WORD!r} 都渲染成豆腐块 —— 参照物选错了，判据不可用"
+        print(f"  ✓ 判据有分辨力：主字体 {Path(CJK_FONT_PATH).name} 渲染 {KO_WORD!r} "
+              f"== 渲染 {TOFU!r}×{len(KO_WORD)}（= 缺字形，与 font_covers=False 一致）")
+    else:
+        print(f"  ✓ 本机主字体（{Path(CJK_FONT_PATH).name}）自带韩文字形 → 与 "
+              f"font_covers=True 一致（这类机器本来就该**不换**字体，见 ④）")
 
 
-# ---------------------------------------------------------------- ② 韩文字体真的有韩文字形
+def test_coverage_probe_matches_independent_criterion() -> None:
+    """★ `font_covers()` 与**独立复算**的豆腐块口径双向对齐（不是自说自话）。
+
+    对主字体、韩文专用字体（若有）各比一次：`font_covers(script, path)` 必须等于本条自己算的
+    「整串非豆腐块 且 非组合符号单字都有墨迹」。判据不一致时先修判据，别改期望值。
+    """
+    checked = 0
+    for label, path in (("主字体", CJK_FONT_PATH), ("韩文专用字体", KO_FONT_PATH)):
+        if not path:
+            continue
+        want = _expected_coverage(path, overlay._SCRIPT_SAMPLES["hangul"])
+        got = font_covers("hangul", path)
+        assert got == want, \
+            (f"{label}（{Path(path).name}）的覆盖结论与独立复算不一致："
+             f"font_covers={got}，独立复算={want}")
+        checked += 1
+    assert checked, "一份字体都没有？后续判据无从谈起"
+    # 反面：路径为空 / 不存在 → 一律 False（调用方据此回落）
+    assert font_covers("hangul", None) is False, "字体路径为空时必须判「不覆盖」"
+    print(f"  ✓ font_covers 与独立复算一致（比了 {checked} 份字体）；路径为空判 False")
+
+
+# ---------------------------------------------------------------- ② 韩文专用字体真的有韩文字形
 
 
 def test_korean_font_renders_real_glyphs() -> None:
-    """★ 解析出来的韩文字体渲染韩文，位图**不等于**缺字位位图（整词 + 逐字两种口径）。"""
+    """★ 本机解析出来的韩文专用字体渲染韩文，位图**不等于**缺字位位图（整词 + 逐字两种口径）。"""
     if _no_ko_font():
         return _skip("test_korean_font_renders_real_glyphs")
     _, ko = _fonts()
@@ -243,7 +351,7 @@ def test_korean_font_renders_real_glyphs() -> None:
 
 
 def test_korean_font_resolved_through_platform_facade() -> None:
-    """韩文字体必须经 `vlt.platform.find_korean_font()` 门面解析，且落在真实存在的文件上。
+    """韩文专用字体必须经 `vlt.platform.find_korean_font()` 门面解析，且落在真实存在的文件上。
 
     顺带钉住降级留痕（禁静默）：门面返回 None 时 `resolve_korean_font_path` 也要返回 None
     并**打一行含「韩文」的告警**（只打一次），渲染不许崩。
@@ -258,14 +366,13 @@ def test_korean_font_resolved_through_platform_facade() -> None:
         assert Path(path).name not in src, \
             f"共享模块 overlay.py 里出现了具体韩文字体文件名 {Path(path).name!r}（平台路径必须留在 vlt/platform/）"
     else:
-        print("  ⏭ 本机没有韩文字体 → 跳过「路径有效 / 与门面一致 / 不在共享模块里」三条；"
+        print("  ⏭ 本机没有韩文专用字体 → 跳过「路径有效 / 与门面一致 / 不在共享模块里」三条；"
               "降级留痕那半条照跑")
 
-    saved_warned = set(overlay._script_font_warned)
+    saved_warned = _clear_warned("hangul")
     orig_facade = platform_mod.find_korean_font
     try:
         overlay._script_font_cache.clear()
-        overlay._script_font_warned.discard("hangul")
         platform_mod.find_korean_font = lambda: None      # type: ignore[assignment]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -290,42 +397,176 @@ def test_korean_font_resolved_through_platform_facade() -> None:
         overlay._script_font_warned.update(saved_warned)
     assert resolve_korean_font_path("") == path, "打桩复原后解析结果应回到真实字体"
     if path:
-        print(f"  ✓ 韩文字体经平台门面解析（{Path(path).name}），overlay.py 不含该文件名；"
+        print(f"  ✓ 韩文专用字体经平台门面解析（{Path(path).name}），overlay.py 不含该文件名；"
               "门面返回 None 时降级留痕（只一次、写明韩文）且渲染不崩")
     else:
-        print("  ✓ 本机无韩文字体：门面返回 None 时降级留痕（只一次、写明韩文）且渲染不崩"
+        print("  ✓ 本机无韩文专用字体：门面返回 None 时降级留痕（只一次、写明韩文）且渲染不崩"
               "（解析路径那一半已跳过）")
 
 
-# ---------------------------------------------------------------- ③ 接线：韩文必须落「韩文格」
+# ---------------------------------------------------------------- ③ 注册表与接线（环境无关）
 
 
-def test_every_script_has_a_platform_finder() -> None:
-    """★ 接线（**环境无关**）：`_SCRIPT_FINDERS` 里每个书写系统，平台两端都必须真有实现。
+def test_script_registry_is_consistent() -> None:
+    """★ 书写系统登记表**一处定义、多处派生**，且派生结果与平台层对得上（评审要求）。
 
-    缺了它 = 那门语言永远走降级分支（方框 + 一行告警），而「没接线」这件事在**装了字体的
-    开发机**上完全看不见（解析成功、位图正确、用例全绿）—— 所以本条把注册表与平台层钉在一起：
-    ⚠️ 它也是「只加了 `_SCRIPT_RANGES` 却忘了在 `vlt/platform/{win,linux}.py` 与门面里补
-    `find_<script>_font`」这类漏接线的唯一守卫。
+    教训（评审实测）：三张表各自独立时，「只加 `_SCRIPT_RANGES` 不加 `_SCRIPT_FINDERS`」
+    会让那一门永远静默回落主字体，而原来的守卫只遍历 `_SCRIPT_FINDERS` → 全绿。
+    现在表是派生的，本条把「三张派生表两两相等」与「平台两端真有实现」一起钉住；
+    另外要求每门的**覆盖探测样本落在这门登记的 Unicode 块里**（否则探的是别的书写系统）。
     """
-    assert overlay._SCRIPT_FINDERS, "书写系统注册表是空的？"
+    ids = set(overlay._SCRIPT_IDS)
+    assert ids, "书写系统登记表是空的？"
+    assert {r[2] for r in overlay._SCRIPT_RANGES} == ids, \
+        "`_SCRIPT_RANGES` 里的书写系统与 `_SCRIPTS` 登记不一致（漏登记 = 该门永远不切 run）"
+    assert set(overlay._SCRIPT_FINDERS) == ids, "`_SCRIPT_FINDERS` 与登记表不一致"
+    assert set(overlay._SCRIPT_NAMES) == ids, "`_SCRIPT_NAMES` 与登记表不一致（留痕文案会退化成脚本 id）"
+    assert set(overlay._SCRIPT_SAMPLES) == ids, "`_SCRIPT_SAMPLES` 与登记表不一致"
+    for script, samples in overlay._SCRIPT_SAMPLES.items():
+        ranges = [(lo, hi) for lo, hi, s in overlay._SCRIPT_RANGES if s == script]
+        assert ranges and samples, f"{script} 没有区间或没有样本"
+        for sample in samples:
+            for ch in sample:
+                assert any(lo <= ord(ch) <= hi for lo, hi in ranges), \
+                    (f"{script} 的覆盖样本 {ch!r}（U+{ord(ch):04X}）不在它登记的 Unicode 块里 —— "
+                     "探测的是别的书写系统")
+    backend_mod = platform_mod.backend()
     for script, finder in overlay._SCRIPT_FINDERS.items():
-        fn = getattr(platform_mod, finder, None)
-        assert callable(fn), \
+        assert callable(getattr(platform_mod, finder, None)), \
             f"{script} 的门面函数 vlt.platform.{finder} 不存在（平台层漏接线 → 该语言永远方框）"
-        backend = platform_mod.backend()
-        assert callable(getattr(backend, finder, None)), \
-            f"{type(backend).__name__} 里没有 {finder}（只有门面壳子，没接平台实现）"
-    print(f"  ✓ 注册表 {sorted(overlay._SCRIPT_FINDERS)} 的探测函数在门面与 "
-          f"{type(platform_mod.backend()).__name__} 里都真实存在")
+        assert callable(getattr(backend_mod, finder, None)), \
+            f"{type(backend_mod).__name__} 里没有 {finder}（只有门面壳子，没接平台实现）"
+    print(f"  ✓ 登记表 {sorted(ids)}：三张派生表一致、样本落在登记块内、"
+          f"探测函数在门面与 {type(backend_mod).__name__} 里都真实存在")
+
+
+# ---------------------------------------------------------------- ④ 覆盖驱动：该不该换字体
+
+
+def test_no_switch_when_main_font_covers() -> None:
+    """★ **主字体画得出 → 一个字都不许换**（pan-CJK 主机；评审实测的假阳性就在这里）。
+
+    做法：打桩「主字体覆盖韩文」，**解析入口保持真实实现** —— 若代码不看覆盖就去解析，
+    本机真实的韩文字体（malgun 等）会被装进字典，本条立刻红。
+    另一半：位图必须与「一个专用字体都没有」时**逐字节相同**（= 那种机器上的行为与改动前一致）。
+    """
+    cfg = OverlayConfig()
+    with _stub_coverage({"hangul": True}):
+        fonts = load_script_fonts(cfg, FONT_SIZE)
+        assert "hangul" not in fonts, \
+            ("主字体覆盖韩文却仍然换了字体（就是评审实测的「韩文被变粗一档」）："
+             f"{Path(fonts['hangul'].path).name}")
+        img_main = render_panel(KO_WORD, KO_SENTENCE, cfg)
+    with _stub_script_fonts({s: None for s in overlay._SCRIPT_IDS}):
+        img_base = render_panel(KO_WORD, KO_SENTENCE, cfg)
+    assert img_main.tobytes() == img_base.tobytes(), \
+        "覆盖为真时面板仍与「无专用字体」时不同 —— 说明有字体被偷偷用上了"
+    d_probe = ImageDraw.Draw(_blank())
+    cjk = ImageFont.truetype(CJK_FONT_PATH, FONT_SIZE)
+    got_w = _measure_line(d_probe, KO_WORD, cjk, {})
+    want_w = d_probe.textlength(KO_WORD, font=cjk)
+    assert abs(got_w - want_w) < 0.01, "测量被换字体的逻辑带偏了"
+    print(f"  ✓ 主字体覆盖韩文时：不产生韩文格（字典={sorted(fonts) or '空'}），"
+          f"面板与「无专用字体」逐字节相同（{len(img_main.tobytes())} 字节），"
+          f"测量 {want_w:.1f}px == 单字体口径")
+
+
+def test_switch_when_main_font_lacks() -> None:
+    """★ **主字体画不出 → 必须换**（Windows/msyh 的现场）：换出来的字真不是方框。
+
+    做法：打桩「主字体不覆盖韩文」+ 真实解析 → 韩文格必须在字典里，且面板与
+    「一个专用字体都没有」时不同（= 真的用上了）。
+    """
+    if _no_ko_font():
+        return _skip("test_switch_when_main_font_lacks", _TYPE_WHY + "（这条要一份真能画韩文的字体）")
+    cfg = OverlayConfig()
+    with _stub_coverage({"hangul": False}):
+        fonts = load_script_fonts(cfg, FONT_SIZE)
+        assert "hangul" in fonts, \
+            "主字体画不出韩文却没有换字体（= 用户看到的方框没被修）"
+        img_switched = render_panel(KO_WORD, KO_SENTENCE, cfg)
+    with _stub_script_fonts({s: None for s in overlay._SCRIPT_IDS}):
+        img_base = render_panel(KO_WORD, KO_SENTENCE, cfg)
+    if SAME_FONT_FILE:
+        print(f"  ⏭ 位图那半条跳过：{_SAME_WHY}")
+    else:
+        assert img_switched.tobytes() != img_base.tobytes(), \
+            "换了字体，但面板位图与「一个专用字体都没有」完全相同 —— 韩文格没被用上"
+    ko = ImageFont.truetype(KO_FONT_PATH, FONT_SIZE)
+    assert not _is_tofu(ko, KO_WORD), f"换上的字体渲染 {KO_WORD!r} 仍是方框"
+    print(f"  ✓ 主字体画不出韩文时：韩文格 = {Path(fonts['hangul'].path).name}，"
+          "面板与无专用字体时不同（真的换了）")
+
+
+def test_uncovered_candidate_is_rejected_with_trace() -> None:
+    """★ 探测返回的字体**不真覆盖**该书写系统时：必须拒绝 + 留痕（禁静默降级）。
+
+    为什么单列（评审 2026-10-15 的 P2-2）：平台层的候选表只能保证「能打开」，不保证「能画这门语言」
+    （`fc-list` 的第一行只是扫描顺序）。上层若把不合格的候选直接用上，症状就是「一排豆腐块 +
+    一行日志都没有」。本条用**本机确实不含韩文字形**的字体当不合格候选（临时挑，不写死平台路径），
+    断言 `resolve_korean_font_path()` 返回 None 且输出里点明了原因、且只打一次。
+    """
+    bad = next((p for p in (THAI_FONT_PATH, CJK_FONT_PATH)
+                if p and not font_covers("hangul", p)), None)
+    if bad is None:
+        return _skip("test_uncovered_candidate_is_rejected_with_trace",
+                     "本机挑不出一份「存在但不含韩文字形」的字体（该分支无从构造）")
+    saved_warned = _clear_warned("hangul")
+    orig_facade = platform_mod.find_korean_font
+    try:
+        overlay._script_font_cache.clear()
+        platform_mod.find_korean_font = lambda: bad       # type: ignore[assignment]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            got = resolve_korean_font_path("")
+        assert got is None, \
+            f"不合格的候选（{Path(bad).name} 不含韩文字形）被当成可用字体了：{got!r}"
+        out = buf.getvalue()
+        assert "并不真覆盖" in out and "韩文" in out, \
+            f"拒绝不合格候选时必须留痕（禁静默降级），实际输出：{out!r}"
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            resolve_korean_font_path("")
+        assert "并不真覆盖" not in buf2.getvalue(), "同一条告警打了第二次（刷屏）"
+    finally:
+        platform_mod.find_korean_font = orig_facade       # type: ignore[assignment]
+        overlay._script_font_cache.clear()
+        overlay._script_font_warned.clear()
+        overlay._script_font_warned.update(saved_warned)
+    print(f"  ✓ 不合格候选（{Path(bad).name}）被拒绝并留痕（只一次）→ 返回 None（回落主字体）")
+
+
+def test_platform_skips_unopenable_candidates() -> None:
+    """★ 平台层候选表要**逐份打开校验**：打不开的候选跳过，别把坏路径交给上层。
+
+    评审（2026-10-15）实测过一条洞：`fc-list` 的首行只是扫描顺序，可能是 Pillow 打不开的位图
+    字体；平台层若无脑返回它，上层只会「静默回落主字体 = 一排豆腐块」。
+    本条用**临时文件**造场景（环境无关）：一个存在但不是字体的文件排前面 → 必须跳到真字体；
+    只有坏候选 → 必须返回 None。
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        junk = Path(td) / "not-a-font.bin"
+        junk.write_bytes(b"this is definitely not a font file")
+        assert junk.exists(), "临时文件没建出来"
+        assert platform_mod.first_openable_font([str(junk)]) is None, \
+            "只有打不开的候选时应当返回 None（让上层降级留痕）"
+        assert platform_mod.first_openable_font([str(junk), str(Path(td) / "missing.ttf")]) is None, \
+            "全是坏候选时应当返回 None"
+        if CJK_FONT_PATH:
+            got = platform_mod.first_openable_font([str(junk), CJK_FONT_PATH])
+            assert got == CJK_FONT_PATH, \
+                f"应当跳过打不开的候选取到真字体，实际 {got!r}"
+        assert platform_mod.first_openable_font([]) is None, "空候选表应当返回 None"
+        assert platform_mod.first_openable_font(["", "   "]) is None, "空路径候选应当被跳过"
+    print("  ✓ 平台层逐份打开校验：坏候选 / 空候选被跳过，只有坏候选时返回 None")
 
 
 def test_hangul_runs_go_to_the_hangul_slot() -> None:
     """★ 接线判据（**不依赖本机有没有韩文字体**）：韩文字符落 `hangul` 槽，别的字符不许蹭。
 
     做法：给 `hangul` 槽塞一个**字号明显不同**的字体 —— 宽度就能分辨走的是哪一格。
-    （生产入口 `load_script_fonts()` 解析出来的韩文字体在 Linux 上可能与主字体同文件，
-    那时位图口径不可观测，这条宽度口径仍有效。）
     """
     assert CJK_FONT_PATH, "平台层没解析出主字体"
     cjk = ImageFont.truetype(CJK_FONT_PATH, FONT_SIZE)
@@ -361,46 +602,7 @@ def test_hangul_runs_go_to_the_hangul_slot() -> None:
     got = _measure_line(d, CJK_WORD + "x", cjk, {"hangul": big})
     assert abs(got - d.textlength(CJK_WORD + "x", font=cjk)) < 0.01, \
         "主字体那一段被其它书写系统的格抢走了"
-    print(f"  ✓ 韩文落韩文格（{KO_WORD!r} → 该格字体；中文/拉丁仍走主字体；混排两段各按各的量）")
-
-
-def test_production_font_dict_and_panel_path() -> None:
-    """★ 生产入口：`load_script_fonts()` 必须把**已解析到的**书写系统真的装进字典，
-    且 `render_panel()` 这条用户实际走的路必须用上它。
-
-    为什么单列：前面那些用例大多**手搭** `{"hangul": ...}` 字典 —— 那证明得了「切 run + 绘制」，
-    证明不了「render_panel → load_script_fonts 这条路拿到了韩文格」。
-    （实测：把 `load_script_fonts` 的循环写成只遍历泰文，手搭字典的用例全绿。）
-    """
-    cfg = OverlayConfig()
-    fonts = load_script_fonts(cfg, FONT_SIZE)
-    for script in overlay._SCRIPT_FINDERS:
-        path = overlay.resolve_script_font_path(script, cfg.font)
-        if path:
-            assert script in fonts, \
-                f"{script} 已解析到 {Path(path).name}，但 load_script_fonts() 的字典里没有它"
-        else:
-            assert script not in fonts, f"{script} 没解析到字体却出现在字典里：{fonts[script]!r}"
-
-    if _no_ko_font():
-        print(f"  ⏭ 生产路径位图那半条跳过：{_FONT_WHY}（字典一致性那半条照跑）")
-        return
-    assert "hangul" in fonts, "生产字典里没有韩文格（韩文字体已解析到）"
-    if KO_IS_CJK:
-        print(f"  ⏭ 生产路径位图那半条跳过：{_SAME_FONT_WHY}")
-        return
-    ok = render_panel(KO_WORD, "", cfg)
-    with _stub_script_fonts({"hangul": None}):
-        degraded = render_panel(KO_WORD, "", cfg)
-    assert ok.tobytes() != degraded.tobytes(), \
-        "render_panel（生产路径）没用上韩文字体：面板与「韩文格为空」时一模一样"
-    conv = render_conversation([("theirs", "", KO_WORD)], cfg)
-    with _stub_script_fonts({"hangul": None}):
-        conv_degraded = render_conversation([("theirs", "", KO_WORD)], cfg)
-    assert conv.tobytes() != conv_degraded.tobytes(), \
-        "render_conversation（生产路径）没用上韩文字体"
-    print(f"  ✓ 生产入口：load_script_fonts() 的字典含 {sorted(fonts)}，"
-          f"render_panel / render_conversation 的韩文位图与「韩文格为空」时不同")
+    print(f"  ✓ 韩文落韩文格（{KO_WORD!r} 与两档字母；中文/拉丁仍走主字体；混排两段各按各的量）")
 
 
 def _runs_by_fixture(text: str) -> list[str]:
@@ -414,7 +616,7 @@ def _runs_by_fixture(text: str) -> list[str]:
     return runs
 
 
-# ---------------------------------------------------------------- ④ 主字体渲染行为不变
+# ---------------------------------------------------------------- ⑤ 主字体渲染行为不变
 
 
 def test_cjk_font_not_swapped_for_korean() -> None:
@@ -424,9 +626,8 @@ def test_cjk_font_not_swapped_for_korean() -> None:
     ② 非韩文文本走 `_draw_line` 与改动前的写法 `d.text(..., font=cjk, anchor="la")`
        逐字节相同 —— 字体字典取**生产口径** `load_script_fonts(cfg, size)`。
 
-    ⚠️ 样本里**不放韩文**：韩文在生产口径下本来就该换字体（那是修复）。
+    ⚠️ 样本里**不放韩文**：韩文在主字体覆盖不了的机器上本来就该换字体（那是修复）。
     """
-    assert CJK_FONT_PATH and getattr(overlay, "resolve_font_path", None)
     assert CJK_FONT_PATH == platform_mod.find_cjk_font(), \
         (f"默认字体被换了：resolve_font_path('')={CJK_FONT_PATH!r} "
          f"find_cjk_font()={platform_mod.find_cjk_font()!r}")
@@ -447,8 +648,11 @@ def test_cjk_font_not_swapped_for_korean() -> None:
 
 
 def test_pure_cjk_panel_bitmap_unchanged() -> None:
-    """★ 端到端：纯中日韩面板在「韩文字体解析成功」与「解析失败(None)」两种情况下
+    """★ 端到端：纯中日韩面板在「韩文格有字体」与「韩文格为空」两种情况下
     位图**逐字节一致** —— 韩语那条腿对不用韩语的用户是零影响的。"""
+    if _no_ko_font():
+        return _skip("test_pure_cjk_panel_bitmap_unchanged",
+                     _TYPE_WHY + "（没有韩文字体时这条恒成立，但也就没有分辨力）")
     cfg = OverlayConfig()
     text, source = CJK_SENTENCE, "こんにちは、ニキシです。"
 
@@ -472,18 +676,16 @@ def test_pure_cjk_panel_bitmap_unchanged() -> None:
           f"与「无韩文字体」时逐字节相同（{cfg.size_px}）")
 
 
-# ---------------------------------------------------------------- ⑤ 中韩混排不出豆腐块
+# ---------------------------------------------------------------- ⑥ 中韩混排不出豆腐块
 
 
 def test_mixed_line_uses_both_fonts() -> None:
     """★ 同一行里既有中文又有韩文：韩文那段必须用韩文字体画，且整行不出豆腐块。
 
     判据（三条互相独立）：
-    ① run-aware 绘制的位图 **≠** 把韩文字体换成主字体（= 修复前的方框效果）的位图；
+    ① run-aware 绘制的位图 **≠** 把韩文格换成主字体（= 修复前的方框效果）的位图；
     ② 混排行里每个韩文码位单独用韩文字体渲染都不是豆腐块；
     ③ 整行墨迹非空，且墨迹宽度与 `_measure_line` 的测量值吻合（测量跟着字体走）。
-
-    ⚠️ 本机韩文字体与主字体同文件时，①③ 不可观测 → 明确跳过（见文件头平台差异一节）。
     """
     if _no_ko_font():
         return _skip("test_mixed_line_uses_both_fonts")
@@ -492,8 +694,8 @@ def test_mixed_line_uses_both_fonts() -> None:
         "用例本身必须同时含中文与韩文"
 
     fixed = _render(lambda d: _draw_line(d, ORIGIN, MIXED_LINE, cjk, _korean_only(ko), fill=255))
-    if KO_IS_CJK:
-        print(f"  ⏭ 跳过「位图≠方框版本」那半条：{_SAME_FONT_WHY}")
+    if SAME_FONT_FILE:
+        print(f"  ⏭ 跳过「位图≠方框版本」那半条：{_SAME_WHY}")
     else:
         before = _render(lambda d: _draw_line(d, ORIGIN, MIXED_LINE, cjk, _korean_only(cjk),
                                               fill=255))
@@ -510,12 +712,11 @@ def test_mixed_line_uses_both_fonts() -> None:
     assert abs(got - want) <= INK_TOLERANCE_PX, \
         f"测量与实际墨迹不符（换行会算错）：测量 {want:.1f}px，实画 {got}px"
     naive = d_probe.textlength(MIXED_LINE, font=cjk)
-    if abs(naive - want) > INK_TOLERANCE_PX:
-        extra = f"（主字体单字体口径 {naive:.0f}px，确有差别）"
-    else:
-        extra = "（本机韩文格与主字体量宽相同，这一条在本机没有分辨力）"
+    note = (f"主字体单字体口径 {naive:.0f}px，差 {abs(naive - want):.0f}px"
+            if abs(naive - want) > INK_TOLERANCE_PX
+            else "（本机两份字体量宽相同，这条差异在本机不可观测）")
     print(f"  ✓ 中韩混排：韩文 {len(_hangul_chars(MIXED_LINE))} 码位全覆盖；"
-          f"测量 {want:.0f}px / 实画 {got}px{extra}")
+          f"测量 {want:.0f}px / 实画 {got}px；{note}")
 
 
 def _hang_allowance(d: ImageDraw.ImageDraw, ln: str,
@@ -532,7 +733,13 @@ def _hang_allowance(d: ImageDraw.ImageDraw, ln: str,
 
 
 def test_mixed_wrap_respects_max_width() -> None:
-    """★ 混排长句折行：**每一行实画出来的墨迹都不许超出 max_w**（量错字体 = 溢出面板）。"""
+    """★ 混排长句折行：**每一行实画出来的墨迹都不许超出 max_w**（量错字体 = 溢出面板）。
+
+    ⚠️ 这里**不断言**「旧口径（一律用主字体量）必然量错」—— 那取决于两份字体的量宽是否相同，
+    在 Noto CJK 的 Regular/Medium 这类同族不同字重的机器上它**成立不了**（评审实测：差 0.0px，
+    直接判红）。改为：断言「run-aware 测量 == 独立按 run 复算」这条**恒真且有意义**的不变量，
+    旧口径的偏差只作汇报。
+    """
     if _no_ko_font():
         return _skip("test_mixed_wrap_respects_max_width")
     cjk, ko = _fonts()
@@ -547,6 +754,11 @@ def test_mixed_wrap_respects_max_width() -> None:
         for ln in lines:
             slack = _hang_allowance(d_probe, ln, cjk, ko)
             m = _measure_line(d_probe, ln, cjk, _korean_only(ko))
+            # 独立复算：按「是不是韩文」分段，各用各的字体量
+            want = sum(d_probe.textlength(run, font=(ko if _is_hangul_char(run[0]) else cjk))
+                       for run in _runs_by_fixture(ln))
+            assert abs(m - want) <= 0.01, \
+                f"max_w={max_w}：run-aware 测量 {m:.1f}px 与独立复算 {want:.1f}px 不符"
             assert m <= max_w + slack + 1, \
                 f"max_w={max_w}：测量就超宽 {m:.0f}px（允许的悬挂 {slack:.0f}px）：{ln[:24]!r}"
             ink = _ink_bbox(_render(lambda dd, t=ln: _draw_line(dd, ORIGIN, t, cjk,
@@ -556,29 +768,16 @@ def test_mixed_wrap_respects_max_width() -> None:
                 f"max_w={max_w}：实画墨迹 {ink}px 超出面板（悬挂 {slack:.0f}px）：{ln[:24]!r}"
         report.append(f"{max_w}px→{len(lines)}行")
 
-    # 对照：不传韩文格（= 修复前的测量口径）时，含韩文的行会被量错 ——
-    # 量错的方向取决于主字体的缺字框比真韩文字形宽还是窄，所以只钉「量错」这个事实本身。
-    if KO_IS_CJK:
-        print("  ⏭ 跳过「旧口径量错」对照："
-              + _SAME_FONT_WHY + "，两种口径必然一致")
-    else:
-        naive_lines = wrap_text(d_probe, text, cjk, 400)
-        errs = []
-        for ln in naive_lines:
-            if not _hangul_chars(ln):
-                continue
-            naive_m = _measure_line(d_probe, ln, cjk, None)          # 旧口径：一律用主字体
-            real = _measure_line(d_probe, ln, cjk, _korean_only(ko))  # 真实：按 run 各用各的
-            errs.append((ln, naive_m - real))
-        assert errs, "混排长句里一行含韩文的都没折出来？对照失效"
-        worst_ln, worst = max(errs, key=lambda e: abs(e[1]))
-        assert abs(worst) > INK_TOLERANCE_PX, \
-            (f"旧口径与 run-aware 测量在混排行上没有差别（最大差 {worst:.1f}px）"
-             " —— 「测量跟着字体走」这条改动没有可观测效果，判据无分辨力")
-        direction = "高估→行变短留白" if worst > 0 else "低估→实画溢出面板"
-        report.append(f"旧口径在 {len(errs)} 行混排上量错，最大偏差 {abs(worst):.0f}px"
-                      f"（本机方向：{direction}；最差行 {worst_ln[:20]!r}）")
-    print(f"  ✓ 混排折行：{'，'.join(report)}，每行测量与实画墨迹均不超宽（含避头尾悬挂余量）")
+    # 汇报（不断言）：旧口径（一律用主字体量）在本机的偏差方向与量级
+    naive_lines = wrap_text(d_probe, text, cjk, 400)
+    errs = [abs(_measure_line(d_probe, ln, cjk, None) - _measure_line(d_probe, ln, cjk, _korean_only(ko)))
+            for ln in naive_lines if _hangul_chars(ln)]
+    worst = max(errs) if errs else 0.0
+    note = (f"旧口径（一律主字体量）在 {len(errs)} 行混排上最大偏差 {worst:.0f}px"
+            if worst > INK_TOLERANCE_PX
+            else f"本机两份字体量宽相同（偏差 {worst:.1f}px），旧口径不会量错")
+    print(f"  ✓ 混排折行：{'，'.join(report)}，每行测量 == 独立复算且实画不超宽"
+          f"（含避头尾悬挂余量）；{note}")
 
 
 def test_mixed_line_end_to_end_in_panel() -> None:
@@ -596,21 +795,19 @@ def test_mixed_line_end_to_end_in_panel() -> None:
     tf, tf_ko = _fonts_at(cfg.font_size)
     checked = 0
     for ln in wrap_text(d_probe, MIXED_LINE, tf, inner_w, script_fonts=_korean_only(tf_ko)):
-        if not _hangul_chars(ln) or KO_IS_CJK:
+        if not _hangul_chars(ln) or SAME_FONT_FILE:
             continue
         a = _render(lambda d, t=ln: _draw_line(d, ORIGIN, t, tf, _korean_only(tf_ko), fill=255))
         b = _render(lambda d, t=ln: _draw_line(d, ORIGIN, t, tf, _korean_only(tf), fill=255))
         assert a.tobytes() != b.tobytes(), f"面板里这一行的韩文仍是方框：{ln[:24]!r}"
         checked += 1
 
-    # 面板里画出来的像素必须与「逐行方案」一致：随便挑一行韩文，比对面板上的墨迹位置更麻烦，
-    # 这里改为直接钉「面板非空 + 尺寸正确 + （可分辨时）逐行非方框」三条。
     conv = render_conversation([("mine", MIXED_LINE, MIXED_LINE),
                                 ("peer:abc", KO_SENTENCE, "你好，很高兴认识你")], cfg)
     assert conv.size == cfg.size_px, conv.size
     assert conv.getextrema()[3][1] > 0, "对话视图全透明"
-    if KO_IS_CJK:
-        print(f"  ⏭ 跳过「面板里逐行非方框」那半条：{_SAME_FONT_WHY}（尺寸/非空两条照跑）")
+    if SAME_FONT_FILE:
+        print(f"  ⏭ 跳过「面板里逐行非方框」那半条：{_SAME_WHY}（尺寸/非空两条照跑）")
     print(f"  ✓ 端到端：render_panel / render_conversation 尺寸与墨迹正确"
           f"（{checked} 行中韩混排逐行确认非方框；{cfg.size_px}，字号 {cfg.font_size}）")
 
@@ -652,12 +849,12 @@ def test_korean_only_line_uses_korean_font() -> None:
                                        fill=255))
     ref_ko = _render(lambda d: d.text(ORIGIN, KO_SENTENCE, font=ko, fill=255, anchor="la"))
     assert got.tobytes() == ref_ko.tobytes(), "纯韩文行没有用韩文字体画"
-    if not KO_IS_CJK:
-        ref_tofu = _render(lambda d: d.text(ORIGIN, KO_SENTENCE, font=cjk, fill=255,
+    if not SAME_FONT_FILE:
+        ref_cjk = _render(lambda d: d.text(ORIGIN, KO_SENTENCE, font=cjk, fill=255,
                                             anchor="la"))
-        assert got.tobytes() != ref_tofu.tobytes(), "纯韩文行与主字体（方框）结果相同"
+        assert got.tobytes() != ref_cjk.tobytes(), "纯韩文行与主字体（方框）结果相同"
     print(f"  ✓ 纯韩文行走韩文字体（墨迹 {_ink_bbox(got)[1]}px"
-          f"{'，与方框版本不同' if not KO_IS_CJK else '；本机与主字体同文件'}）")
+          f"{'，与方框版本不同' if not SAME_FONT_FILE else '；本机与主字体同文件'}）")
 
 
 def test_korean_jamo_line_uses_korean_font() -> None:
@@ -677,7 +874,7 @@ def test_korean_jamo_line_uses_korean_font() -> None:
         ref_ko = _render(lambda d, t=sample: d.text(ORIGIN, t, font=ko, fill=255, anchor="la"))
         assert got.tobytes() == ref_ko.tobytes(), \
             f"{label}行没有用韩文字体画（{sample!r} —— 这一档被漏掉了？）"
-        if not KO_IS_CJK:
+        if not SAME_FONT_FILE:
             ref_cjk = _render(lambda d, t=sample: d.text(ORIGIN, t, font=cjk, fill=255,
                                                          anchor="la"))
             assert got.tobytes() != ref_cjk.tobytes(), \
@@ -693,11 +890,15 @@ def test_korean_jamo_line_uses_korean_font() -> None:
 def main() -> int:
     tests = [
         test_tofu_probe_has_teeth,
+        test_coverage_probe_matches_independent_criterion,
         test_korean_font_renders_real_glyphs,
         test_korean_font_resolved_through_platform_facade,
-        test_every_script_has_a_platform_finder,
+        test_script_registry_is_consistent,
+        test_uncovered_candidate_is_rejected_with_trace,
+        test_platform_skips_unopenable_candidates,
+        test_no_switch_when_main_font_covers,
+        test_switch_when_main_font_lacks,
         test_hangul_runs_go_to_the_hangul_slot,
-        test_production_font_dict_and_panel_path,
         test_cjk_font_not_swapped_for_korean,
         test_pure_cjk_panel_bitmap_unchanged,
         test_mixed_line_uses_both_fonts,
@@ -709,9 +910,9 @@ def main() -> int:
     ]
     print("test_korean_font:")
     print(f"  环境：主字体={Path(CJK_FONT_PATH or '?').name} "
-          f"韩文={Path(KO_FONT_PATH or '（未找到）').name} "
-          f"泰文={Path(THAI_FONT_PATH or '（未找到）').name}"
-          f"{'【韩文==主字体】' if KO_IS_CJK else ''}")
+          f"（覆盖韩文={MAIN_COVERS_KO}） 韩文专用字体="
+          f"{Path(KO_FONT_PATH or '（未找到）').name} "
+          f"泰文={Path(THAI_FONT_PATH or '（未找到）').name}")
     failed = 0
     for fn in tests:
         try:
@@ -728,8 +929,8 @@ def main() -> int:
         print(f"ALL PASSED（跑 {ran}/{len(tests)} 个用例，跳过 {len(_SKIPPED)} 条："
               f"{'、'.join(_SKIPPED)}）")
     else:
-        print(f"ALL PASSED（{len(tests)} 个用例：豆腐块判据 / 韩文字体×2 / "
-              "接线×3 / 主字体行为不变×2 / 中韩混排×3 / 右对齐 / 纯韩文 / 字母两档）")
+        print(f"ALL PASSED（{len(tests)} 个用例：豆腐块/覆盖判据×2 / 韩文专用字体×2 / 登记表 / 候选校验×2 / "
+              "该换与不该换×2 / 接线 / 主字体行为不变×2 / 中韩混排×3 / 右对齐 / 纯韩文 / 字母两档）")
     return 0
 
 

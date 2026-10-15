@@ -438,7 +438,7 @@ output:
 | 圆角外一圈是黑的 / 底板看着不透明 | 走了 Tk 回落路径（日志 `后端=Tk`） | 确认合成器支持 `zwlr_layer_shell_v1`（niri/sway/Hyprland/KDE 支持；GNOME/Weston 不支持）；`desktop_overlay.backend=wayland` 可让日志给出具体原因 |
 | 字幕窗被平铺、把桌面布局挤开 | 走了 Tk 回落（原生窗在 overlay 层，不会被平铺） | 同上：看日志确认后端；支持 layer-shell 的合成器里不该出现 |
 | 拖不动 / 拖动后落点没变 | 旧版只认 relative-pointer，而 niri 不发相对位移事件 | 升级到含「拖动双源」的版本；仍不对就附日志里 `[desktop:wayland]` 的几行 |
-| 韩语 / 泰语字幕显示成一排方块 | 宿主机没装**含该书写系统字形**的字体（AppImage **不自带字体**，用的是宿主 fontconfig；中日韩字体不含韩文/泰文，Windows 的默认雅黑也一样） | 装一个对应语言的字体：韩文 `apt install fonts-unfonts-core`（或 `fonts-noto-cjk`，其中含韩文）、泰文 `apt install fonts-thai-tlwg`；用 `fc-list :lang=ko` / `fc-list :lang=th` 可确认装上没有。日志里会有一行「找不到含韩文/泰文字形的字体 → …豆腐块」提示 |
+| 韩语 / 泰语字幕显示成一排方块 | 该书写系统的字形不在宿主的中日韩字体里（AppImage **不自带字体**，用的是宿主 fontconfig；Windows 的默认雅黑也一样）。程序**先看主字体能不能画**：能画就不换，画不出才另找一份（Linux 走 `fc-list :lang=ko|th`） | 装一个对应语言的字体：韩文 `apt install fonts-unfonts-core`（或 `fonts-noto-cjk`，其中含韩文）、泰文 `apt install fonts-thai-tlwg`；用 `fc-list :lang=ko` / `fc-list :lang=th` 可确认装上没有。日志里会有一行「找不到含该书写系统字形的字体 → …豆腐块」提示 |
 
 ### 其它
 

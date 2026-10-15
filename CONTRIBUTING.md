@@ -160,10 +160,14 @@ PR 描述请按仓库的 **[PR 模板](.github/pull_request_template.md)** 填�
 （**两边都要加**）、`vlt/tts.py` 的 `LANG_NAMES`、其它 `locales/*.py` 里补上这门语言的译名，
 以及**字体覆盖**（很多 CJK 字体不含某些语言的字形，缺字体就是一排豆腐块）。动手前先开个 issue
 说一声，维护者会告诉你当前的口径。字体那一步的做法（以泰文/韩文为样板）：
-`vlt/platform/{win,linux}.py` 各加一张候选/探测表（Windows 列已知字体路径，Linux 用
-`fc-list :lang=<code>`），渲染侧在 `vlt/output/overlay.py` 的 `_SCRIPT_RANGES` 登记该语言占的
-Unicode 块 —— **两处都要改**，只加候选表不会生效；守卫照 `tests/test_thai_font.py` /
-`tests/test_korean_font.py` 的形态写（判据是「渲染目标文字 vs 渲染缺字位，位图相同就是豆腐块」）。
+在 `vlt/output/overlay.py` 的 `_SCRIPTS` 里**登记一行**（该语言占的 Unicode 块 + 平台探测函数名 +
+中文名 + 覆盖探测样本），平台两端（`vlt/platform/{win,linux}.py` + 门面）各加一条
+`find_<script>_font()` —— **两处都要改**，只加一处不会生效（三张派生表由 `_SCRIPTS` 生成，
+漏登记由 `tests/test_korean_font.py::test_script_registry_is_consistent` 抓）。
+⚠️ 换不换字体由**主字体的字形覆盖**决定（`font_covers()`），不是「遇到这门语言就换」——
+pan-CJK 主机上主字体本来就画得出，无脑换只会把它换成同族另一个字重。
+守卫照 `tests/test_korean_font.py` / `tests/test_thai_font.py` 的形态写（判据是「渲染目标文字 vs
+渲染缺字位，位图相同就是豆腐块」），并按 `out/inject_faults_ko.py` 的形态做**故障注入**。
 
 ---
 

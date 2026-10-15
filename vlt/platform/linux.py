@@ -43,7 +43,6 @@ import ctypes
 import json
 import logging
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -53,6 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from . import child_env
+from . import first_openable_font
 from .audio import QueueAudioSource
 from .base import AudioSource, LoopbackTarget
 
@@ -444,11 +444,12 @@ def find_thai_font() -> str | None:
     ⚠️ 判据必须是 `fc-list :lang=th`（只列**覆盖泰文**的字体），**不能只信 `fc-match`**：
     `fc-match` 永远会返回一个字体（哪怕它不含泰文字形，例如 DejaVu Sans），于是
     「拿到路径」≠「能画泰文」→ 既不告警、渲染出来还是豆腐块，属于**静默降级**。
-    所以：fc-list 拿不到 → 再走下面的已知路径兜底 → 都没有就返回 None，
-    由调用方（`overlay.resolve_thai_font_path`）打一次性告警后回落 CJK 字体。
+    候选按序**打开校验**（`first_openable_font`）：`fc-list` 给的只是扫描顺序，可能撞上
+    Pillow 打不开的位图字体，跳过它继续试后面的候选即可（覆盖校验在上层 `font_covers`）。
 
     Windows 侧对应的是 `LeelawUI.ttf` / `tahoma.ttf`（见 win.py）。
     """
+    candidates: list[str] = []
     if shutil.which("fc-list"):
         try:
             res = subprocess.run(
@@ -457,18 +458,11 @@ def find_thai_font() -> str | None:
                 env=child_env(),          # 别让宿主 fc-list 加载包内旧 fontconfig
             )
             if res.returncode == 0:
-                for line in res.stdout.decode("utf-8", "replace").splitlines():
-                    cand = line.strip()
-                    # 字体集合（.ttc）在部分 fontconfig 版本里会带 `:index=0` / `:face=0` 后缀
-                    cand = re.sub(r":(?:index|face)=\d+$", "", cand)
-                    if cand and Path(cand).exists():
-                        return cand
+                candidates += res.stdout.decode("utf-8", "replace").splitlines()
         except (OSError, subprocess.TimeoutExpired):
             pass
-    for cand in _THAI_FONT_FALLBACKS:
-        if Path(cand).exists():
-            return cand
-    return None
+    candidates += list(_THAI_FONT_FALLBACKS)
+    return first_openable_font(candidates)
 
 
 # 韩文字体兜底路径（fc-list 找不到时用）。
@@ -503,30 +497,26 @@ def find_korean_font() -> str | None:
     ⚠️ 判据同泰文：必须是 `fc-list :lang=ko`（只列**覆盖韩文**的字体），**不能只信 `fc-match`**
     —— `fc-match` 永远会返回一个字体（哪怕它不含韩文字形），于是「拿到路径」≠「能画韩文」
     → 既不告警、渲染出来还是豆腐块，属于**静默降级**。
-    fc-list 拿不到 → 再走下面的已知路径兜底 → 都没有就返回 None，
-    由调用方（`overlay.resolve_korean_font_path`）打一次性告警后回落 CJK 字体。
+    候选按序**打开校验**（`first_openable_font`）：`fc-list` 给的只是扫描顺序（实测首行可能是
+    与主字体同族不同字重的集合文件，也可能是 Pillow 打不开的位图字体），打不开的跳过；
+    「是否真覆盖韩文」在上层 `overlay.font_covers()` 判 —— 那边才有各档码位的样本。
 
     Windows 侧对应的是 `malgun.ttf` / `gulim.ttc`（见 win.py）。
     """
+    candidates: list[str] = []
     if shutil.which("fc-list"):
         try:
             res = subprocess.run(
                 ["fc-list", ":lang=ko", "-f", "%{file}\n"],
                 capture_output=True, timeout=5,
-                env=child_env(),
+                env=child_env(),          # 别让宿主 fc-list 加载包内旧 fontconfig
             )
             if res.returncode == 0:
-                for line in res.stdout.decode("utf-8", "replace").splitlines():
-                    cand = line.strip()
-                    cand = re.sub(r":(?:index|face)=\d+$", "", cand)
-                    if cand and Path(cand).exists():
-                        return cand
+                candidates += res.stdout.decode("utf-8", "replace").splitlines()
         except (OSError, subprocess.TimeoutExpired):
             pass
-    for cand in _KOREAN_FONT_FALLBACKS:
-        if Path(cand).exists():
-            return cand
-    return None
+    candidates += list(_KOREAN_FONT_FALLBACKS)
+    return first_openable_font(candidates)
 
 
 # ---------------------------------------------------------------- 界面语言

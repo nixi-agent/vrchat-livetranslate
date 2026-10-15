@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import unicodedata
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -122,64 +123,197 @@ def resolve_font_path(configured: str) -> str | None:
     return _font_cache[key]
 
 
-# 非主书写系统的专用字体：解析结果缓存（与 `_font_cache` 同口径，避免每次渲染都去 spawn 一个 fc-list）。
-# 键 = (书写系统, 配置里写的字体) —— 配置会影响兜底分支，所以两维都要进键。
+# ---------------------------------------------------------------- 书写系统（字体覆盖）
+#
+# 一门书写系统 = **一条登记项**（`_SCRIPTS`）：① 它占的 Unicode 块（切 run 用）
+# ② 平台门面里的探测函数名 ③ 中文名（留痕文案）④ 逐码位覆盖探测用的样本。
+# 下面三张派生表全部**从这一张表生成** —— 以前它们是各自独立的三张表，漏登记一处就静默漂移
+# （评审实测：只加 `_SCRIPT_RANGES` 不登记 finder → 那一门永远回落主字体，还没有任何痕迹）。
+_SCRIPTS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "thai",
+        "name": "泰文",
+        "finder": "find_thai_font",
+        "ranges": ((0x0E00, 0x0E7F),),
+        # 纯泰文码位（不含拉丁/空格）：组合符号在缺字形的字体里可能被画成**空白**而不是方框，
+        # 所以覆盖探测要**逐码位**做，两者都算「画不出来」。
+        "samples": ("สวัสดี",),
+    },
+    {
+        "id": "hangul",
+        "name": "韩文",
+        "finder": "find_korean_font",
+        # 韩文三档码位都要覆盖：音节（现代韩文正文）/ 兼容字母（ㄱㄴㄷ…）/ 字母 Jamo
+        # （NFD 形态、输入法中间态），另加字母扩展 A、B 与半角字母。只认音节块会漏掉后两档
+        # （实测主字体渲染 `ㄱㄴㄷ` 同样是方框）。
+        "ranges": (
+            (0x1100, 0x11FF),   # 字母（Jamo）
+            (0x3130, 0x318F),   # 兼容字母（ㄱㄴㄷ…）
+            (0xA960, 0xA97F),   # 字母扩展-A
+            (0xAC00, 0xD7A3),   # 音节（现代韩文正文都在这里）
+            (0xD7B0, 0xD7FF),   # 字母扩展-B
+            (0xFFA0, 0xFFDC),   # 半角字母
+        ),
+        "samples": ("\u1100\u1161", "ㄱㄴㄷ", "안녕하세요", "\uffa1\uffc2"),
+    },
+)
+
+_SCRIPT_IDS: tuple[str, ...] = tuple(s["id"] for s in _SCRIPTS)
+# 书写系统 → 它占的 Unicode 块（供 `_script_of` 快速判定；表外的字符一律算主书写系统 cjk）。
+_SCRIPT_RANGES: tuple[tuple[int, int, str], ...] = tuple(
+    (lo, hi, s["id"]) for s in _SCRIPTS for lo, hi in s["ranges"])
+# 书写系统 → 平台门面里的探测函数名。
+# ⚠️ 按**名字**在调用时取（`getattr(platform, name)`），不是 import 时就绑成函数对象：
+#    用例会打桩门面（`platform.find_thai_font = lambda: None`），绑定死的函数对象会绕过打桩
+#    → 用例失去分辨力。（这一条曾经被评审点过，别改回去。）
+_SCRIPT_FINDERS: dict[str, str] = {s["id"]: s["finder"] for s in _SCRIPTS}
+# 书写系统 → 中文名（留痕文案用）。
+_SCRIPT_NAMES: dict[str, str] = {s["id"]: s["name"] for s in _SCRIPTS}
+# 书写系统 → 覆盖探测样本（见 `font_covers`）。
+_SCRIPT_SAMPLES: dict[str, tuple[str, ...]] = {s["id"]: s["samples"] for s in _SCRIPTS}
+
+# 缺字位（私有区，任何字体都不该有真字形）→ 渲染出来就是豆腐块。
+_TOFU_CHAR = "\uE000"
+# 覆盖探测的字号（只判「有没有这个字形」，与渲染字号无关）；结果按 (字体文件, 书写系统) 缓存。
+_COVER_PROBE_SIZE = 32
+_cover_cache: dict[tuple[str, str], bool] = {}
+
+
+def _probe_coverage(font_path: str, samples: tuple[str, ...]) -> bool:
+    """这份字体能不能真画出这些样本 —— 两种口径都要过：
+
+    ① **整串**：渲染整串 == 渲染「同长度的缺字位」→ 就是豆腐块（这是泰文那条腿一直在用的判据）；
+    ② **逐字**：非组合符号（`unicodedata.category` 以 `M` 开头的不算）的单字必须有墨迹 ——
+       缺字形时字体可能把它画成**空白**而不是方框，整串口径会把这种漏判成「能画」。
+
+    为什么不能只查 cmap：Pillow 不暴露 cmap 查询。任一判据不通过 → 整门算不覆盖
+    （保守：宁可多找一次专用字体，也不在缺字形时硬撑）。
+    """
+    try:
+        font = ImageFont.truetype(font_path, _COVER_PROBE_SIZE)
+    except Exception:  # noqa: BLE001 — 打不开 = 不能用（调用方负责留痕）
+        return False
+    try:
+        canvas = Image.new("L", (_COVER_PROBE_SIZE * 2, _COVER_PROBE_SIZE * 2), 0)
+        d = ImageDraw.Draw(canvas)
+
+        def _ink(text: str) -> bytes:
+            canvas.paste(0, (0, 0, *canvas.size))
+            d.text((2, 2), text, font=font, fill=255)
+            return canvas.tobytes()
+
+        for sample in samples:
+            if not sample:
+                continue
+            if _ink(sample) == _ink(_TOFU_CHAR * len(sample)):
+                return False                       # ① 整串就是豆腐块
+            for ch in sample:
+                if unicodedata.category(ch).startswith("M"):
+                    continue                       # 组合符号单独画本来就可能是空白，不据此判定
+                if not any(_ink(ch)):
+                    return False                   # ② 单字没墨迹 = 这个字形没有
+        return True
+    except Exception:  # noqa: BLE001 — 探测本身绝不能把主流程搞挂
+        return False
+
+
+def font_covers(script: str, font_path: str | None) -> bool:
+    """这份字体能不能画出该书写系统（带缓存）。`font_path` 为空 = 画不出来。"""
+    if not font_path:
+        return False
+    key = (font_path, script)
+    if key not in _cover_cache:
+        _cover_cache[key] = _probe_coverage(font_path, _SCRIPT_SAMPLES.get(script, ()))
+    return _cover_cache[key]
+
+
+def main_font_covers(script: str, main_path: str | None = None) -> bool:
+    """**主字体**能不能画这一门 —— `load_script_fonts()` 的决策点（用例在这里打桩）。
+
+    单独成一个函数是有意的：它是「换不换字体」的唯一判据，把它和 `font_covers(script, 别的字体)`
+    分开，用例才能只覆盖「主字体的判断」而不影响「候选字体的覆盖校验」（两者共用 `font_covers`
+    时，打桩会把候选校验也一起改掉 —— 实测踩过，表现是「明明有可用的专用字体却不换」）。
+    """
+    return font_covers(script, main_path if main_path is not None else resolve_font_path(""))
+
+
+# 专用字体解析结果缓存（与 `_font_cache` 同口径，避免每次渲染都去 spawn 一个 fc-list）。
+# 键 = (书写系统, 配置里写的字体) —— 配置会影响第一优先级，所以两维都要进键。
 _script_font_cache: dict[tuple[str, str], str | None] = {}
-# 「找不到某书写系统的字体」的告警**每个书写系统只打一次**（禁静默降级，但也不要刷屏）。
+# 降级/异常留痕**每类只打一次**（禁静默降级，但也不要刷屏）。键形如 `"hangul:missing"`。
 _script_font_warned: set[str] = set()
 
-# 书写系统 → 平台门面里的探测函数名（见 `vlt/platform/__init__.py`，两端各一条实现）。
-# ⚠️ 按**名字**在调用时取，而不是 import 时就绑成函数对象：用例会打桩门面
-#    （`platform.find_thai_font = lambda: None`），绑定死的函数对象会绕过打桩 → 用例失去分辨力。
-_SCRIPT_FINDERS: dict[str, str] = {"thai": "find_thai_font", "hangul": "find_korean_font"}
-# 书写系统的中文名（留痕文案用）。
-_SCRIPT_NAMES: dict[str, str] = {"thai": "泰文", "hangul": "韩文"}
 
-
-def _warn_script_font_missing(script: str) -> None:
-    """降级留痕：找不到含该书写系统字形的字体时打一行告警（同一书写系统只打一次）。"""
-    if script in _script_font_warned:
+def _warn_script_font(script: str, kind: str, detail: str) -> None:
+    """降级留痕（同一书写系统同一类只打一次）。"""
+    key = f"{script}:{kind}"
+    if key in _script_font_warned:
         return
-    _script_font_warned.add(script)
+    _script_font_warned.add(key)
     name = _SCRIPT_NAMES.get(script, script)
     try:
-        print(f"[overlay] 找不到含{name}字形的字体 → {name}文本将渲染为豆腐块"
-              f"（CJK 字体不含{name}字形，降级）", flush=True)
+        print(f"[overlay] {detail}（{name}）", flush=True)
     except Exception:  # noqa: BLE001 — 日志本身绝不能把主流程搞挂
         pass
 
 
-def resolve_script_font_path(script: str, configured: str) -> str | None:
-    """决定某个**非主书写系统**（`thai` / `hangul`）的文本用哪个字体文件。
+def _usable_script_font(script: str, path: str | None) -> str | None:
+    """把候选路径校验成「真能用」：存在 + 能打开 + 真覆盖该书写系统；否则 None（并留痕）。"""
+    if not path:
+        return None
+    if not Path(path).exists():
+        _warn_script_font(script, "missing-file",
+                          f"探测到的字体文件不存在（{path}）→ 回落主字体，该书写系统会渲染成豆腐块")
+        return None
+    if not font_covers(script, path):
+        _warn_script_font(script, "not-covered",
+                          f"探测到的字体并不真覆盖该书写系统的字形（{Path(path).name}）"
+                          "→ 回落主字体，缺的字形会渲染成豆腐块")
+        return None
+    return path
 
-    优先级：平台自动探测（`find_thai_font()` / `find_korean_font()`，保证含该书写系统字形）
-    → 用户配置的字体（兜底：用户可能配了一个多脚本字体，但也可能不含该书写系统 → 豆腐块，
-    降级留痕）→ None（调用方回落 CJK 字体 → 豆腐块）。
 
-    ⚠️ **不能复用 `resolve_font_path`**：CJK 字体（雅黑 / Noto Sans CJK 等）**不一定**含这些字形 ——
-    实测 `msyh.ttc` 渲染 `สวัสดี` / `안녕하세요` 得到的位图与渲染缺字位 U+E000 **完全相同**（= 豆腐块）。
-    所以每种书写系统都要独立探测，渲染侧按书写系统切 run、各用各的字体画。
+def resolve_script_font_path(script: str, configured: str = "") -> str | None:
+    """该书写系统的**专用字体**文件；找不到 / 不可用 → None（并留痕）。
+
+    优先级：**用户配置且真覆盖该书写系统**的字体 → 平台探测（`find_thai_font()` /
+    `find_korean_font()`）→ None。
+
+    ⚠️ 什么时候才该调它：先看**主字体覆盖不覆盖**（`font_covers()`）—— 主字体画得出就**别换**
+    （Linux 上主字体常见落点是 Noto Sans CJK 这类 pan-CJK 族，换了只会换成同族另一个字重，
+    实测纯白像素 +37%，等于在本来没毛病的机器上把韩文**变粗一档**）。这条判断在
+    `load_script_fonts()` 里，生产路径只走那里；本函数是「已经确定要换，去找哪一份」。
+
+    ⚠️ 也**不能复用 `resolve_font_path`**：CJK 字体（雅黑 / Noto Sans CJK 等）**不一定**含这些
+    书写系统的字形 —— 实测 `msyh.ttc` 渲染 `สวัสดี` / `안녕하세요` 得到的位图与渲染缺字位
+    U+E000 **完全相同**（= 豆腐块）。所以每种书写系统都要独立探测，渲染侧按书写系统切 run。
     """
     key = (script, configured or "")
     if key not in _script_font_cache:
-        from .. import platform as _platform
-        finder = getattr(_platform, _SCRIPT_FINDERS.get(script, ""), None)
-        resolved: str | None = finder() if finder else None
-        if resolved is None and configured and Path(configured).exists():
-            resolved = configured          # 用户配置的字体兜底（可能不含该书写系统 → 豆腐块）
+        resolved: str | None = None
+        # ① 用户配置的那份（若真覆盖这一门）——与 `resolve_font_path` 一样「配置优先」
+        if configured and Path(configured).exists() and font_covers(script, configured):
+            resolved = configured
+        # ② 平台探测
         if resolved is None:
-            _warn_script_font_missing(script)
+            from .. import platform as _platform
+            finder = getattr(_platform, _SCRIPT_FINDERS.get(script, ""), None)
+            resolved = _usable_script_font(script, finder() if finder else None)
+        if resolved is None:
+            _warn_script_font(script, "missing",
+                              "找不到含该书写系统字形的字体 → 这些字将渲染成豆腐块"
+                              "（主字体不含该字形，已降级）")
         _script_font_cache[key] = resolved
     return _script_font_cache[key]
 
 
-def resolve_thai_font_path(configured: str) -> str | None:
-    """泰文文本用哪个字体文件（口径见 `resolve_script_font_path`；门面 = `find_thai_font`）。"""
+def resolve_thai_font_path(configured: str = "") -> str | None:
+    """泰文专用字体（口径见 `resolve_script_font_path`；门面 = `find_thai_font`）。"""
     return resolve_script_font_path("thai", configured)
 
 
-def resolve_korean_font_path(configured: str) -> str | None:
-    """韩文文本用哪个字体文件（口径见 `resolve_script_font_path`；门面 = `find_korean_font`）。"""
+def resolve_korean_font_path(configured: str = "") -> str | None:
+    """韩文专用字体（口径见 `resolve_script_font_path`；门面 = `find_korean_font`）。"""
     return resolve_script_font_path("hangul", configured)
 
 
@@ -304,22 +438,9 @@ def _is_cjk(ch: str) -> bool:
     return any(lo <= o <= hi for lo, hi in _CJK_RANGES)
 
 
-# 非主书写系统的 Unicode 块。与 CJK 是**彼此独立**的书写系统：CJK 字体不含泰文/韩文字形，
-# 泰文字体也不含中日韩字形 —— 混排时必须按书写系统切 run、各用各的字体画，
-# 否则会出豆腐块（实测 `msyh.ttc` 渲染 `สวัสดี` / `안녕하세요` = 渲染缺字位 U+E000 的位图）。
-#
-# 每条 = (起, 止, 书写系统名)；`_script_of` 落在表外的字符一律算主书写系统（cjk）。
-# 韩文那几条覆盖「音节（正文）/ 字母 Jamo / 兼容字母 / 字母扩展 A、B / 半角字母」——
-# 只认音节块会漏掉 `ㄱㄴㄷ` 这类用字母写的韩文（实测与缺字位同形，也是豆腐块）。
-_SCRIPT_RANGES: tuple[tuple[int, int, str], ...] = (
-    (0x0E00, 0x0E7F, "thai"),     # 泰文
-    (0x1100, 0x11FF, "hangul"),   # 韩文字母（Jamo）
-    (0x3130, 0x318F, "hangul"),   # 韩文兼容字母（ㄱㄴㄷ…）
-    (0xA960, 0xA97F, "hangul"),   # 韩文字母扩展-A
-    (0xAC00, 0xD7A3, "hangul"),   # 韩文音节（现代韩文正文都在这里）
-    (0xD7B0, 0xD7FF, "hangul"),   # 韩文字母扩展-B
-    (0xFFA0, 0xFFDC, "hangul"),   # 韩文半角字母
-)
+# 混合书写系统的行要按 run 切分、各用各的字体画，否则会出豆腐块
+# （实测 `msyh.ttc` 渲染 `สวัสดี` / `안녕하세요` = 渲染缺字位 U+E000 的位图）。
+# 书写系统表见文件上方 `_SCRIPTS`（`_SCRIPT_RANGES` 由它派生）。
 
 
 def _script_of(ch: str) -> str:
@@ -399,23 +520,41 @@ def _load_font(path: str | None, size: int) -> ImageFont.FreeTypeFont:
 
 
 def load_script_fonts(cfg: OverlayConfig, size: int) -> dict[str, ImageFont.FreeTypeFont]:
-    """该字号下**各非主书写系统**的专用字体（键 = `"thai"` / `"hangul"`）。
+    """该字号下**需要换字体**的那些书写系统的专用字体（键 = `"thai"` / `"hangul"`）。
 
-    解析不到（本机没装覆盖该书写系统的字体）/ 字体文件坏了的，**不进字典** ——
-    调用方回落主字体（那一段会渲染成豆腐块，`resolve_script_font_path` 已经留痕）。
-    于是「一个都没解析出来」时字典为空 → 渲染走单字体路径，行为与引入本机制之前
-    **逐字节一致**（有用例钉住这条不变量）。
+    ⚠️ **判据是「字形覆盖」，不是「书写系统」**（评审 2026-10-15 实测纠正过一版按书写系统
+    无脑换的写法）：**主字体能画这一门 → 就不换**。Linux 上主字体常见落点是 Noto Sans CJK 这类
+    pan-CJK 族（自带韩文），无脑换只会换成同族另一个字重 —— 实测纯白像素 +37%，等于在本来没有
+    毛病的机器上把韩文**变粗一档**（假阳性）。只有在主字体**画不出**时才去找专用字体
+    （Windows/msyh 的现场），且那份专用字体也要**覆盖检查**通过才用。
+
+    一门都解析不到 / 用不上时字典为空 → 渲染走单字体路径，行为与引入本机制之前**逐字节一致**
+    （有用例钉住这条不变量）。
     """
     out: dict[str, ImageFont.FreeTypeFont] = {}
-    for script in _SCRIPT_FINDERS:
+    main_path = resolve_font_path(cfg.font)
+    for script in _SCRIPT_IDS:
+        if main_font_covers(script, main_path):
+            continue                      # 主字体画得出 → 不换（用户那条路与改动前逐字节相同）
         path = resolve_script_font_path(script, cfg.font)
-        if not path:
+        if not path or path == main_path:
+            continue                      # 找不到 / 就是主字体自己（`resolve_*` 已留痕）
+        font = _try_open_font(path, size)
+        if font is None:
+            _warn_script_font(script, "unopenable",
+                              f"专用字体打不开（{Path(path).name}）→ 回落主字体，"
+                              "该书写系统会渲染成豆腐块")
             continue
-        try:
-            out[script] = ImageFont.truetype(path, size)
-        except Exception:  # noqa: BLE001 — 一个字体坏了不该把另一个书写系统也拖下水
-            continue
+        out[script] = font
     return out
+
+
+def _try_open_font(path: str, size: int) -> ImageFont.FreeTypeFont | None:
+    """开一份字体；打不开返回 None（调用方决定怎么留痕/回落）。"""
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception:  # noqa: BLE001 — 字体文件坏了不该把整条腿拖挂
+        return None
 
 
 def _pick_font(script: str, cjk_font: ImageFont.FreeTypeFont,

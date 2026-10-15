@@ -279,7 +279,9 @@ def test_thai_font_resolved_through_platform_facade() -> None:
     orig_facade = platform_mod.find_thai_font
     try:
         overlay._script_font_cache.clear()
-        overlay._script_font_warned.discard("thai")
+        # 留痕标志按「书写系统:类别」分键（见 overlay._warn_script_font），清掉泰文那一族
+        overlay._script_font_warned.difference_update(
+            k for k in list(overlay._script_font_warned) if k.startswith("thai:"))
         platform_mod.find_thai_font = lambda: None       # type: ignore[assignment]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

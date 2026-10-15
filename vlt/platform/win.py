@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from .audio import QueueAudioSource
+from . import first_openable_font
 from .base import PA_LOCK, AudioSource, LoopbackTarget
 
 log = logging.getLogger(__name__)
@@ -221,11 +222,10 @@ def find_thai_font() -> str | None:
     与 `find_cjk_font()` 是**两条独立**的探测：CJK 字体（雅黑等）不含泰文字形，
     泰文字体（Leelawadee UI 等）不含中日韩字形 —— 混排时必须按书写系统切 run、
     各用各的字体画，否则会出豆腐块。
+
+    候选逐份**打开校验**（`first_openable_font`）：路径存在但 Pillow 打不开的候选会被跳过。
     """
-    for cand in _THAI_FONT_CANDIDATES:
-        if Path(cand).exists():
-            return cand
-    return None
+    return first_openable_font(_THAI_FONT_CANDIDATES)
 
 
 # 韩文字体候选（按优先级）。
@@ -261,11 +261,11 @@ def find_korean_font() -> str | None:
 
     与 `find_cjk_font()` / `find_thai_font()` 是**三条独立**的探测：CJK 字体不含韩文与泰文，
     韩文字体（Malgun Gothic 等）不含中日文字形 —— 混排时必须按书写系统切 run、各用各的字体画。
+
+    候选逐份**打开校验**（`first_openable_font`）：路径存在但 Pillow 打不开的候选会被跳过，
+    免得把坏路径交给上层变成「静默回落 = 一排豆腐块」。
     """
-    for cand in _KOREAN_FONT_CANDIDATES:
-        if Path(cand).exists():
-            return cand
-    return None
+    return first_openable_font(_KOREAN_FONT_CANDIDATES)
 
 
 # ---------------------------------------------------------------- 界面语言

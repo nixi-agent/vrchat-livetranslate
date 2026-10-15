@@ -135,9 +135,12 @@ _SCRIPTS: tuple[dict[str, Any], ...] = (
         "name": "泰文",
         "finder": "find_thai_font",
         "ranges": ((0x0E00, 0x0E7F),),
+        # `primary` = **主导码位**：不覆盖它就算「这门书写系统画不出来」（决定换不换字体）；
+        # `extra` = 次要码位：缺了只留一行痕、**仍采用**这份字体（它至少把正文修好了）。
         # 纯泰文码位（不含拉丁/空格）：组合符号在缺字形的字体里可能被画成**空白**而不是方框，
-        # 所以覆盖探测要**逐码位**做，两者都算「画不出来」。
-        "samples": ("สวัสดี",),
+        # 所以覆盖探测要**整串 + 逐码位**两种口径（见 `_probe_coverage`）。
+        "primary": ("สวัสดี",),
+        "extra": (),
     },
     {
         "id": "hangul",
@@ -154,7 +157,10 @@ _SCRIPTS: tuple[dict[str, Any], ...] = (
             (0xD7B0, 0xD7FF),   # 字母扩展-B
             (0xFFA0, 0xFFDC),   # 半角字母
         ),
-        "samples": ("\u1100\u1161", "ㄱㄴㄷ", "안녕하세요", "\uffa1\uffc2"),
+        # 正文（音节）+ 标字母（兼容字母）是「没它就没法用」的；
+        # 字母 Jamo / 半角字母只出现在 NFD 文本与输入法中间态里 → 算次要。
+        "primary": ("안녕하세요", "ㄱㄴㄷ"),
+        "extra": ("\u1100\u1161", "\uffa1\uffc2"),
     },
 )
 
@@ -169,62 +175,76 @@ _SCRIPT_RANGES: tuple[tuple[int, int, str], ...] = tuple(
 _SCRIPT_FINDERS: dict[str, str] = {s["id"]: s["finder"] for s in _SCRIPTS}
 # 书写系统 → 中文名（留痕文案用）。
 _SCRIPT_NAMES: dict[str, str] = {s["id"]: s["name"] for s in _SCRIPTS}
-# 书写系统 → 覆盖探测样本（见 `font_covers`）。
-_SCRIPT_SAMPLES: dict[str, tuple[str, ...]] = {s["id"]: s["samples"] for s in _SCRIPTS}
+# 书写系统 → 主导码位样本（决定「这门画不画得出来」，见 `font_covers`）。
+_SCRIPT_PRIMARY: dict[str, tuple[str, ...]] = {s["id"]: s["primary"] for s in _SCRIPTS}
+# 书写系统 → 次要码位样本（缺了只留痕、仍采用该字体，见 `missing_extra_samples`）。
+_SCRIPT_EXTRA: dict[str, tuple[str, ...]] = {s["id"]: s["extra"] for s in _SCRIPTS}
 
 # 缺字位（私有区，任何字体都不该有真字形）→ 渲染出来就是豆腐块。
 _TOFU_CHAR = "\uE000"
-# 覆盖探测的字号（只判「有没有这个字形」，与渲染字号无关）；结果按 (字体文件, 书写系统) 缓存。
+# 覆盖探测的字号（只判「有没有这个字形」，与渲染字号无关）。
 _COVER_PROBE_SIZE = 32
-_cover_cache: dict[tuple[str, str], bool] = {}
+# 覆盖探测缓存：键 = (字体文件, 书写系统)，值 = (主导码位是否全覆盖, 缺的次要样本)
+_cover_cache: dict[tuple[str, str], tuple[bool, tuple[str, ...]]] = {}
 
 
-def _probe_coverage(font_path: str, samples: tuple[str, ...]) -> bool:
-    """这份字体能不能真画出这些样本 —— 两种口径都要过：
+def _probe_samples(font: ImageFont.FreeTypeFont, samples: tuple[str, ...]) -> tuple[str, ...]:
+    """这些样本里**画不出来**的那些（判据见 `_probe_coverage` 的两种口径）。"""
+    canvas = Image.new("L", (_COVER_PROBE_SIZE * 2, _COVER_PROBE_SIZE * 2), 0)
+    d = ImageDraw.Draw(canvas)
 
-    ① **整串**：渲染整串 == 渲染「同长度的缺字位」→ 就是豆腐块（这是泰文那条腿一直在用的判据）；
-    ② **逐字**：非组合符号（`unicodedata.category` 以 `M` 开头的不算）的单字必须有墨迹 ——
-       缺字形时字体可能把它画成**空白**而不是方框，整串口径会把这种漏判成「能画」。
+    def _ink(text: str) -> bytes:
+        canvas.paste(0, (0, 0, *canvas.size))
+        d.text((2, 2), text, font=font, fill=255)
+        return canvas.tobytes()
 
-    为什么不能只查 cmap：Pillow 不暴露 cmap 查询。任一判据不通过 → 整门算不覆盖
-    （保守：宁可多找一次专用字体，也不在缺字形时硬撑）。
+    missing: list[str] = []
+    for sample in samples:
+        if not sample:
+            continue
+        if _ink(sample) == _ink(_TOFU_CHAR * len(sample)):
+            missing.append(sample)                 # ① 整串就是豆腐块
+            continue
+        for ch in sample:
+            if unicodedata.category(ch).startswith("M"):
+                continue                           # 组合符号单独画本来就可能是空白，不据此判定
+            if not any(_ink(ch)):
+                missing.append(sample)             # ② 单字没墨迹 = 这个字形没有
+                break
+    return tuple(missing)
+
+
+def _coverage_of(script: str, font_path: str | None) -> tuple[bool, tuple[str, ...]]:
+    """(主导码位是否全覆盖, 缺的次要样本) —— 带缓存。
+
+    为什么不用「查 cmap」：Pillow 不暴露 cmap。为什么要**两种口径**：缺字形的字体既可能把字画成
+    方框（有墨迹）也可能画成**空白**（泰文组合符号就会这样），只看其中一种会漏判成「能画」。
     """
-    try:
-        font = ImageFont.truetype(font_path, _COVER_PROBE_SIZE)
-    except Exception:  # noqa: BLE001 — 打不开 = 不能用（调用方负责留痕）
-        return False
-    try:
-        canvas = Image.new("L", (_COVER_PROBE_SIZE * 2, _COVER_PROBE_SIZE * 2), 0)
-        d = ImageDraw.Draw(canvas)
-
-        def _ink(text: str) -> bytes:
-            canvas.paste(0, (0, 0, *canvas.size))
-            d.text((2, 2), text, font=font, fill=255)
-            return canvas.tobytes()
-
-        for sample in samples:
-            if not sample:
-                continue
-            if _ink(sample) == _ink(_TOFU_CHAR * len(sample)):
-                return False                       # ① 整串就是豆腐块
-            for ch in sample:
-                if unicodedata.category(ch).startswith("M"):
-                    continue                       # 组合符号单独画本来就可能是空白，不据此判定
-                if not any(_ink(ch)):
-                    return False                   # ② 单字没墨迹 = 这个字形没有
-        return True
-    except Exception:  # noqa: BLE001 — 探测本身绝不能把主流程搞挂
-        return False
+    if not font_path:
+        return False, ()
+    key = (font_path, script)
+    if key not in _cover_cache:
+        try:
+            font = ImageFont.truetype(font_path, _COVER_PROBE_SIZE)
+        except Exception:  # noqa: BLE001 — 打不开 = 不能用（调用方负责留痕）
+            return False, ()
+        try:
+            primary_missing = _probe_samples(font, _SCRIPT_PRIMARY.get(script, ()))
+            extra_missing = _probe_samples(font, _SCRIPT_EXTRA.get(script, ()))
+            _cover_cache[key] = (not primary_missing, extra_missing)
+        except Exception:  # noqa: BLE001 — 探测本身绝不能把主流程搞挂
+            return False, ()
+    return _cover_cache[key]
 
 
 def font_covers(script: str, font_path: str | None) -> bool:
-    """这份字体能不能画出该书写系统（带缓存）。`font_path` 为空 = 画不出来。"""
-    if not font_path:
-        return False
-    key = (font_path, script)
-    if key not in _cover_cache:
-        _cover_cache[key] = _probe_coverage(font_path, _SCRIPT_SAMPLES.get(script, ()))
-    return _cover_cache[key]
+    """这份字体画不画得出该书写系统的**主导码位**（带缓存）。空路径 = 画不出。"""
+    return _coverage_of(script, font_path)[0]
+
+
+def missing_extra_samples(script: str, font_path: str | None) -> tuple[str, ...]:
+    """这份字体**缺的次要码位样本**（空 = 全覆盖）；用于留痕，不参与「用不用」的决策。"""
+    return _coverage_of(script, font_path)[1]
 
 
 def main_font_covers(script: str, main_path: str | None = None) -> bool:
@@ -257,8 +277,23 @@ def _warn_script_font(script: str, kind: str, detail: str) -> None:
         pass
 
 
+def _warn_if_partial(script: str, path: str | None, where: str) -> None:
+    """该字体覆盖主导码位但缺次要码位 → 留一行痕（禁静默降级）。"""
+    if not path:
+        return
+    missing = missing_extra_samples(script, path)
+    if missing:
+        _warn_script_font(script, f"partial-{where}",
+                          f"{where}不含该书写系统的部分次要码位（{Path(path).name}，"
+                          f"缺 {len(missing)} 组样本）→ 这些码位仍会渲染成豆腐块，其余正常")
+
+
 def _usable_script_font(script: str, path: str | None) -> str | None:
-    """把候选路径校验成「真能用」：存在 + 能打开 + 真覆盖该书写系统；否则 None（并留痕）。"""
+    """把候选路径校验成「真能用」：存在 + 能打开 + **主导码位**覆盖；否则 None（并留痕）。
+
+    注意**次要码位**缺字形时**不拒绝**：那份字体至少把正文（主导码位）修好了，比回落主字体
+    （全是豆腐块）强得多 —— 只留一行痕说明哪些码位还没有。
+    """
     if not path:
         return None
     if not Path(path).exists():
@@ -270,6 +305,9 @@ def _usable_script_font(script: str, path: str | None) -> str | None:
                           f"探测到的字体并不真覆盖该书写系统的字形（{Path(path).name}）"
                           "→ 回落主字体，缺的字形会渲染成豆腐块")
         return None
+    missing = missing_extra_samples(script, path)
+    if missing:
+        _warn_if_partial(script, path, where="探测到的字体")
     return path
 
 
@@ -535,6 +573,7 @@ def load_script_fonts(cfg: OverlayConfig, size: int) -> dict[str, ImageFont.Free
     main_path = resolve_font_path(cfg.font)
     for script in _SCRIPT_IDS:
         if main_font_covers(script, main_path):
+            _warn_if_partial(script, main_path, where="主字体")
             continue                      # 主字体画得出 → 不换（用户那条路与改动前逐字节相同）
         path = resolve_script_font_path(script, cfg.font)
         if not path or path == main_path:

@@ -319,7 +319,7 @@ def test_coverage_probe_matches_independent_criterion() -> None:
     for label, path in (("主字体", CJK_FONT_PATH), ("韩文专用字体", KO_FONT_PATH)):
         if not path:
             continue
-        want = _expected_coverage(path, overlay._SCRIPT_SAMPLES["hangul"])
+        want = _expected_coverage(path, overlay._SCRIPT_PRIMARY["hangul"])
         got = font_covers("hangul", path)
         assert got == want, \
             (f"{label}（{Path(path).name}）的覆盖结论与独立复算不一致："
@@ -421,14 +421,18 @@ def test_script_registry_is_consistent() -> None:
         "`_SCRIPT_RANGES` 里的书写系统与 `_SCRIPTS` 登记不一致（漏登记 = 该门永远不切 run）"
     assert set(overlay._SCRIPT_FINDERS) == ids, "`_SCRIPT_FINDERS` 与登记表不一致"
     assert set(overlay._SCRIPT_NAMES) == ids, "`_SCRIPT_NAMES` 与登记表不一致（留痕文案会退化成脚本 id）"
-    assert set(overlay._SCRIPT_SAMPLES) == ids, "`_SCRIPT_SAMPLES` 与登记表不一致"
-    for script, samples in overlay._SCRIPT_SAMPLES.items():
+    assert set(overlay._SCRIPT_PRIMARY) == ids, "`_SCRIPT_PRIMARY` 与登记表不一致"
+    assert set(overlay._SCRIPT_EXTRA) == ids, "`_SCRIPT_EXTRA` 与登记表不一致"
+    for script in ids:
         ranges = [(lo, hi) for lo, hi, s in overlay._SCRIPT_RANGES if s == script]
-        assert ranges and samples, f"{script} 没有区间或没有样本"
-        for sample in samples:
+        primary, extra = overlay._SCRIPT_PRIMARY[script], overlay._SCRIPT_EXTRA[script]
+        assert ranges, f"{script} 没有登记 Unicode 块"
+        assert primary, f"{script} 没有主导码位样本 —— 换不换字体就无从判断"
+        assert not (set(primary) & set(extra)), f"{script} 的主导/次要样本重复了"
+        for sample in primary + extra:
             for ch in sample:
                 assert any(lo <= ord(ch) <= hi for lo, hi in ranges), \
-                    (f"{script} 的覆盖样本 {ch!r}（U+{ord(ch):04X}）不在它登记的 Unicode 块里 —— "
+                    (f"{script} 的样本 {ch!r}（U+{ord(ch):04X}）不在它登记的 Unicode 块里 —— "
                      "探测的是别的书写系统")
     backend_mod = platform_mod.backend()
     for script, finder in overlay._SCRIPT_FINDERS.items():
@@ -496,6 +500,47 @@ def test_switch_when_main_font_lacks() -> None:
     assert not _is_tofu(ko, KO_WORD), f"换上的字体渲染 {KO_WORD!r} 仍是方框"
     print(f"  ✓ 主字体画不出韩文时：韩文格 = {Path(fonts['hangul'].path).name}，"
           "面板与无专用字体时不同（真的换了）")
+
+
+def test_resolve_accepts_primary_coverage_and_traces_partials() -> None:
+    """★ 平台探测到的候选：**主导码位**覆盖 → 采用（缺次要码位只留一行痕）；主导都不覆盖 → 拒绝。
+
+    为什么分两档：只认「全部样本都要有」会把「正文能画、只缺 NFD/半角那种罕见码位」的字体也拒掉
+    —— 那是拿「宁可整段方框」换「不漏一个码位」（评审机器上的 UnPilgi 就是这种字体）。
+    本条按**平台真实探测结果**分派断言，两种环境都真跑（不写死平台路径）。
+    """
+    cand = platform_mod.find_korean_font()
+    if not cand:
+        return _skip("test_resolve_accepts_primary_coverage_and_traces_partials",
+                     "本机平台探测不到韩文候选字体（该分支无从构造）")
+    saved_warned = _clear_warned("hangul")
+    orig_facade = platform_mod.find_korean_font
+    try:
+        overlay._script_font_cache.clear()
+        platform_mod.find_korean_font = lambda: cand       # type: ignore[assignment]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            got = resolve_korean_font_path("")
+        out = buf.getvalue()
+        if font_covers("hangul", cand):
+            assert got == cand, f"主导码位能画的候选被拒了：{got!r} vs {cand!r}"
+            missing = overlay.missing_extra_samples("hangul", cand)
+            if missing:
+                assert "部分次要码位" in out, \
+                    f"缺次要码位必须留痕（禁静默降级），实际输出：{out!r}"
+            else:
+                assert "部分次要码位" not in out, f"全覆盖的候选不该报「缺次要码位」：{out!r}"
+            print(f"  ✓ 候选 {Path(cand).name}：主导码位覆盖 → 采用"
+                  f"（缺次要 {len(missing)} 组{'，已留痕' if missing else '，无'}）")
+        else:
+            assert got is None, f"主导码位画不出的候选被采用了：{got!r}"
+            assert "并不真覆盖" in out, f"拒绝时必须留痕，实际输出：{out!r}"
+            print(f"  ✓ 候选 {Path(cand).name}：主导码位画不出 → 拒绝并留痕")
+    finally:
+        platform_mod.find_korean_font = orig_facade       # type: ignore[assignment]
+        overlay._script_font_cache.clear()
+        overlay._script_font_warned.clear()
+        overlay._script_font_warned.update(saved_warned)
 
 
 def test_uncovered_candidate_is_rejected_with_trace() -> None:
@@ -894,6 +939,7 @@ def main() -> int:
         test_korean_font_renders_real_glyphs,
         test_korean_font_resolved_through_platform_facade,
         test_script_registry_is_consistent,
+        test_resolve_accepts_primary_coverage_and_traces_partials,
         test_uncovered_candidate_is_rejected_with_trace,
         test_platform_skips_unopenable_candidates,
         test_no_switch_when_main_font_covers,
@@ -929,7 +975,7 @@ def main() -> int:
         print(f"ALL PASSED（跑 {ran}/{len(tests)} 个用例，跳过 {len(_SKIPPED)} 条："
               f"{'、'.join(_SKIPPED)}）")
     else:
-        print(f"ALL PASSED（{len(tests)} 个用例：豆腐块/覆盖判据×2 / 韩文专用字体×2 / 登记表 / 候选校验×2 / "
+        print(f"ALL PASSED（{len(tests)} 个用例：豆腐块/覆盖判据×2 / 韩文专用字体×2 / 登记表 / 候选校验×3 / "
               "该换与不该换×2 / 接线 / 主字体行为不变×2 / 中韩混排×3 / 右对齐 / 纯韩文 / 字母两档）")
     return 0
 

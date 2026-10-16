@@ -154,9 +154,9 @@ def _yaml_set_or_create(text: str, path: list[str], value: str) -> str:
             lines[at:at] = block
             return
         i, clo, chi = got
+        m = re.compile(rf"^(\s*){re.escape(key_path[0])}:(\s*)([^#\n]*)(\s*#.*)?$").match(lines[i])
+        comment = (m.group(4) or "").strip() if m else ""
         if len(key_path) == 1:                    # 叶子：就地替换，连带删掉旧的块子行（同旧函数）
-            m = re.compile(rf"^(\s*){re.escape(key_path[0])}:(\s*)([^#\n]*)(\s*#.*)?$").match(lines[i])
-            comment = (m.group(4) or "").strip() if m else ""
             lines[i] = f"{' ' * indent}{key_path[0]}: {value}" + (f"   {comment}" if comment else "")
             # 与 `_yaml_set_in_text` 同一取舍：删块行、**不删纯注释行**（见那边的说明）。
             drop: list[int] = []
@@ -180,6 +180,8 @@ def _yaml_set_or_create(text: str, path: list[str], value: str) -> str:
             for k in reversed(drop):
                 del lines[k]
             return
+        if m and re.fullmatch(r"\{\s*\}|null|Null|NULL|~", m.group(3).strip()):
+            lines[i] = f"{' ' * indent}{key_path[0]}:" + (f"   {comment}" if comment else "")
         _walk(key_path[1:], indent + 2, clo, chi)
 
     _walk(path, 0, 0, len(lines))

@@ -3,7 +3,7 @@
 要证三件事：
   ① 开复用时，连续两次合成**只建一条 TCP/HTTP 连接**（这正是每段省一次 DNS+TCP+TLS 的来源）；
   ② 关复用时，每次都是新连接 —— 与改动前的行为**完全一致**；
-  ③ 连接被对端掐断时，**自动重连一次并成功**，且留下降级痕迹（禁静默降级）。
+  ③ POST 已被接收后断线，明确报错、不重送；下一次新请求仍能正常执行。
 """
 from __future__ import annotations
 
@@ -91,15 +91,20 @@ def main() -> int:
         synth(port, reuse=False)
         check("关复用时两次建 2 条连接（与改动前一致）", len(set(CONNS)) == 2)
 
-        # ③ 断线自愈：掐断一条 → 仍成功 + 有痕迹
+        # ③ 结果不明：已读完 POST 后断线，不能假定服务没有执行
         CONNS.clear()
         DROP_NEXT[0] = True
         buf = io.StringIO()
+        error = ""
         with redirect_stdout(buf):
-            got = synth(port, reuse=True)
+            try:
+                synth(port, reuse=True)
+            except tts.TtsError as exc:
+                error = str(exc)
+            failed_requests = len(CONNS)
             got2 = synth(port, reuse=True)
-        check("连接被掐断后仍能合成成功（重连一次）", got > 0 and got2 > 0)
-        check("重连/降级留下了痕迹（禁静默降级）", "重连" in buf.getvalue() or "复用" in buf.getvalue())
+        check("断线的 POST 只发送一次，后续新请求仍成功", failed_requests == 1 and len(CONNS) == 2 and got2 > 0)
+        check("向调用端明确说明结果不明且没有重送", "结果不明" in error and "重送" in error and buf.getvalue() == "")
     finally:
         srv.shutdown()
 

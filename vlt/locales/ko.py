@@ -543,3 +543,5 @@ STRINGS: dict[str, str] = {
     "译音音量已更新（逐句生效）": "번역 음성 음량을 업데이트했습니다(문장별로 적용)",
     "麦克风电平参考取不到 → 译音音量匹配回落固定增益 {db} dB": "마이크 레벨 참조를 가져올 수 없음 → 번역 음량 매칭이 고정 게인 {db} dB로 돌아갑니다",
 }
+from .chatgpt import STRINGS as _CHATGPT
+STRINGS.update(_CHATGPT["ko"])

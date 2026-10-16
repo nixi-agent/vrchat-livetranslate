@@ -27,8 +27,8 @@ PC 端（不戴头显）用户的诉求原话是「译文像歌词一样贴在�
 """
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field
+import time as time
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -36,293 +36,24 @@ from PIL import Image
 
 # 调试帧是"跑完要看"的产物 → 可写目录（exe 旁），与手腕屏的 dry-run 同一个口径
 from ..paths import APP_DIR
-from ..platform.overlay_pixels import alpha_mask_bits
-from .overlay import OverlayConfig, _unpack_entry, render_conversation, render_panel
+from ..platform.overlay_pixels import alpha_mask_bits as alpha_mask_bits
+from ..session.chatgpt_output import allowed, current, same, scope, select_rows
+from .overlay import OverlayConfig as OverlayConfig, _unpack_entry, render_conversation, render_panel
 
 # 色键：窗口底色与贴图底色必须是**同一个**颜色，Tk 才会把那一片抠成透明。
 # 选 (1,2,3) 是因为它离面板配色足够远（不会被误抠），又不是纯黑（纯黑会与文字抗锯齿边打架）。
-TRANSPARENT_KEY = "#010203"
-KEY_RGB = (1, 2, 3)                     # ⚠️ 必须与 TRANSPARENT_KEY 一致
-
-ANCHORS = ("top_left", "top_center", "top_right",
-           "middle_left", "center", "middle_right",
-           "bottom_left", "bottom_center", "bottom_right", "free")
-
-MODES = ("conversation", "latest")
-
-# 窗口后端：auto=有原生就用、没有则回落 Tk（Tk 是正常路径之一，不留警告）；
-# native=显式要求原生（建不起来时留一行警告再回落）；tk=强制 Tk；
-# wayland / x11=强制某一条原生后端（不可用回落 Tk 并留日志）。
-# ⚠️ 启动时生效；运行中改这条需要重启桌面字幕那条腿。
-BACKENDS = ("auto", "native", "tk", "wayland", "x11")
-
-ALPHA_MIN, ALPHA_MAX, ALPHA_DEFAULT = 0.2, 1.0, 0.9
-
-# 锚点 → (水平, 垂直) 的**分子**（分母恒为 2）：0=贴起始边、1=居中、2=贴结束边。
-# 用整数分数而不是 0.5 浮点，是为了让结果与面板/窗口尺寸的奇偶无关（不会出现 .5 抖动）。
-_ANCHOR_GRID: dict[str, tuple[int, int]] = {
-    "top_left": (0, 0), "top_center": (1, 0), "top_right": (2, 0),
-    "middle_left": (0, 1), "center": (1, 1), "middle_right": (2, 1),
-    "bottom_left": (0, 2), "bottom_center": (1, 2), "bottom_right": (2, 2),
-}
-
-_MISSING = object()
+from .desktop_model import (  # noqa: F401 — preserve existing import locations
+    TRANSPARENT_KEY, KEY_RGB, ANCHORS, MODES,
+    BACKENDS, ALPHA_MIN, ALPHA_MAX, ALPHA_DEFAULT,
+    _ANCHOR_GRID, _MISSING, _VISUAL_FIELDS, desktop_visual_defaults,
+    DesktopOverlayConfig, _pick, _as_pair, _as_int,
+    _as_str, _as_bool, clamp_alpha, _clamp_into_area,
+    compute_position, best_anchor, resolve_position,
+)
+from .desktop_controls import _DesktopWindowControls
 
 
-# 桌面字幕**自带**的视觉键（配色 / 底板与边框透明度 / 分隔线 / 说话人竖条色）。
-# 默认值取 OverlayConfig 的**代码默认值** —— 不是用户 config.yaml 里的 `overlay:` 段：
-# 两个面板长得像，但配置完全独立（2026-10-04 维护者口径：两者区别太大，不能共享配置）。
-_VISUAL_FIELDS = ("color_translation", "color_source", "source_alpha", "color_border",
-                  "border_alpha", "color_bg", "bg_alpha", "color_mine", "color_theirs",
-                  "separator", "fade_after_s")
-
-
-def desktop_visual_defaults() -> dict:
-    """桌面字幕的视觉默认值（配色等）—— 取自 OverlayConfig 的**代码**默认值。
-
-    用户改 `overlay:` 段（手腕屏）不会牵动这里，反过来也一样。
-    """
-    base = OverlayConfig()
-    return {k: getattr(base, k) for k in _VISUAL_FIELDS}
-
-
-# ---------------------------------------------------------------- 配置
-@dataclass
-class DesktopOverlayConfig:
-    """桌面字幕窗的配置（**完全独立于 `overlay:` 段**）。
-
-    ⚠️ 桌面面板与头显里的手腕屏长得像，但**两者不是一回事**（尺寸单位、使用场景、
-    屏幕分辨率都不同），所以配置不许共享：本段自带一整套视觉键（字体 / 字号 / 配色 /
-    行数 / 是否显示原文 / 面板尺寸），缺省时回落 **OverlayConfig 的代码默认值**。
-    维护者口径（2026-10-04）：原来的「视觉参数默认继承 `overlay:` 段」打回重做。
-    """
-
-    enabled: bool = False
-    mode: str = "conversation"            # conversation=镜像聊天区 | latest=只显示最新一句（歌词式）
-    backend: str = "auto"                 # 窗口后端，见 BACKENDS（启动时生效）
-    attach_to_game: bool = True           # True=贴在目标窗口上并跟随
-    anchor: str = "bottom_center"         # 见 ANCHORS；free=用 pos 绝对定位
-    offset: tuple[int, int] = (0, -48)    # 相对锚点的像素偏移
-    pos: tuple[int, int] = (80, 80)       # attach_to_game=False / anchor="free" 时的屏幕坐标
-    size_px: tuple[int, int] = (1024, 360)
-    alpha: float = ALPHA_DEFAULT          # 整窗透明度（用户要的「可改透明度」），0.2~1.0
-    click_through: bool = True            # 鼠标穿透（拖动时临时关掉）
-    follow: bool = True                   # 游戏窗口移动/缩放时跟随
-    game_title: str = "VRChat"
-    # ---- 视觉参数：**全在本段**，不从 overlay 段继承 ----
-    font: str = ""                        # 空 = 按平台自动探测（见 overlay.resolve_font_path）
-    font_size: int = 36
-    source_font_size: int = 29
-    max_lines: int = 3
-    show_source: bool = True
-    # 其余视觉键（配色 / 底板与边框透明度 / 分隔线 / 说话人竖条色）也全在本段：
-    # 这里只装**本段显式写出的**那部分，渲染时缺的用 desktop_visual_defaults() 补。
-    visual: dict = field(default_factory=dict)
-
-    @staticmethod
-    def from_dict(d: dict) -> "DesktopOverlayConfig":
-        """解析 `desktop_overlay:` 段。
-
-        ⚠️ **不接收也不读 `overlay:` 段**：两个面板的配置完全独立（见类文档）。
-        每个键缺省时回落本 dataclass 的默认值（视觉键回落 OverlayConfig 的代码默认值）。
-        """
-        d = dict(d or {})
-        base = DesktopOverlayConfig()
-
-        def own(key: str, default: Any, cast: Any = None) -> Any:
-            """只认本段（`desktop_overlay:`）的键。"""
-            return _pick(d, key, default, cast)
-
-        anchor = str(own("anchor", base.anchor, _as_str) or base.anchor)
-        if anchor not in ANCHORS:
-            print(f"[desktop] ⚠️ 配置里的 anchor={anchor!r} 不认识（可选 {ANCHORS}）"
-                  f" → 用 {base.anchor}")
-            anchor = base.anchor
-        mode = str(own("mode", base.mode, _as_str) or base.mode)
-        if mode not in MODES:
-            print(f"[desktop] ⚠️ 配置里的 mode={mode!r} 不认识（可选 {MODES}）"
-                  f" → 用 {base.mode}")
-            mode = base.mode
-        # backend 只看本段：`overlay.backend`（auto/null）是手腕屏那套，语义完全不同，
-        # 读过来会让桌面字幕跟着手腕屏的开关走，属于配置语义漂移。
-        backend = str(own("backend", base.backend, _as_str) or base.backend)
-        if backend not in BACKENDS:
-            print(f"[desktop] ⚠️ 配置里的 backend={backend!r} 不认识（可选 {BACKENDS}）"
-                  f" → 用 {base.backend}")
-            backend = base.backend
-
-        cfg = DesktopOverlayConfig(
-            enabled=bool(own("enabled", base.enabled, _as_bool)),
-            mode=mode,
-            backend=backend,
-            attach_to_game=bool(own("attach_to_game", base.attach_to_game, _as_bool)),
-            anchor=anchor,
-            offset=own("offset", base.offset, _as_pair),
-            pos=own("pos", base.pos, _as_pair),
-            size_px=own("size_px", base.size_px, _as_pair),
-            alpha=clamp_alpha(own("alpha", base.alpha)),
-            click_through=bool(own("click_through", base.click_through, _as_bool)),
-            follow=bool(own("follow", base.follow, _as_bool)),
-            game_title=str(own("game_title", base.game_title, _as_str) or base.game_title),
-            font=str(own("font", base.font, _as_str) or ""),
-            font_size=own("font_size", base.font_size, _as_int),
-            source_font_size=own("source_font_size", base.source_font_size, _as_int),
-            max_lines=own("max_lines", base.max_lines, _as_int),
-            show_source=bool(own("show_source", base.show_source, _as_bool)),
-        )
-        # 视觉键（配色等）同样只认本段：整段原样收下，渲染时用代码默认值补缺。
-        cfg.visual = {k: v for k, v in d.items() if k in _VISUAL_FIELDS}
-        return cfg
-
-    def visual_config(self) -> OverlayConfig:
-        """渲染用的视觉配置：**本段自己的**配色/底板/字体 + 尺寸/字号/行数。
-
-        ⚠️ 不从 `overlay:` 段取任何东西 —— 两个面板的观感各自独立。
-        """
-        d = desktop_visual_defaults()
-        d.update(self.visual or {})
-        d.update({
-            "enabled": True,
-            "size_px": list(self.size_px),
-            "alpha": self.alpha,
-            "font": self.font,
-            "font_size": self.font_size,
-            "source_font_size": self.source_font_size,
-            "max_lines": self.max_lines,
-            "show_source": self.show_source,
-        })
-        return OverlayConfig.from_dict(d)
-
-
-def _pick(d: dict, key: str, default: Any, cast: Any) -> Any:
-    """取值：本段写了（且不是 None）就转成目标类型，否则用 `default`。
-
-    ⚠️ 这里**没有**「继承另一个段」的口子 —— 桌面字幕与 `overlay:`（手腕屏）
-    的配置完全独立（2026-10-04 维护者口径）。别再加回来。
-    """
-    raw = d.get(key, _MISSING)
-    if raw is _MISSING or raw is None:
-        return default
-    if cast is None:
-        return raw
-    try:
-        return cast(raw)
-    except (TypeError, ValueError):
-        # 配置是用户手改的：值不合法要**说出来**再回落，不能悄悄换个值让人猜
-        print(f"[desktop] ⚠️ 配置项 {key}={raw!r} 不合法 → 用默认值 {default!r}")
-        return default
-
-
-def _as_pair(raw: Any) -> tuple[int, int]:
-    vals = [int(v) for v in raw]
-    if len(vals) != 2:
-        raise ValueError(f"需要两个整数，实际 {len(vals)} 个")
-    return (vals[0], vals[1])
-
-
-def _as_int(raw: Any) -> int:
-    return int(raw)
-
-
-def _as_str(raw: Any) -> str:
-    return str(raw)
-
-
-def _as_bool(raw: Any) -> bool:
-    return bool(raw)
-
-
-# ---------------------------------------------------------------- 纯函数（离线可测）
-def clamp_alpha(a: Any) -> float:
-    """整窗透明度夹到 0.2~1.0；非法值（None / "abc" / NaN）回落 0.9。
-
-    下限不是 0：全透明的字幕窗用户会以为"功能坏了"，0.2 至少还看得见个影子。
-    """
-    try:
-        v = float(a)
-    except (TypeError, ValueError):
-        return ALPHA_DEFAULT
-    if v != v:                                  # NaN
-        return ALPHA_DEFAULT
-    return max(ALPHA_MIN, min(ALPHA_MAX, v))
-
-
-def _clamp_into_area(x: int, y: int, w: int, h: int,
-                     area: tuple[int, int, int, int]) -> tuple[int, int]:
-    """把 (x, y) 夹进可用屏幕区域。面板比区域还大时贴区域左上角（至少看得见）。"""
-    left, top, right, bottom = (int(v) for v in area)
-    if w >= right - left:
-        x = left
-    else:
-        x = max(left, min(int(x), right - w))
-    if h >= bottom - top:
-        y = top
-    else:
-        y = max(top, min(int(y), bottom - h))
-    return (int(x), int(y))
-
-
-def compute_position(anchor: str, offset: tuple[int, int],
-                     rect: tuple[int, int, int, int],
-                     size: tuple[int, int],
-                     area: tuple[int, int, int, int]) -> tuple[int, int]:
-    """按锚点把面板贴到目标窗口客户区上，加偏移，最后夹进屏幕可用区域。
-
-    `rect`=(left, top, right, bottom) 目标窗口客户区（屏幕坐标）；
-    `size`=(w, h) 面板像素尺寸；`area`=(l, t, r, b) 可用屏幕区域（工作区，不含任务栏）。
-
-    不认识的锚点按 `center` 处理（面板不会因此跑到屏幕外）。
-    """
-    left, top, right, bottom = (int(v) for v in rect)
-    w, h = (int(v) for v in size)
-    fx, fy = _ANCHOR_GRID.get(str(anchor or ""), _ANCHOR_GRID["center"])
-    ox, oy = _as_pair(offset)
-    x = left + ((right - left - w) * fx) // 2 + ox
-    y = top + ((bottom - top - h) * fy) // 2 + oy
-    return _clamp_into_area(x, y, w, h, area)
-
-
-def best_anchor(pos: tuple[int, int], rect: tuple[int, int, int, int],
-                size: tuple[int, int]) -> tuple[str, tuple[int, int]]:
-    """把「拖到某处的绝对坐标」反算成 `(锚点, 偏移)`。
-
-    拖动后要落盘的必须是「贴着窗口的哪个锚点 + 多大的偏移」，**不能存死坐标** ——
-    否则 VRChat 窗口一移动/改分辨率，字幕就与它脱钩了（用户拖动时并不知道自己在
-    「贴窗」）。取**离落点最近**的那个九宫格点（偏移向量最短），这样窗口缩放时字幕
-    仍然贴着同一条边。
-    """
-    left, top, right, bottom = (int(v) for v in rect)
-    w, h = (int(v) for v in size)
-    px, py = (int(v) for v in pos)
-    best: tuple[int, str, int, int] = (1 << 62, "center", 0, 0)
-    for name, (fx, fy) in _ANCHOR_GRID.items():
-        bx = left + ((right - left - w) * fx) // 2
-        by = top + ((bottom - top - h) * fy) // 2
-        ox, oy = px - bx, py - by
-        d = ox * ox + oy * oy
-        if d < best[0]:
-            best = (d, name, ox, oy)
-    return best[1], (best[2], best[3])
-
-
-def resolve_position(cfg: DesktopOverlayConfig,
-                     rect: tuple[int, int, int, int] | None,
-                     size: tuple[int, int],
-                     area: tuple[int, int, int, int]) -> tuple[int, int]:
-    """定位的统一入口。
-
-    没有目标窗口（`rect is None`）、`anchor == "free"`、或 `attach_to_game=False`
-    → 用 `cfg.pos` 的屏幕绝对坐标（同样夹进 area）；否则按锚点贴到目标窗口上。
-    """
-    if rect is None or cfg.anchor == "free" or not cfg.attach_to_game:
-        x, y = _as_pair(cfg.pos)
-        w, h = (int(v) for v in size)
-        return _clamp_into_area(x, y, w, h, area)
-    return compute_position(cfg.anchor, cfg.offset, rect, size, area)
-
-
-# ---------------------------------------------------------------- 窗口本体
-class DesktopOverlay:
+class DesktopOverlay(_DesktopWindowControls):
     """桌面字幕窗：生命周期 + 出图 + 跟随 + 配置热重载。
 
     接口与手腕屏后端对齐（`start/update/update_entries/tick/close/available`），
@@ -363,6 +94,10 @@ class DesktopOverlay:
         self._entries: list[tuple[str, str, str]] = []
         self._latest: tuple[str, str] = ("", "")
         self._last_sig: Any = None
+        self._content: Any = None
+        self._displayed_approval: Any = None
+        self._epoch = 0
+        self._lock = threading.Lock()
         self._last_cfg_mtime = 0.0
         self._next_search = 0.0
         self._area_fallback_logged = False
@@ -436,106 +171,16 @@ class DesktopOverlay:
               f"跟随={'开' if self.cfg.follow else '关'} 位置={self.position}")
         return True
 
-    def _create_native_window(self) -> Any:
-        """问门面要原生叠加窗（Linux：Wayland layer-shell / X11 ARGB 覆盖窗）；拿不到返回 None。
-
-        建不起来的原因由后端自己打日志（`vlt/platform/linux.py`）；这里只兜异常。
-        """
-        from ..platform import create_desktop_window
-        try:
-            return create_desktop_window(
-                size=tuple(self.cfg.size_px),
-                alpha=self.cfg.alpha,
-                click_through=self.cfg.click_through,
-                on_drag_end=self._native_drag_end,
-                backend=self.cfg.backend,
-            )
-        except Exception as exc:  # noqa: BLE001 — 原生窗失败不许带崩界面
-            print(f"[desktop] ⚠️ 原生窗创建异常（回落 Tk）：{type(exc).__name__}: {exc}")
-            return None
-
-    def _native_drag_end(self, x: int, y: int) -> None:
-        """原生窗拖动落点：与 Tk 的 `_on_drag_end` 走同一套「折算成锚点+偏移」逻辑。"""
-        self.user_pos = (int(x), int(y))
-        changed = self.snap_to_config(self.user_pos)
-        if changed:
-            print(f"[desktop] 拖动落点 {self.user_pos} → 折算成配置 {changed}"
-                  f"（点「锁定位置」后写回 config.yaml）")
-
-    def _build_window(self, tk: Any) -> None:
-        """无边框 + 置顶 + 色键透明 + 鼠标穿透。每一步失败都留一行日志再降级。"""
-        from PIL import ImageTk  # noqa: F401  — 早失败：出图口不在就现在说清楚
-
-        win = tk.Toplevel(self._root)
-        self._win = win
-        win.overrideredirect(True)                     # 无边框（不要标题栏那条）
-        win.configure(bg=TRANSPARENT_KEY)
-        w, h = (int(v) for v in self.cfg.size_px)
-        win.geometry(f"{w}x{h}+{int(self.cfg.pos[0])}+{int(self.cfg.pos[1])}")
-        # 三个属性各自 try：某个平台不吃其中一个时，其余的仍然生效（不要一坏全坏）
-        for name, value in (("-topmost", True),
-                            ("-alpha", clamp_alpha(self.cfg.alpha)),
-                            ("-transparentcolor", TRANSPARENT_KEY)):
-            try:
-                win.attributes(name, value)
-            except tk.TclError as exc:
-                if name == "-transparentcolor":
-                    # Linux 的 Tk 没有色键 → 记下来，之后每帧用 1 位形状蒙版抠底
-                    self._need_shape_mask = True
-                    hint = "改用 1 位形状蒙版抠底（不行的话底板会是不透明的一块）"
-                else:
-                    hint = "这一项按系统默认"
-                print(f"[desktop] ⚠️ 窗口属性 {name} 没吃下（{exc}）→ {hint}，字幕仍可用")
-        label = tk.Label(win, bd=0, highlightthickness=0, bg=TRANSPARENT_KEY)
-        label.pack(fill="both", expand=True)
-        self._label = label
-        # update_idletasks（不是 update）：让 HWND 真的建出来、几何真的落下去，
-        # 但不处理事件队列 —— GUI 模式下主循环正在跑，抢事件会重入。
-        win.update_idletasks()
-        self._resolve_hwnd()
-        self._apply_exstyles()
-        self._bind_drag()
-        # Tk 首次映射时还会再写一次扩展样式（把穿透冲掉）→ 第一跳 tick 补回来
-        self._exstyles_dirty = True
-
-    def _resolve_hwnd(self) -> int:
-        """Tk 给的是子窗口句柄，顶层要再问一次平台门面。"""
-        if self._win is None:
-            return 0
-        from ..platform import top_level_hwnd
-        try:
-            self._hwnd = int(top_level_hwnd(int(self._win.winfo_id())))
-        except Exception as exc:  # noqa: BLE001
-            print(f"[desktop] ⚠️ 取窗口句柄失败（{type(exc).__name__}: {exc}）"
-                  f" → 鼠标穿透/不抢焦点设不上")
-            self._hwnd = 0
-        return self._hwnd
-
-    def _apply_exstyles(self) -> None:
-        """鼠标穿透 + 不抢焦点 + 不进 alt-tab（能力在平台门面上，缺就降级并留痕）。"""
-        if self.dry_run:
-            return
-        want = bool(self.cfg.click_through) and not self._dragging
-        if self._native is not None:
-            # 原生 Wayland 窗：键盘交互在建面时就是 none（不抢焦点）；穿透 = 输入区置空。
-            self._native.set_click_through(want)
-            return
-        if self._win is None:
-            return
-        from ..platform import set_click_through, set_tool_window
-        if not self._hwnd:
-            self._resolve_hwnd()
-        if not self._hwnd:
-            return
-        if not set_tool_window(self._hwnd):
-            print("[desktop] ⚠️ 「不抢焦点/不进任务栏」没设上（本平台可能不支持）"
-                  " → 点字幕可能把焦点从游戏里抢走")
-        if not set_click_through(self._hwnd, want):
-            print(f"[desktop] ⚠️ 鼠标穿透（{'开' if want else '关'}）没设上"
-                  f"（本平台可能不支持） → 字幕会挡住鼠标")
 
     def close(self) -> None:
         """销毁自己的窗口；自建的 root 一并销毁。重复调用不报错。"""
+        with self._lock:
+            self.available = False
+            self._dragging, self._drag_from = False, None
+            self._entries, self._latest = [], ("", "")
+            self._epoch += 1
+            self._content = self._last_sig = self._displayed_approval = None
+            self._dirty = False
         native, self._native = self._native, None
         if native is not None:
             try:
@@ -568,13 +213,12 @@ class DesktopOverlay:
     # ---------- 内容 ----------
     def update(self, text: str, source: str = "", force: bool = False) -> None:
         """只显示最新一句（歌词式）。`mode="conversation"` 时当作"别人刚说的一句"。"""
+        epoch = self._epoch
         text = (text or "").strip()
         source = (source or "").strip()
-        if not text:
+        if not text or not allowed(current()):
             return                                   # 空内容不清屏：宁可留着上一句
-        self._latest = (text, source)
-        self._entries = [("theirs", source, text)]
-        self._touch(force)
+        self._touch(force, (text, source), (("theirs", source, text),), epoch)
 
     def update_entries(self, entries: Any, force: bool = False) -> None:
         """刷新成对话视图：entries = [(who, source, translation[, label]), ...]，**最后一条最新**。
@@ -585,6 +229,7 @@ class DesktopOverlay:
         而手腕屏那条腿好好的（它一直收 4 元组）。两条腿共用同一份 `render_conversation`，
         形状也必须共用同一套口径。
         """
+        epoch = self._epoch
         rows: list[tuple[str, str, str, str]] = []
         for item in (entries or []):
             who, source, text, label = _unpack_entry(item)
@@ -595,31 +240,53 @@ class DesktopOverlay:
                          (label or "").strip()))
         if not rows:
             return                                   # 空内容不清屏
-        self._entries = rows
-        self._latest = (rows[-1][2], rows[-1][1])
-        self._touch(force)
+        self._touch(force, (rows[-1][2], rows[-1][1]), tuple(rows), epoch)
 
-    def _touch(self, force: bool) -> None:
-        sig = self._signature()
-        if sig == self._last_sig and not force:
-            return                                   # 内容没变：不重复出图（省 CPU）
-        self._last_sig = sig
-        self._dirty = True
+    def _touch(self, force: bool, latest: tuple, entries: tuple, epoch: int) -> None:
+        approval = current()
+        content = (latest, entries, approval)
+        view = self._view(content)
+        if not view[1]:
+            return
+        with self._lock:
+            if epoch != self._epoch or not self.available:
+                return
+            self._content = content
+            self._latest, self._entries = latest, list(entries)
+            sig, last = self._signature(view), self._last_sig
+            if last is not None and sig == last[0] and same(view[2], last[1]) and not force:
+                return                               # 同一段内容没变：不重复出图
+            self._last_sig = (sig, view[2])
+            self._dirty = True
         if self.dry_run:
             self._redraw()                           # dry-run 没有 tick 驱动 → 立刻落盘
 
-    def _signature(self) -> tuple:
+    def _signature(self, content: Any = None) -> tuple:
+        latest, entries = content[:2] if content is not None else (self._latest, self._entries)
         if self.cfg.mode == "latest":
-            return ("latest", self._latest)
-        return ("conversation", tuple(self._entries))
+            return ("latest", latest)
+        return ("conversation", tuple(entries))
 
-    def _render(self) -> Image.Image:
+    def _view(self, content):
+        if content is None:
+            return self._latest, tuple(self._entries), None
+        rows, approval = select_rows(content[1], content[2], self.cfg.mode == "latest")
+        latest = (rows[-1][2], rows[-1][1]) if rows else ("", "")
+        return latest, rows, approval
+
+    def _retry(self, key, epoch):
+        with self._lock:
+            if epoch == self._epoch and self._last_sig is key:
+                self._last_sig = None
+
+    def _render(self, content: Any = None) -> Image.Image:
         """复用**手腕屏那套**渲染（不另写画字逻辑）。"""
         vcfg = self.cfg.visual_config()
+        latest, entries = content[:2] if content is not None else (self._latest, self._entries)
         if self.cfg.mode == "latest":
-            text, source = self._latest
+            text, source = latest
             return render_panel(text, source, vcfg)
-        return render_conversation(list(self._entries), vcfg)
+        return render_conversation(list(entries), vcfg)
 
     def _composite(self, panel: Image.Image) -> Image.Image:
         """把 RGBA 面板贴到**色键同色**的 RGB 底上。
@@ -632,21 +299,42 @@ class DesktopOverlay:
         return base
 
     def _redraw(self) -> None:
-        self._dirty = False
+        with self._lock:
+            self._dirty = False
+            epoch, content = self._epoch, self._content
+            key, mode = self._last_sig, self.cfg.mode
+        view = self._view(content)
+        approval = view[2]
+        if content is not None and not view[1]:
+            return
+        if epoch != self._epoch or not allowed(approval):
+            return
         try:
-            panel = self._render()
+            panel = self._render(view)
         except Exception as exc:  # noqa: BLE001 — 出图失败不许打断翻译腿，保留上一帧
             print(f"[desktop] ⚠️ 出图失败（保留上一帧）：{type(exc).__name__}: {exc}")
+            self._retry(key, epoch)
             return
-        if self._native is not None:
+        if epoch != self._epoch or mode != self.cfg.mode or not allowed(approval):
+            return
+        native = self._native
+        if native is not None:
             try:
-                self._native.set_panel(panel, self.cfg.alpha)
-                self._frames += 1
+                with scope(approval):
+                    native.set_panel(panel, self.cfg.alpha)
+                with self._lock:
+                    if epoch != self._epoch or self._native is not native:
+                        return
+                    self._displayed_approval = approval
+                    self._frames += 1
             except Exception as exc:  # noqa: BLE001
                 print(f"[desktop] ⚠️ 原生窗贴图失败（保留上一帧）："
                       f"{type(exc).__name__}: {exc}")
+                self._retry(key, epoch)
             return
         frame = self._composite(panel)
+        if epoch != self._epoch or mode != self.cfg.mode or not allowed(approval):
+            return
         if self.dry_run:
             path = self._frames_dir / f"frame_{self._frames + 1:03d}.png"
             try:
@@ -659,50 +347,44 @@ class DesktopOverlay:
             print(f"[desktop][dry-run] 第 {self._frames} 帧 → {path.name}"
                   f"（{frame.size[0]}x{frame.size[1]}）")
             return
-        if self._blit(frame):
-            self._frames += 1
+        with scope(approval):
+            drawn = self._blit(frame)
+        if drawn:
+            with self._lock:
+                if epoch != self._epoch:
+                    return
+                self._frames += 1
             if self._need_shape_mask:
                 self._apply_shape_mask(panel)
+        else:
+            self._retry(key, epoch)
 
-    def _apply_shape_mask(self, panel: Image.Image) -> None:
-        """Tk 回落路径的 Linux 补丁：把面板 alpha 转 1 位形状蒙版，抠掉键色底。
-
-        Windows 的 Tk 有 `-transparentcolor` 色键；Linux 的 Tk 没有 → 每帧用 X Shape
-        抠形（面板圆角外那圈键色底不再是不透明矩形；圆角本身是 1 位的、会有锯齿）。
-        **逐像素半透明做不到** —— 那是原生窗（Wayland layer-shell / X11 ARGB）的事。
-        尺寸变了蒙版要跟着重设 —— 每帧都重设，天然覆盖（set_window_shape 口径见此）。
-        """
-        if not self._hwnd or self._win is None:
-            return
-        from ..platform import set_window_shape
-        try:
-            mask = alpha_mask_bits(panel)
-            ok = set_window_shape(self._hwnd, mask, panel.size[0], panel.size[1])
-        except Exception as exc:  # noqa: BLE001 — 抠形失败不许打断出图
-            if not self._shape_warned:
-                self._shape_warned = True
-                print(f"[desktop] ⚠️ 形状蒙版失败（字幕仍可用，圆角外会是不透明底）："
-                      f"{type(exc).__name__}: {exc}")
-            return
-        if not ok and not self._shape_warned:
-            self._shape_warned = True
-            print("[desktop] ⚠️ 形状蒙版没设上（本平台可能不支持）"
-                  " → 圆角外会是不透明键色底")
 
     def _blit(self, frame: Image.Image) -> bool:
-        if self._win is None or self._label is None:
+        approval = current()
+        epoch = self._epoch
+        win, label = self._win, self._label
+        if self._win is None or self._label is None or not allowed(approval):
             return False
         try:
             from PIL import ImageTk
 
             # ⚠️ master 要给：进程里可能同时存在 GUI 的 root 与我们自建的 root，
             #    不指定的话 PhotoImage 会挂到"默认 root"上（可能已经被销毁）。
-            self._photo = ImageTk.PhotoImage(frame, master=self._win)
-            self._label.configure(image=self._photo)
+            photo = ImageTk.PhotoImage(frame, master=win)
+            if epoch != self._epoch or not allowed(approval):
+                return False
+            label.configure(image=photo)
+            with self._lock:
+                if epoch != self._epoch or self._win is not win or self._label is not label:
+                    return False
+                self._photo = photo
+                self._displayed_approval = approval
+            self._apply_alpha_only()
         except Exception as exc:  # noqa: BLE001
             print(f"[desktop] ⚠️ 贴图失败（保留上一帧）：{type(exc).__name__}: {exc}")
             return False
-        return True
+        return epoch == self._epoch and self._win is win and self._label is label
 
     # ---------- 周期任务 ----------
     def tick(self) -> None:
@@ -713,10 +395,30 @@ class DesktopOverlay:
             if self._dirty:
                 self._redraw()
             return
-        if self._native is not None:
-            self._reload_config()
-            self._follow_game()
-            self._native.tick()
+        if not allowed(self._displayed_approval):
+            self._apply_alpha_only()
+            if not self._started:
+                return
+            self._dirty = True
+        native = self._native
+        if native is not None:
+            try:
+                self._reload_config()
+                if not self._started or self._native is not native:
+                    return
+                self._follow_game()
+                if not self._started or self._native is not native:
+                    return
+                native.tick()
+                if getattr(native, 'available', True) is False:
+                    self.close()
+                    return
+            except Exception as exc:
+                print(f"[desktop] ⚠️ 原生窗轮询失败：{type(exc).__name__} → 停用字幕窗")
+                self.close()
+                return
+            if not self._started or self._native is not native:
+                return
             if self._dirty:
                 self._redraw()
             return
@@ -737,321 +439,9 @@ class DesktopOverlay:
             except Exception as exc:  # noqa: BLE001
                 print(f"[desktop] ⚠️ 泵 Tk 事件失败：{type(exc).__name__}: {exc}")
 
-    def _work_area(self) -> tuple[int, int, int, int]:
-        """夹取用的屏幕可用区域。
-
-        **已贴到目标窗口**就用「那块显示器」的工作区：主屏工作区只有主屏那一份，
-        拿它夹副屏上的字幕会把字幕拽回主屏（左侧副屏坐标是负的，拽得尤其明显）。
-        没有目标窗口（自由模式 / 找不到窗口）才沿用主屏工作区。
-        """
-        from ..platform import monitor_work_area, screen_work_area
-        try:
-            raw = (monitor_work_area(self._game_hwnd) if self._game_hwnd
-                   else screen_work_area())
-            area = tuple(int(v) for v in raw)
-            left, top, right, bottom = area            # type: ignore[misc]
-            if right > left and bottom > top:
-                return (left, top, right, bottom)      # type: ignore[return-value]
-        except Exception as exc:  # noqa: BLE001
-            if not self._area_fallback_logged:
-                self._area_fallback_logged = True
-                print(f"[desktop] ⚠️ 取屏幕工作区失败（{type(exc).__name__}: {exc}）"
-                      f" → 按 1920x1080 兜底")
-        return (0, 0, 1920, 1080)
-
-    def _apply_position(self) -> None:
-        w, h = (int(v) for v in self.cfg.size_px)
-        x, y = resolve_position(self.cfg, self._game_rect, (w, h), self._work_area())
-        if self._native is not None:
-            try:
-                self._native.move(x, y)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[desktop] ⚠️ 移动原生窗失败：{type(exc).__name__}: {exc}")
-            return
-        if self._win is None:
-            return
-        try:
-            # ⚠️ 偏移必须写成 "+x+y"：Tk 把 "-50" 当成"距右边 50"，只有 "+-50" 才是
-            #    绝对坐标 -50（多屏时副屏在左侧，坐标是负的）。
-            self._win.geometry(f"{w}x{h}+{x}+{y}")
-            self._win.update_idletasks()
-        except Exception as exc:  # noqa: BLE001
-            print(f"[desktop] ⚠️ 移动窗口失败：{type(exc).__name__}: {exc}")
-
-    def _own_hwnds(self) -> tuple[int, ...]:
-        """本程序**自己**的窗口句柄（主界面 + 字幕窗）：找游戏窗口时必须排除。
-
-        主界面标题是「VRChat 实时同传」（英文界面是 vrchat-livetranslate），也含
-        "VRChat" —— 不排除的话，VRChat 没起来时字幕会贴到我们自己的界面上
-        （截图里看得一清二楚：字幕贴在程序窗口下沿）。实测踩过。
-        """
-        out: list[int] = []
-        if self._hwnd:
-            out.append(int(self._hwnd))
-        if self._root is not None:
-            try:
-                from ..platform import top_level_hwnd
-                out.append(int(top_level_hwnd(int(self._root.winfo_id()))))
-            except Exception:  # noqa: BLE001 — 拿不到就少排一个，不影响主流程
-                pass
-        return tuple(out)
-
-    def _find_game(self, *, quiet_missing: bool = False) -> bool:
-        """找目标窗口并记下它的客户区。找不到不算错（退化成绝对定位），但要留一行。"""
-        if not self.cfg.attach_to_game:
-            self._game_hwnd = None
-            self._game_rect = None
-            return False
-        from ..platform import find_game_window, window_client_rect
-        hwnd = find_game_window(self.cfg.game_title, self._own_hwnds())
-        if not hwnd:
-            self._game_hwnd = None
-            self._game_rect = None
-            self._next_search = time.monotonic() + self.SEARCH_RETRY_S
-            if not quiet_missing:
-                print(f"[desktop] ⚠️ 没找到窗口 {self.cfg.game_title!r}"
-                      f" → 退化成屏幕绝对定位 {tuple(self.cfg.pos)}"
-                      f"（{self.SEARCH_RETRY_S:.0f}s 后重试）")
-            return False
-        self._game_hwnd = int(hwnd)
-        self._game_rect = window_client_rect(self._game_hwnd)
-        if self._game_rect is None:
-            print(f"[desktop] ⚠️ 找到窗口 {self.cfg.game_title!r}"
-                  f"（hwnd=0x{self._game_hwnd:X}）但取不到客户区（最小化？）"
-                  f" → 先用屏幕绝对定位")
-            return False
-        print(f"[desktop] ✅ 已贴到 {self.cfg.game_title!r}"
-              f"（hwnd=0x{self._game_hwnd:X}，客户区 {self._game_rect}）")
-        return True
-
-    def _follow_game(self) -> None:
-        """目标窗口移动/缩放/关闭时跟上；句柄失效就重新找。"""
-        if not self.cfg.attach_to_game:
-            return
-        if self._dragging or self._drag_from is not None:
-            return                       # 用户正在拖：别跟他抢窗口位置
-        from ..platform import is_window, window_client_rect
-        if self._game_hwnd is not None and not is_window(self._game_hwnd):
-            print(f"[desktop] ⚠️ 目标窗口已关闭（hwnd=0x{self._game_hwnd:X}）"
-                  f" → 重新查找 {self.cfg.game_title!r}")
-            self._game_hwnd = None
-            self._game_rect = None
-        if self._game_hwnd is None:
-            if time.monotonic() >= self._next_search:
-                if self._find_game(quiet_missing=True) and self.cfg.follow:
-                    self._apply_position()
-            return
-        rect = window_client_rect(self._game_hwnd)
-        if rect is None:
-            if not self._rect_missing_logged:
-                self._rect_missing_logged = True
-                print("[desktop] ⚠️ 目标窗口取不到客户区（最小化/还在加载？）→ 字幕停在原位")
-            return
-        self._rect_missing_logged = False
-        if tuple(rect) == self._game_rect:
-            return
-        self._game_rect = tuple(rect)
-        if self.cfg.follow:
-            self._apply_position()
-
-    # ---------- 交互 ----------
-    def set_draggable(self, on: bool) -> None:
-        """True = 临时关掉鼠标穿透，好让用户把字幕拖到想要的位置。"""
-        on = bool(on)
-        self._dragging = on
-        if self.dry_run:
-            return
-        if self._native is not None:
-            self._native.set_draggable(on)
-        elif self._win is not None:
-            self._apply_exstyles()
-        else:
-            return
-        restored = "开" if (self.cfg.click_through and not on) else "关"
-        print(f"[desktop] {'已解锁拖动（鼠标穿透临时关闭）' if on else '已锁定位置'}"
-              f" → 鼠标穿透={restored}")
-
-    # ---------- 拖动 ----------
-    # `overrideredirect(True)` 的窗口**没有标题栏**，系统不给拖 —— 只能自己绑鼠标事件。
-    # 解不解锁是用户的事：鼠标穿透开着时窗口根本收不到这些事件（这正是穿透的意义）。
-    def _bind_drag(self) -> None:
-        if self._win is None:
-            return
-        for widget in (self._win, self._label):
-            if widget is None:
-                continue
-            widget.bind("<Button-1>", self._on_drag_start, add="+")
-            widget.bind("<B1-Motion>", self._on_drag_move, add="+")
-            widget.bind("<ButtonRelease-1>", self._on_drag_end, add="+")
-
-    def _on_drag_start(self, ev: Any) -> None:
-        if not self._dragging or self._win is None:
-            return
-        try:
-            self._drag_from = (int(ev.x_root) - int(self._win.winfo_x()),
-                               int(ev.y_root) - int(self._win.winfo_y()))
-        except Exception:  # noqa: BLE001
-            self._drag_from = None
-
-    def _on_drag_move(self, ev: Any) -> None:
-        if self._drag_from is None or self._win is None:
-            return
-        x = int(ev.x_root) - self._drag_from[0]
-        y = int(ev.y_root) - self._drag_from[1]
-        try:
-            # 「+x+y」两段都要带加号：Tk 把 "-50" 读成「距右边 50」，只有 "+-50"
-            # 才是绝对坐标 -50（多屏时副屏在左侧，坐标真的是负的）。
-            self._win.geometry(f"+{x}+{y}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[desktop] ⚠️ 拖动窗口失败：{type(exc).__name__}: {exc}")
-
-    def _on_drag_end(self, _ev: Any) -> None:
-        if self._drag_from is None or self._win is None:
-            return
-        self._drag_from = None
-        try:
-            pos = (int(self._win.winfo_x()), int(self._win.winfo_y()))
-        except Exception:  # noqa: BLE001
-            return
-        self.user_pos = pos
-        changed = self.snap_to_config(pos)
-        if changed:
-            print(f"[desktop] 拖动落点 {pos} → 折算成配置 {changed}"
-                  f"（点「锁定位置」后写回 config.yaml）")
-
-    def snap_to_config(self, pos: tuple[int, int] | None = None) -> dict[str, Any]:
-        """把用户拖到的位置折算成配置键（界面拿它写回 config.yaml）。
-
-        贴窗时**必须**折算成 `(anchor, offset)`：存死坐标的话，VRChat 窗口一移动 /
-        改分辨率，字幕就与它脱钩了。没贴窗（`attach_to_game=False` 或找不到窗口）
-        才直接存 `pos` 的屏幕绝对坐标。折算结果同时写回 `self.cfg` —— 否则下一跳
-        「跟随」会按旧锚点把窗口弹回原处。
-        """
-        target = pos or self.user_pos
-        if target is None:
-            return {}
-        w, h = (int(v) for v in self.cfg.size_px)
-        if self.cfg.attach_to_game and self._game_rect is not None:
-            anchor, offset = best_anchor(target, self._game_rect, (w, h))
-            self.cfg.anchor, self.cfg.offset = anchor, offset
-            return {"anchor": anchor, "offset": [int(offset[0]), int(offset[1])]}
-        self.cfg.pos = (int(target[0]), int(target[1]))
-        return {"pos": [int(target[0]), int(target[1])]}
-
-    def set_alpha(self, alpha: Any) -> None:
-        """整窗透明度（用户要的「可改透明度」）。夹到 0.2~1.0。"""
-        self.cfg.alpha = clamp_alpha(alpha)
-        if self.dry_run:
-            return
-        if self._native is not None:
-            self._native.set_alpha(self.cfg.alpha)
-            return
-        if self._win is None:
-            return
-        try:
-            self._win.attributes("-alpha", self.cfg.alpha)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[desktop] ⚠️ 设置透明度 {self.cfg.alpha:.2f} 失败："
-                  f"{type(exc).__name__}: {exc} → 保持原值")
-            return
-        # Tk 改 -alpha 会重写窗口扩展样式 → 穿透/工具窗要补回去，否则拖一次滑块就漏鼠标。
-        # 立刻补一次 + 下一跳再补一次（Tk 的重写是延迟到事件循环里的）。
-        self._apply_exstyles()
-        self._exstyles_dirty = True
-
-    # ---------- 热重载 ----------
-    def _remember_cfg_mtime(self) -> None:
-        if self.config_path is None:
-            return
-        try:
-            self._last_cfg_mtime = self.config_path.stat().st_mtime
-        except OSError:
-            self._last_cfg_mtime = 0.0
-
-    def _reload_config(self) -> None:
-        """config.yaml 存盘即生效（位置/尺寸/透明度/字号改完不用重启）。"""
-        path = self.config_path
-        if path is None:
-            return
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            return                                   # 文件被删/暂时读不到：保留旧配置
-        if mtime == self._last_cfg_mtime:
-            return
-        self._last_cfg_mtime = mtime
-        try:
-            import yaml
-
-            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-            # ⚠️ 只读本段：桌面字幕的配置与 `overlay:`（手腕屏）完全独立。
-            new = DesktopOverlayConfig.from_dict(raw.get("desktop_overlay") or {})
-        except Exception as exc:  # noqa: BLE001
-            print(f"[desktop] ⚠️ 热重载失败（保留旧配置）：{type(exc).__name__}: {exc}")
-            return
-        old, self.cfg = self.cfg, new
-        if new.alpha != old.alpha:
-            self._apply_alpha_only()
-        if new.click_through != old.click_through:
-            self._apply_exstyles()
-        if new.attach_to_game and not old.attach_to_game:
-            self._find_game()
-        if not new.attach_to_game:
-            self._game_hwnd = None
-            self._game_rect = None
-        if (new.size_px, new.anchor, new.offset, new.pos,
-                new.attach_to_game) != (old.size_px, old.anchor, old.offset,
-                                        old.pos, old.attach_to_game):
-            if self._native is not None and new.size_px != old.size_px:
-                try:
-                    self._native.set_size(tuple(new.size_px))
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[desktop] ⚠️ 原生窗改尺寸失败：{type(exc).__name__}: {exc}")
-            self._apply_position()
-        self._last_sig = None                        # 视觉参数可能变了 → 下一跳重新出图
-        self._dirty = True
-        print(f"[desktop] ♻️ 配置热重载：mode={new.mode} anchor={new.anchor} "
-              f"offset={new.offset} 面板={new.size_px[0]}x{new.size_px[1]} "
-              f"透明度={new.alpha:.2f} 字号={new.font_size}/{new.source_font_size} "
-              f"行数={new.max_lines} 显示原文={'是' if new.show_source else '否'} "
-              f"穿透={'开' if new.click_through else '关'} 跟随={'开' if new.follow else '关'}")
-
-    def _apply_alpha_only(self) -> None:
-        """热重载里改透明度用：与 set_alpha 的区别是**不动 cfg**（已经换过了）。"""
-        if self._native is not None:
-            self._native.set_alpha(self.cfg.alpha)
-            return
-        if self._win is None:
-            return
-        try:
-            self._win.attributes("-alpha", self.cfg.alpha)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[desktop] ⚠️ 热重载设置透明度失败：{type(exc).__name__}: {exc}")
-            return
-        self._apply_exstyles()
-        self._exstyles_dirty = True
 
     # ---------- 诊断 ----------
-    @property
-    def position(self) -> tuple[int, int]:
-        """当前窗口的屏幕坐标；没起窗时返回按配置推算的位置。"""
-        if self._native is not None:
-            try:
-                return (int(self._native.position[0]), int(self._native.position[1]))
-            except Exception:  # noqa: BLE001 — 窗口正在销毁：退回推算值
-                pass
-        if self._win is not None:
-            try:
-                return (int(self._win.winfo_x()), int(self._win.winfo_y()))
-            except Exception:  # noqa: BLE001 — 窗口正在销毁：退回推算值
-                pass
-        return resolve_position(self.cfg, self._game_rect,
-                                tuple(int(v) for v in self.cfg.size_px), self._work_area())
 
-    @property
-    def game_rect(self) -> tuple[int, int, int, int] | None:
-        """最近一次找到的目标窗口客户区；没有则 None。"""
-        return self._game_rect
 
     @property
     def frame_count(self) -> int:

@@ -255,6 +255,23 @@ def test_close_is_idempotent_and_wired_into_exit() -> None:
     print("  ✓ ⑤ 关窗幂等 + 退出时收窗")
 
 
+def test_legacy_config_creates_missing_parents() -> None:
+    with _harness(headless=False) as (gui, cfg_path, _opened):
+        for suffix in ("", "output:\n  capture:\n    mic_device: preserved\n", "output:\n  audio:\n    enabled: true\n",
+                       "output: {} # keep-inline\n", "output: null # keep-inline\n",
+                       "output:\n  audio: {} # keep-inline\n", "output:\n  audio:\n    proxy: ~ # keep-inline\n"):
+            original = "# preserve comment\nui:\n  lang: ja\n" + suffix
+            cfg_path.write_text(original, encoding="utf-8")
+            gui._mark_proxy_hint_shown()
+            text = cfg_path.read_text(encoding="utf-8")
+            assert _read_proxy_cfg(cfg_path).get("hint_shown") is True, text
+            assert "# preserve comment" in text and "lang: ja" in text
+            if "mic_device" in original:
+                assert "mic_device: preserved" in text
+            if "keep-inline" in original:
+                assert "# keep-inline" in text
+    print("  ✓ 旧配置缺少父节点时仍持久保存提示标记")
+
 def _n_hashes(text: str) -> int:
     """含 `#` 的行数（本文件用老配置形态做回归，顺便盯住注释不被吃）。"""
     return sum(1 for ln in text.splitlines() if "#" in ln)
@@ -344,6 +361,8 @@ if __name__ == "__main__":
     test_second_process_reads_flag_and_stays_quiet()
     test_disabled_proxy_does_not_hint()
     test_close_is_idempotent_and_wired_into_exit()
+    test_legacy_config_creates_missing_parents()
+
     test_legacy_config_without_proxy_section_marks_once()
     test_unwritable_config_falls_back_loudly_and_never_repeats()
     print("\nALL PASSED")

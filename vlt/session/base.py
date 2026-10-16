@@ -83,6 +83,46 @@ def should_finalize(*, text_quiet_s: float, user_quiet_s: float | None,
     return text_quiet_s >= fast_silence_s
 
 
+class _PolicyWords(dict):
+    """ChatGPT 词库变更使用单调代次，恢复原值也不会复活旧输出。"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._revision = 0
+
+    def _mutate(self, operation, *args, **kwargs):
+        before = dict(self)
+        try:
+            return operation(self, *args, **kwargs)
+        finally:
+            if self != before:
+                self._revision += 1
+
+    def __setitem__(self, key, value):
+        return self._mutate(dict.__setitem__, key, value)
+
+    def __delitem__(self, key):
+        return self._mutate(dict.__delitem__, key)
+
+    def clear(self):
+        return self._mutate(dict.clear)
+
+    def pop(self, key, *default):
+        return self._mutate(dict.pop, key, *default)
+
+    def popitem(self):
+        return self._mutate(dict.popitem)
+
+    def setdefault(self, key, default=None):
+        return self._mutate(dict.setdefault, key, default)
+
+    def update(self, *args, **kwargs):
+        return self._mutate(dict.update, *args, **kwargs)
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+
 @dataclass
 class SessionConfig:
     """一条会话的全部可配置项。模型与目标语言都在这里，故都可插拔。"""
@@ -112,6 +152,19 @@ class SessionConfig:
     # None = 关掉快路径（退回纯 final_silence_s）。
     fast_final_silence_s: float | None = DEFAULT_FAST_FINAL_SILENCE_S
     fast_final_user_quiet_s: float = DEFAULT_FAST_FINAL_USER_QUIET_S
+
+    def __setattr__(self, name, value):
+        data = self.__dict__
+        if (name == 'hotwords' and data.get('provider') == 'chatgpt'
+                and isinstance(value, dict) and not isinstance(value, _PolicyWords)):
+            value = _PolicyWords(value)
+        if (name in ('provider', 'source_lang', 'target_lang', 'output_audio', 'hotwords', '_direction')
+                and name in data and (data[name] != value or (name == 'hotwords' and data[name] is not value))):
+            data['_policy_revision'] = data.get('_policy_revision', 0) + 1
+        object.__setattr__(self, name, value)
+        if (name == 'provider' and value == 'chatgpt' and isinstance(data.get('hotwords'), dict)
+                and not isinstance(data['hotwords'], _PolicyWords)):
+            data['hotwords'] = _PolicyWords(data['hotwords'])
 
     @property
     def url(self) -> str:
@@ -174,6 +227,9 @@ class LiveTranslateSession(abc.ABC):
 
 def create_session(cfg: SessionConfig) -> LiveTranslateSession:
     """按模型名前缀分发到对应代次的实现（可插拔点）。"""
+    if cfg.provider == endpoints.PROVIDER_CHATGPT:
+        from .chatgpt_validated import ChatGPTValidatedSession
+        return ChatGPTValidatedSession(cfg)
     model = cfg.model.lower()
     if model.startswith("qwen3.8-livetranslate") or model.startswith("qwen3.5-livetranslate"):
         from .qwen38 import QwenLiveTranslateSession  # 3.5/3.8 共用一套写出逻辑，差异在事件映射

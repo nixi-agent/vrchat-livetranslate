@@ -410,8 +410,9 @@ def log_startup_info(tag: str = "") -> None:
         from .credentials import mask_key
         raw = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding='utf-8')) if DEFAULT_CONFIG.exists() else {}
         provider = endpoints.normalize_provider(((raw or {}).get('session') or {}).get('provider', endpoints.DEFAULT_PROVIDER))
-        key = load_api_key(slot=endpoints.key_slot(provider))
-        print(f"[startup] API 密钥：{mask_key(key)}")
+        if provider != endpoints.PROVIDER_CHATGPT:
+            key = load_api_key(slot=endpoints.key_slot(provider))
+            print(f"[startup] API 密钥：{mask_key(key)}")
     except SystemExit:
         print("[startup] API 密钥：未配置")
     except Exception as exc:

@@ -9,10 +9,12 @@
 from __future__ import annotations
 
 import socket
+import threading
 import time
 from collections import deque
 
 from pythonosc.osc_message_builder import OscMessageBuilder
+from ..session.chatgpt_output import allowed, current
 
 ADDRESS = "/chatbox/input"
 
@@ -24,21 +26,32 @@ class TokenBucket:
         self.capacity = capacity
         self.window_s = window_s
         self.min_gap_s = min_gap_s
-        self._stamps: deque[float] = deque()
+        self._stamps: deque[tuple[float, object]] = deque()
+        self._lock = threading.Lock()
         self.dropped = 0
 
     def allow(self, now: float | None = None) -> bool:
+        return self.reserve(now) is not None
+
+    def reserve(self, now: float | None = None):
         now = time.monotonic() if now is None else now
-        while self._stamps and now - self._stamps[0] > self.window_s:
-            self._stamps.popleft()
-        if self._stamps and (now - self._stamps[-1]) < self.min_gap_s:
-            self.dropped += 1
-            return False
-        if len(self._stamps) >= self.capacity:
-            self.dropped += 1
-            return False
-        self._stamps.append(now)
-        return True
+        with self._lock:
+            while self._stamps and now - self._stamps[0][0] > self.window_s:
+                self._stamps.popleft()
+            if ((self._stamps and now - self._stamps[-1][0] < self.min_gap_s)
+                    or len(self._stamps) >= self.capacity):
+                self.dropped += 1
+                return None
+            token = object()
+            self._stamps.append((now, token))
+            return token
+
+    def refund(self, token):
+        with self._lock:
+            for index, (_, reserved) in enumerate(self._stamps):
+                if reserved is token:
+                    del self._stamps[index]
+                    break
 
 
 class Chatbox:
@@ -53,7 +66,7 @@ class Chatbox:
         self._sock: socket.socket | None = None
         self.sent_ok = 0
         self.sent_dropped = 0        # 增量被限流丢弃（可弃）
-        self._pending: list[str] = []  # 最终版暂存队列（不可弃，等窗口到了补发）
+        self._pending: list[tuple] = []  # 文本与核准 closure；消费前再次检查
         self.last_datagram: bytes | None = None
 
     def _ensure_sock(self) -> socket.socket:
@@ -79,20 +92,25 @@ class Chatbox:
         return text
 
     def send(self, text: str, is_final: bool = False) -> bool:
+        approval = current()
+        if not allowed(approval):
+            return False
         text = self.sanitize(text)
         if not text:
             return False
-        if not self.bucket.allow():
+        token = self.bucket.reserve()
+        if token is None:
             if is_final:
                 # 最终版必达：不丢，入队等限流窗口（由 app 的 pump 周期补发）
-                if text not in self._pending:
-                    self._pending.append(text)
+                item = (text, approval)
+                if item not in self._pending:
+                    self._pending.append(item)
                 print(f"[chatbox] ⏳ 限流暂缓，最终版入队（pending={len(self._pending)}）: {text[:40]}…")
             else:
                 self.sent_dropped += 1
                 print(f"[chatbox] ⚠️ 限流丢弃增量（bucket dropped={self.bucket.dropped}）: {text[:40]}…")
             return False
-        return self._dispatch(text, is_final)
+        return self._dispatch(text, is_final, approval, token)
 
     def flush_pending(self, newest_first: bool = False) -> int:
         """把暂存的最终版逐条补发（受同一个令牌桶约束）。返回本次成功条数。
@@ -102,18 +120,25 @@ class Chatbox:
         """
         sent = 0
         while self._pending:
-            if not self.bucket.allow():
+            index = -1 if newest_first else 0
+            if not allowed(self._pending[index][1]):
+                self._pending.pop(index)
+                continue
+            token = self.bucket.reserve()
+            if token is None:
                 break
-            text = self._pending.pop() if newest_first else self._pending.pop(0)
-            self._dispatch(text, True)
-            sent += 1
+            text, approval = self._pending.pop(index)
+            sent += int(self._dispatch(text, True, approval, token))
         return sent
 
     @property
     def pending_count(self) -> int:
         return len(self._pending)
 
-    def _dispatch(self, text: str, is_final: bool) -> bool:
+    def _dispatch(self, text: str, is_final: bool, approval=None, token=None) -> bool:
+        if not allowed(approval):
+            self.bucket.refund(token)
+            return False
         dgram = self.build_datagram(text, self.notification_sound)
         self.last_datagram = dgram
         if self.dry_run:

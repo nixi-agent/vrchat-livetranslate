@@ -54,13 +54,15 @@ from urllib.parse import urlsplit
 
 PROVIDER_QIANWEN = "qianwen"
 PROVIDER_QWENCLOUD = "qwencloud"
-PROVIDERS = (PROVIDER_QIANWEN, PROVIDER_QWENCLOUD)
+PROVIDER_CHATGPT = "chatgpt"
+PROVIDERS = (PROVIDER_QIANWEN, PROVIDER_QWENCLOUD, PROVIDER_CHATGPT)
 DEFAULT_PROVIDER = PROVIDER_QIANWEN
 
 # 线路中文名（**只进日志**，不是界面文案；界面文案走 t()）。
 _PROVIDER_CN = {
     PROVIDER_QIANWEN: "千问云",
     PROVIDER_QWENCLOUD: "千问云·海外版",
+    PROVIDER_CHATGPT: "ChatGPT 订阅语音",
 }
 
 # 已下线线路的别名 → 现行线路。老 config.yaml 里可能写着 `bailian_intl`：
@@ -168,6 +170,8 @@ def default_base_url(provider: str) -> str:
     两条线路都不带占位符 / 账号成分：host 是公共域名，直接可连。
     """
     prov = normalize_provider(provider)
+    if prov == PROVIDER_CHATGPT:
+        return "codex://app-server"
     return f"wss://{HOSTS[prov]}{WS_PATH}"
 
 

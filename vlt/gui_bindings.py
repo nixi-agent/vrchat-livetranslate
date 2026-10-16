@@ -1,15 +1,15 @@
 """GUI 薄殼的既有委派表。"""
-from . import gui_settings, gui_update, gui_layout, gui_proxy_hint, gui_proxy
+from . import gui_settings, gui_update, gui_layout, gui_chatgpt, gui_proxy_hint, gui_proxy
 _DELEGATE_MAP = {
-    "_build_settings_dialog": gui_settings.build_settings_dialog,
+    "_build_settings_dialog": gui_chatgpt.build_settings_dialog,
     "_sync_settings_pages": gui_settings.sync_settings_pages,
     "_on_settings_wheel": gui_settings.on_settings_wheel,
     "_size_settings_window": gui_settings.size_settings_window,
     "_build_settings_general": gui_settings.build_settings_general,
     "_on_save_osc_port": gui_settings.on_save_osc_port,
-    "_build_provider_section": gui_settings.build_provider_section,
+    "_build_provider_section": gui_chatgpt.build_provider_section,
     "_on_provider_change": gui_settings.on_provider_change,
-    "_on_save_provider": gui_settings.on_save_provider,
+    "_on_save_provider": gui_chatgpt.on_save_provider,
     "_build_settings_audio": gui_settings.build_settings_audio,
     "_build_settings_wrist": gui_settings.build_settings_wrist,
     "_build_settings_desktop": gui_settings.build_settings_desktop,
@@ -58,8 +58,8 @@ _DELEGATE_MAP = {
     "_schedule_version_changed_hint": gui_update.schedule_version_changed_hint,
     "_show_version_changed_hint": gui_update.show_version_changed_hint,
     "_close_updated_hint": gui_update.close_updated_hint,
-    "_refresh_key_status": gui_update.refresh_key_status,
-    "_open_qianwen_signup": gui_update.open_qianwen_signup,
+    "_refresh_key_status": gui_chatgpt.refresh_key_status,
+    "_open_qianwen_signup": gui_chatgpt.open_signup,
     "_refresh_api_key_in_cfg": gui_update.refresh_api_key_in_cfg,
     "_on_save_key": gui_update.on_save_key,
     "_on_clear_key": gui_update.on_clear_key,

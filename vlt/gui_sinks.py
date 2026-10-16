@@ -9,6 +9,15 @@ from .output.overlay import (OverlayConfig, OVERLAY_ERR_ANCHOR, OVERLAY_ERR_COMP
                              OVERLAY_ERR_HMD, OVERLAY_ERR_OTHER, OVERLAY_ERR_RUNTIME)
 from .i18n import t
 from .gui_engine_context import EngineCtx
+from .session.chatgpt_output import allowed, combined, scope
+
+
+def _approved_rows(bubbles):
+    rows = [b for b in bubbles if (b.text or '').strip()
+            and allowed(getattr(b, 'approval', None), b.who)][-8:]
+    entries = [(b.who, b.source, b.text, b.label) for b in rows]
+    approval = combined((getattr(b, 'approval', None), b.who) for b in rows)
+    return entries, approval
 
 def start_overlay(ctx: EngineCtx, *, force: bool = False) -> bool:
     """按勾选状态接管 SteamVR 的手腕屏。失败只禁用这一项，绝不影响翻译。
@@ -103,8 +112,9 @@ def push_overlay(ctx: EngineCtx, force: bool = False) -> None:
     if ctx.overlay_out is None:
         return
     try:
-        entries = [(b.who, b.source, b.text, b.label) for b in ctx.bubbles[-8:]]
-        ctx.overlay_out.update_entries(entries, force=force)
+        entries, approval = _approved_rows(ctx.bubbles)
+        with scope(approval):
+            ctx.overlay_out.update_entries(entries, force=force)
     except Exception as exc:              # noqa: BLE001
         print(f"[gui] 手腕屏刷新失败：{type(exc).__name__}: {exc}", flush=True)
 
@@ -122,7 +132,9 @@ def start_desktop(ctx: EngineCtx, *, force: bool = False) -> bool:
     失败只禁用这一项，绝不影响翻译。
     """
     if ctx.desktop_out is not None:
-        return True
+        if ctx.desktop_out.available:
+            return True
+        stop_desktop(ctx)
     if not force and "desktop" not in ctx.sinks:
         return False
     try:
@@ -133,7 +145,7 @@ def start_desktop(ctx: EngineCtx, *, force: bool = False) -> bool:
             return False                  # start() 内部已打印原因
         ctx.desktop_out = out
         push_desktop(ctx, force=True)
-        return True
+        return bool(ctx.desktop_out is out and out.available)
     except Exception as exc:              # noqa: BLE001
         ctx.desktop_out = None
         print(f"[gui] ⚠️ 桌面字幕初始化异常，已禁用（翻译不受影响）："
@@ -169,8 +181,17 @@ def push_desktop(ctx: EngineCtx, force: bool = False) -> None:
     if ctx.desktop_out is None:
         return
     try:
-        entries = [(b.who, b.source, b.text, b.label) for b in ctx.bubbles[-8:]]
-        ctx.desktop_out.update_entries(entries, force=force)
+        if not ctx.desktop_out.available:
+            stop_desktop(ctx)
+            ctx.sinks.discard('desktop')
+            if ctx.desktop_var is not None:
+                ctx.desktop_var.set(False)
+            if ctx.set_status_fn:
+                ctx.set_status_fn('warn', t('桌面字幕没启动起来，已自动取消勾选'))
+            return
+        entries, approval = _approved_rows(ctx.bubbles)
+        with scope(approval):
+            ctx.desktop_out.update_entries(entries, force=force)
     except Exception as exc:              # noqa: BLE001
         print(f"[gui] 桌面字幕刷新失败：{type(exc).__name__}: {exc}", flush=True)
 

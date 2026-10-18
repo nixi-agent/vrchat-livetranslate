@@ -723,11 +723,15 @@ _IID_IACTIVATEAUDIOINTERFACECOMPLETIONHANDLER = _GUID("41D949AB-9862-444A-80F6-C
 
 _HRESULT = ctypes.c_long
 _E_NOINTERFACE = -2147467262
+# Linux 上**不存在** `ctypes.WINFUNCTYPE`，但多条既有用例会 import 本模块只验纯逻辑
+# （`test_loopback_errors` / `test_device_wasapi_filter` / `test_i18n` 的 langid 用例…）。
+# 占位成 CFUNCTYPE：真正的 COM 调用只会在 Windows 上发生，Linux 上这些类型不会被调用。
+_WINFUNCPTR = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 
-_QI_FN = ctypes.WINFUNCTYPE(_HRESULT, ctypes.c_void_p, ctypes.POINTER(_GUID),
+_QI_FN = _WINFUNCPTR(_HRESULT, ctypes.c_void_p, ctypes.POINTER(_GUID),
                             ctypes.POINTER(ctypes.c_void_p))
-_AR_FN = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
-_AC_FN = ctypes.WINFUNCTYPE(_HRESULT, ctypes.c_void_p, ctypes.c_void_p)
+_AR_FN = _WINFUNCPTR(ctypes.c_ulong, ctypes.c_void_p)
+_AC_FN = _WINFUNCPTR(_HRESULT, ctypes.c_void_p, ctypes.c_void_p)
 
 
 class _WAVEFORMATEX(ctypes.Structure):
@@ -774,7 +778,7 @@ class _OSVERSIONINFOW(ctypes.Structure):
 def _vcall(ptr, index: int, restype, argtypes: list, *args):
     """按 vtable 下标调一个原始 COM 接口指针。"""
     vtbl = ctypes.cast(ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
-    proto = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)
+    proto = _WINFUNCPTR(restype, ctypes.c_void_p, *argtypes)
     return proto(vtbl[index])(ptr, *args)
 
 

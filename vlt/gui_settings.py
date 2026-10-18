@@ -516,6 +516,28 @@ def signup_url(gui) -> str:
 
 # ================================================================ 音频页
 
+def sync_monitor_controls(gui) -> None:
+    """主界面「耳返」开关 → 设置页「耳返音量 / 耳返输出」的可用态。
+
+    开关本体在主界面（`gui._monitor_var`，唯一那个变量）；这里只负责灰化，避免出现
+    「主界面明明是关的，设置页还能拖音量」这种两处状态打架的观感。
+    Linux 没有这两个控件（`None`）→ 什么都不做。
+    """
+    en = bool(gui._monitor_var.get()) if getattr(gui, "_monitor_var", None) is not None else False
+    vol = getattr(gui, "_monitor_vol", None)
+    combo = getattr(gui, "_monitor_combo", None)
+    if vol is not None:
+        try:
+            vol.configure(state="normal" if en else "disabled")
+        except Exception:                     # noqa: BLE001 — 纯外观，失败不挡流程
+            pass
+    if combo is not None:
+        try:
+            combo.configure(state="readonly" if en else "disabled")
+        except Exception:                     # noqa: BLE001
+            pass
+
+
 def build_settings_audio(gui, body: ttk.Frame) -> None:
     """「音频」页：设备选择 → 输入门限 → 译音音色。"""
     from .voices import REALTIME_VOICES, TTS_VOICES, voice_choices
@@ -575,24 +597,18 @@ def build_settings_audio(gui, body: ttk.Frame) -> None:
                   style="Muted.TLabel", justify=tk.LEFT,
                   wraplength=SETTINGS_WRAP).pack(anchor=tk.W, pady=(6, 0))
 
-    # ---- 耳返（Windows）：勾选 + 输出设备 + 音量 ----
-    gui._monitor_check = None
+    # ---- 耳返（Windows）：开关在主界面（输出行），这里只留 输出设备 + 音量 ----
+    # ⚠️ 开关的 BooleanVar 由主界面 `build_output_row` 创建（`gui._monitor_var`），这里**不再新建**
+    #    —— 两个 BooleanVar 各存一份状态，会出现「主界面勾了、设置页以为没开」。
     gui._monitor_combo = None
     gui._monitor_vol = None
     gui._monitor_vol_lbl = None
-    gui._monitor_var = None
     gui._monitor_vol_var = None
     if not gui._linux_fixed_audio:
         mon_cfg = audio_cfg.get("monitor") or {}
         head = ttk.Frame(body)
         head.pack(fill=tk.X, pady=(10, 0))
-        gui._monitor_var = tk.BooleanVar(master=body, value=bool(mon_cfg.get("enabled")))
-        gui._monitor_check = ttk.Checkbutton(
-            head, text=t("启用耳返（自己听译音）"), variable=gui._monitor_var,
-            command=lambda: gui._on_monitor_change())
-        gui._monitor_check.pack(side=tk.LEFT)
-        ttk.Label(head, text=t("耳返音量:"), style="Dim.TLabel").pack(
-            side=tk.LEFT, padx=(16, 4))
+        ttk.Label(head, text=t("耳返音量:"), style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 4))
         gui._monitor_vol_var = tk.DoubleVar(
             master=body, value=float(mon_cfg.get("volume", 70) or 70))
         gui._monitor_vol = ttk.Scale(
@@ -614,6 +630,7 @@ def build_settings_audio(gui, body: ttk.Frame) -> None:
         ttk.Label(body, text=t("耳返会同时放给你自己听；与 VRChat 音频同设备时采集会自动改为只抓 VRChat"),
                   style="Muted.TLabel", justify=tk.LEFT, wraplength=SETTINGS_WRAP).pack(
                       anchor=tk.W, pady=(4, 0))
+        sync_monitor_controls(gui)
 
     # ---- 麦克风代理（**两端都建**：Windows 走 PortAudio 输出流，Linux 走 pw-cat 管道 +
     #      运行时声明的虚拟麦。语义完全一致，见 vlt/output/micproxy*.py 的模块头）----

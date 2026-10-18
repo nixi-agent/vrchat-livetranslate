@@ -10,7 +10,7 @@ from tkinter import ttk
 from . import ui_tk
 from . import gui_voice
 from .i18n import t
-from .platform import IS_WINDOWS
+from .platform import IS_LINUX, IS_WINDOWS
 from .paths import BUNDLE_DIR
 from .version import display_version
 from .ui_text import (
@@ -390,6 +390,20 @@ def build_output_row(gui) -> None:
                    command=gui._on_overlay_toggle, **ik).pack(side=tk.LEFT, padx=(10, 0))
     tk.Checkbutton(out_frame, text=t("译音输出"), variable=gui._vmic_var,
                    command=gui._save_audio_flag, **ik).pack(side=tk.LEFT, padx=(10, 0))
+    # 耳返（sidetone）：**开关放主界面**（日常用得上，藏在设置里要点三层）；
+    # 音量 / 输出设备仍在「设置 → 音频」。Windows 独占实现 → Linux 不建这个控件
+    # （`earmonitor.open()` 在非 Windows 直接返回 False，建了只会点了没反应）。
+    # `_monitor_var` 是**唯一**的那个变量：设置页不再新建（否则两个 BooleanVar 各说各话）。
+    gui._monitor_check = None
+    gui._monitor_var = None
+    if not IS_LINUX:
+        mon_cfg = _audio_cfg.get("monitor") or {}
+        gui._monitor_var = tk.BooleanVar(value=bool(mon_cfg.get("enabled", False)))
+        gui._monitor_check = tk.Checkbutton(
+            out_frame, text=t("耳返"), variable=gui._monitor_var,
+            command=gui._on_monitor_change, **ik)
+        gui._monitor_check.pack(side=tk.LEFT, padx=(10, 0))
+
     # 原声/译音切换按钮（依赖 proxy；无 proxy 时禁用）
     from .ui_tk import FONT_UI as _FONT_UI
     gui._voice_mode_btn = ttk.Button(

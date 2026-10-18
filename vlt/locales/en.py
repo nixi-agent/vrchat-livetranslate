@@ -163,13 +163,15 @@ STRINGS: dict[str, str] = {
     "端点混音（含其它应用）": "Endpoint mix (incl. other apps)",
     "只抓 VRChat（进程）": "VRChat only (process)",
     "采集方式：{mode}": "Capture mode: {mode}",
-    "启用耳返（自己听译音）": "Enable sidetone (hear your own TTS)",
+    "耳返": "Sidetone",
     "耳返音量:": "Sidetone volume:",
     "耳返输出:": "Sidetone output:",
     "耳返打开失败（设备被占用或不可用），其余功能不受影响":
         "Sidetone failed to open (device busy or unavailable); everything else is unaffected",
     "耳返：{device}，音量 {vol}%": "Sidetone: {device}, volume {vol}%",
     "耳返已关闭": "Sidetone off",
+    "耳返要配合「译音输出」才有声音": "Sidetone only produces sound together with the Voice Output switch",
+    "耳返要麦克风代理才能出声（设置 → 音频 → 麦克风代理）": "Sidetone needs the Mic Proxy to produce sound (Settings → Audio → Mic Proxy)",
     "系统默认输出": "System default output",
     "耳返会同时放给你自己听；与 VRChat 音频同设备时采集会自动改为只抓 VRChat":
         "Sidetone plays the translation back to you; if it shares the device with VRChat audio, "

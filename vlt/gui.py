@@ -458,18 +458,32 @@ class TranslationGUI(ProxyMethods):
         if new_mic != old_mic:
             self._apply_mic_change(new_mic)
     def _save_device_config(self, mic_name, loop_name, out_name) -> None: self._sync_audio_ctx(); gui_audio.save_device_config(self._audio_ctx, self._cfg, mic_name, loop_name, out_name)
-    # ── 耳返（sidetone）：勾选 / 设备 / 音量 ──
+    # ── 耳返（sidetone）：开关在主界面（输出行）/ 设备 / 音量在设置 ──
     def _on_monitor_change(self, _event=None) -> None:
         self._sync_audio_ctx()
+        if getattr(self, "_monitor_vol_var", None) is None:      # Linux：没有这些控件
+            return
         en = bool(self._monitor_var.get())
         vol = float(self._monitor_vol_var.get())
         dev = gui_audio.monitor_device_from_combo(self._monitor_combo, self._names_holder)
         gui_audio.save_monitor_config(self._audio_ctx, self._cfg, en, dev, vol)
+        # 设置页的音量/设备跟着变灰（开关只有主界面那一个）
+        gui_settings.sync_monitor_controls(self)
+        # 耳返放的是「译音输出」那条腿的音频：那条腿没开就只剩静音 —— 照开流（配置一致、
+        # 之后打开译音输出立刻有声音），但状态栏要说清为什么没声。
+        no_leg = en and not bool(self._vmic_var.get())
         if self._proxy is None:
+            if no_leg:
+                self._set_status("info", t("耳返要配合「译音输出」才有声音"))
+            elif en:
+                # 耳返是挂在麦克风代理那条流上的 tap：没有代理就没有任何音频流。
+                self._set_status("warn", t("耳返要麦克风代理才能出声（设置 → 音频 → 麦克风代理）"))
             return
         ok = self._proxy.restart_monitor(enabled=en, device_name=dev, volume=vol)
         if en and not ok:
             self._set_status("warn", t("耳返打开失败（设备被占用或不可用），其余功能不受影响"))
+        elif no_leg:
+            self._set_status("info", t("耳返要配合「译音输出」才有声音"))
         elif en:
             self._set_status("info", t("耳返：{device}，音量 {vol}%",
                                       device=dev or t("系统默认输出"), vol=f"{vol:.0f}"))

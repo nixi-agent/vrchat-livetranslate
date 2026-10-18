@@ -6,7 +6,9 @@
 1. **音量**：0% 全静音、50% 幅度减半、100% 原样；缓冲里已有的旧音频也按新音量放。
 2. **缓冲**：推进来的 PCM 超过上限时**丢最旧的**；欠载补零（不拖引擎线程）。
 3. **失败口径**：设备打不开 / 平台不支持 → 只禁用耳返，返回 False，不抛、不影响代理。
-4. **接线**：`TranslatedSink.push()` 必须同时喂给耳返（这是唯一 tap 点）。
+4. **接线**：耳返必须从**播放侧** tap（`MicProxy._drain_translated()`）—— 它拿到的是实际
+   发给虚拟声卡的那批字节、同一条时间轴；`TranslatedSink.push()` **不许**喂耳返
+   （那里是 TTS 突发入口，一个 delta 常有几百 ms，会被 120ms 监听缓冲截断）。
 5. **热重开**：界面改开关/设备 → `restart_monitor()` 只重开这一路，不动虚拟声卡。
 6. **回路策略**：耳返与采集端点同设备 + 端点模式 → 自动改 process；
    process 不可用 → 关掉耳返并 warn（绝不静默留一个会自我回译的回路）。
@@ -150,16 +152,93 @@ def test_non_windows_is_disabled() -> None:
 
 # ---------------------------------------------------------------- ③ 接线 / 热重开
 
-def test_proxy_taps_monitor() -> None:
+class _FakeBuf:
+    """译音播放缓冲替身：按剧本吐块；`None` = 未起播/不足（生产里补静音）。"""
+
+    def __init__(self, blocks: list[bytes]) -> None:
+        self.blocks = list(blocks)
+        self.pushed: list[bytes] = []
+
+    def push(self, pcm: bytes) -> None:
+        self.pushed.append(pcm)
+
+    def drain_block(self, need: int) -> bytes | None:
+        if not self.blocks:
+            return None
+        d = self.blocks.pop(0)
+        assert len(d) == need, f"剧本块长不对：{len(d)} != {need}"
+        return d
+
+
+def test_push_does_not_feed_monitor() -> None:
+    """push 只负责「进缓冲」；在那里 tap 耳返会被 120ms 容量截断（真机症状的根因）。"""
     from vlt.output.micproxy import MicProxy
 
     proxy = MicProxy(audio_cfg={"monitor": {"enabled": False}})
+    buf = _FakeBuf([])
     mon = _FakeMon()
-    proxy._monitor = mon                               # noqa: SLF001
-    pcm = b"\x01\x00\x02\x00" * 10
-    proxy.translated_sink.push(pcm)
-    assert mon.got == [pcm], "TranslatedSink.push 必须同时喂耳返"
-    print("  TranslatedSink.push → 耳返 tap OK")
+    proxy._translated = buf                             # noqa: SLF001
+    proxy._monitor = mon                                # noqa: SLF001
+    burst = b"\x01\x00\x02\x00" * 72000                 # 1.5s 一次性到达（真实 TTS delta 形态）
+    proxy.translated_sink.push(burst)
+    assert buf.pushed == [burst], "push 仍必须把数据推进译音缓冲"
+    assert mon.got == [], f"push 处不许喂耳返（会被截断）：{mon.got!r}"
+    print("  TranslatedSink.push 不再 tap 耳返（只进缓冲）OK")
+
+
+def test_playout_tap_feeds_monitor_same_bytes() -> None:
+    """播放侧 tap：交出去的字节 == 耳返收到的字节（同一批、同一时刻）。"""
+    from vlt.output.micproxy import MicProxy
+
+    need = 3840                                          # 20ms / 48k / 2ch / int16
+    chunk = b"\x33\x00" * (need // 2)
+    proxy = MicProxy(audio_cfg={"monitor": {"enabled": False}})
+    proxy._translated = _FakeBuf([chunk])               # noqa: SLF001
+    mon = _FakeMon()
+    proxy._monitor = mon                                # noqa: SLF001
+
+    got = proxy._drain_translated(need)                 # noqa: SLF001
+    assert got == chunk, "交出去的必须就是缓冲里那一块"
+    assert mon.got == [chunk], f"耳返必须收到同一块：{mon.got!r}"
+    print("  播放侧 tap：耳返字节 == 实际播出字节 OK")
+
+
+def test_silence_is_not_pushed_to_monitor() -> None:
+    """未起播/不足时补静音，但**不喂**耳返（别把静音堆进监听缓冲、凭空加延迟）。"""
+    from vlt.output.micproxy import MicProxy
+
+    need = 3840
+    proxy = MicProxy(audio_cfg={"monitor": {"enabled": False}})
+    proxy._translated = _FakeBuf([])                    # noqa: SLF001
+    mon = _FakeMon()
+    proxy._monitor = mon                                # noqa: SLF001
+    assert proxy._drain_translated(need) == b"\x00" * need   # noqa: SLF001
+    assert mon.got == [], mon.got
+    print("  补静音不进耳返 OK")
+
+
+def test_burst_arrival_never_truncates_monitor() -> None:
+    """回归（真机症状「上一句没播完就跳到下一句」）：TTS 整两句突发到达 + 实时排空，
+    耳返收到的块必须与播出去的逐块一致 —— 不许丢正在播的那一句。"""
+    from vlt.output.micproxy import MicProxy
+
+    need = 3840
+    sent_a = [b"\x11\x00" * (need // 2) for _ in range(75)]     # 1.5s = 75 × 20ms
+    sent_b = [b"\x22\x00" * (need // 2) for _ in range(75)]
+    proxy = MicProxy(audio_cfg={"monitor": {"enabled": False}})
+    proxy._translated = _FakeBuf(sent_a + sent_b)              # noqa: SLF001
+    mon = _FakeMon()
+    proxy._monitor = mon                                       # noqa: SLF001
+
+    # 突发：两句一次性推进来（push 不再触达耳返）
+    proxy.translated_sink.push(b"".join(sent_a + sent_b))
+    assert mon.got == [], "突发入队本身不该产生监听音频"
+
+    played = [proxy._drain_translated(need) for _ in range(150)]   # noqa: SLF001
+    assert played == sent_a + sent_b, "播放内容必须完整、有序"
+    assert mon.got == played, ("耳返必须逐块等于播出去的数据（旧实现在这里会丢句子）："
+                              f"{len(mon.got)} vs {len(played)} 块")
+    print("  突发到达 + 实时排空：耳返与游戏听到的逐块一致 OK")
 
 
 def test_proxy_restart_monitor() -> None:
@@ -322,7 +401,10 @@ if __name__ == "__main__":
     test_ring_drops_oldest_and_pads_silence()
     test_open_failure_is_contained()
     test_non_windows_is_disabled()
-    test_proxy_taps_monitor()
+    test_push_does_not_feed_monitor()
+    test_playout_tap_feeds_monitor_same_bytes()
+    test_silence_is_not_pushed_to_monitor()
+    test_burst_arrival_never_truncates_monitor()
     test_proxy_restart_monitor()
     test_conflict_detection()
     test_effective_mode_upgrades_to_process()

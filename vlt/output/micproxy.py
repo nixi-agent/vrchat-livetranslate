@@ -253,9 +253,10 @@ class TranslatedSink:
         buf = self._p._translated
         if buf is not None:
             buf.push(pcm_48k_stereo)
-        # 耳返：同一段（已过 level 增益与限幅的）PCM 再送一份给用户自己听。
-        # 只在这里 tap —— 见 earmonitor.py 模块头（「对方听到的」与「你听到的」是同一段）。
-        self._p._monitor_push(pcm_48k_stereo)
+        # ⚠️ 这里**不能**再 tap 耳返：push 是 TTS 突发到达的入口（一个 delta 常有几百 ms），
+        #    耳返缓冲只有 120ms，在这里喂会把正在播的句子截断 —— 实测症状
+        #    「上一句还没播完就跳到下一句」，而进游戏那一路是对的。
+        #    耳返跟着**实际播出去的字节**走，见 `MicProxy._drain_translated()`。
 
     def end_sentence(self) -> None:
         buf = self._p._translated
@@ -566,13 +567,29 @@ class MicProxy:
                         err=last_exc)
         return False
 
+    def _drain_translated(self, need: int) -> bytes:
+        """取一块「进游戏」的译音数据，并**同时**送给耳返 —— 唯一的耳返 tap 点。
+
+        为什么在这里而不是 `TranslatedSink.push()`：push 是 TTS 突发到达的入口，
+        一个 delta 常有几百 ms，一次性灌进只有 120ms 容量的监听缓冲会把**正在播的
+        句子截断**（真机症状：「上一句还没播完就开始播下一句」，而游戏那一路是对的）。
+        从播放侧 tap，耳返拿到的就是**实际发给虚拟声卡的那批字节、同一条时间轴**。
+
+        未起播 / 数据不足 → 补静音（既有语义），此时**不喂**耳返（别把静音堆进
+        监听缓冲，那只会让耳返凭空多出一段延迟）。
+        """
+        data = self._translated.drain_block(need) if self._translated is not None else None
+        if data is None:
+            return b"\x00" * need
+        self._monitor_push(data)
+        return data
+
     def _out_callback(self, outdata: bytearray, frames: int, time_info, status) -> None:
         need = frames * 2 * 2
         if status:
             pass
         if self._mode == MODE_TRANSLATED and self._translated is not None:
-            data = self._translated.drain_block(need)
-            outdata[:] = (b"\x00" * need) if data is None else data
+            outdata[:] = self._drain_translated(need)
             return
         data, under = self._ring.drain(need)
         outdata[:] = data

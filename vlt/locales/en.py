@@ -159,6 +159,10 @@ STRINGS: dict[str, str] = {
     "设备选择自动保存到 config.yaml": "Device selection is saved to config.yaml automatically",
     "Linux：VRChat 音频与译音输出已自动处理":
         "Linux: VRChat audio and voice output are handled automatically",
+    "采集方式:": "Capture mode:",
+    "端点混音（含其它应用）": "Endpoint mix (incl. other apps)",
+    "只抓 VRChat（进程）": "VRChat only (process)",
+    "采集方式：{mode}": "Capture mode: {mode}",
     # ---- 设置弹窗：输入门限（只作用于 VRChat 输出 /「别人说话」）----
     "输入门限": "Input Gate",
     "启用 —— 低于门限的声音不翻译（滤掉远处说话小声的玩家）":

@@ -17,8 +17,14 @@ from vlt.platform.linux import _mic_target_node
 class Combo:
     tk = SimpleNamespace(splitlist=lambda values: values)
 
-    def configure(self, *, values):
-        self.values = values
+    def __init__(self):
+        self.state = "readonly"
+
+    def configure(self, *, values=None, state=None):
+        if values is not None:
+            self.values = values
+        if state is not None:
+            self.state = state
 
     def set(self, value):
         self.value = value

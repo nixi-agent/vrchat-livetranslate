@@ -646,7 +646,518 @@ def open_loopback(target: LoopbackTarget, *, blocksize: int) -> AudioSource:
     return src
 
 
-# ---------------------------------------------------------------- 手腕屏后端
+# ---------------------------------------------------------------- 进程级 loopback（Win10 21H2+）
+#
+# 为什么要有这条腿：端点 loopback 抓的是**整个输出设备的混音** —— 浏览器、音乐、
+# 系统提示音都会被当成「游戏内语音」喂给模型（Linux 腿早就按应用流节点抓，见
+# `vlt/platform/linux.py::find_vrchat_output_streams` 里那段说明）。Windows 的等价能力
+# 是 WASAPI **process loopback**：`ActivateAudioInterfaceAsync` +
+# `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK`，只抓指定进程树。
+#
+# 实测结论（2026-10，Win11 26200，纯 ctypes，无新依赖；脚本见 Hermes spike）：
+#   · 激活 1.7–2.3ms；包长恒定 480 帧 = 10ms；LOOPBACK|EVENTCALLBACK 稳定出数据
+#   · 只抓目标进程：子进程 1kHz → 主频 1000.0Hz / SNR 134dB；换别的 PID → 全零
+#   · **不抓自己**：同一刻本进程播 500Hz → 500Hz 频段 -90.6dB（这是「耳返不会被
+#     自己采集」的物理保证）
+#   · `GetMixFormat()` / `IsFormatSupported()` 恒 `E_NOTIMPL` → 格式必须硬编码
+#   · `WAVEFORMATEX` **必须 `_pack_=1`**（mmreg.h 是 18 字节；ctypes 默认对齐 20 →
+#     `Initialize` 一律 `E_INVALIDARG`，看起来像"格式不支持"，很能骗人）
+#   · `AUDCLNT_BUFFERFLAGS_SILENT` 实测**从未出现**：静音就是 480 帧全零，别靠 flag 判静音
+#   · 电平：同一素材比端点后端热约 +7.45dB（自播 +2.8dB）→ 换腿后输入门限要重新标定，
+#     这也是它**默认关闭**（`capture.loopback_mode: endpoint`）的原因之一
+#
+# ⚠️ 契约：`QueueAudioSource` 的下游（`engine.to_16k_mono`）只认 **int16le**，
+#    而这里收到的是 float32。转换必须在本模块内完成 —— 直接喂 float32 不会报错，
+#    只会让 ASR 收到一片噪声（实测那类 bug 极难从日志看出来）。
+VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK = "VAD\\Process_Loopback"
+#: 官方文档写 Win10 build 20348，实测 19044/19045（21H2/22H2）可用（OBS 28+ 同口径）。
+PROCESS_LOOPBACK_MIN_BUILD = 19044
+_PROCESS_LOOPBACK_MODE_INCLUDE_TREE = 0
+_PROCESS_LOOPBACK_ACTIVATION_TYPE = 1
+
+_AUDCLNT_SHAREMODE_SHARED = 0
+_AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
+_AUDCLNT_STREAMFLAGS_EVENTCALLBACK = 0x00040000
+_AUDCLNT_BUFFERFLAGS_SILENT = 0x2
+_WAVE_FORMAT_IEEE_FLOAT = 0x0003
+_KSAUDIO_SPEAKER_STEREO = 0x3
+_VT_BLOB = 65
+_COINIT_MULTITHREADED = 0x0
+
+_HR_NAMES = {
+    0x00000000: "S_OK", 0x80004001: "E_NOTIMPL", 0x80004002: "E_NOINTERFACE",
+    0x80070057: "E_INVALIDARG", 0x80070005: "E_ACCESSDENIED",
+    0x80010106: "RPC_E_CHANGED_MODE", 0x8000000A: "E_PENDING",
+    0x88890002: "AUDCLNT_E_ALREADY_INITIALIZED", 0x88890004: "AUDCLNT_E_DEVICE_INVALIDATED",
+    0x88890008: "AUDCLNT_E_UNSUPPORTED_FORMAT", 0x88890021: "AUDCLNT_E_INVALID_STREAM_FLAG",
+}
+
+
+def _hr_name(hr: int) -> str:
+    return _HR_NAMES.get(hr & 0xFFFFFFFF, f"0x{hr & 0xFFFFFFFF:08X}")
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+    def __init__(self, s: str) -> None:
+        super().__init__()
+        parts = s.strip("{}").split("-")
+        self.Data1 = int(parts[0], 16)
+        self.Data2 = int(parts[1], 16)
+        self.Data3 = int(parts[2], 16)
+        for i, b in enumerate(bytes.fromhex(parts[3] + parts[4])):
+            self.Data4[i] = b
+
+    def __eq__(self, other: object) -> bool:      # noqa: D105 —— 只比较字节
+        return bytes(self) == bytes(other)
+
+
+_IID_IUNKNOWN = _GUID("00000000-0000-0000-C000-000000000046")
+_IID_IAGILEOBJECT = _GUID("94ea2b94-e9cc-49e0-c0ff-ee64ca8f5b90")
+_IID_IMARSHAL = _GUID("00000003-0000-0000-C000-000000000046")
+_IID_IAUDIOCLIENT = _GUID("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2")
+_IID_IAUDIOCAPTURECLIENT = _GUID("C8ADBD64-E71E-48a0-A4DE-185C395CD317")
+_IID_IACTIVATEAUDIOINTERFACECOMPLETIONHANDLER = _GUID("41D949AB-9862-444A-80F6-C261334DA5EB")
+
+_HRESULT = ctypes.c_long
+_E_NOINTERFACE = -2147467262
+
+_QI_FN = ctypes.WINFUNCTYPE(_HRESULT, ctypes.c_void_p, ctypes.POINTER(_GUID),
+                            ctypes.POINTER(ctypes.c_void_p))
+_AR_FN = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+_AC_FN = ctypes.WINFUNCTYPE(_HRESULT, ctypes.c_void_p, ctypes.c_void_p)
+
+
+class _WAVEFORMATEX(ctypes.Structure):
+    # ⚠️ `_pack_ = 1` 不是洁癖：mmreg.h 用 pshpack1，18 字节；不压紧就是 20，
+    #    `IAudioClient::Initialize` 一律 `E_INVALIDARG`（实测烧掉一轮排查）。
+    _pack_ = 1
+    _fields_ = [("wFormatTag", ctypes.c_ushort), ("nChannels", ctypes.c_ushort),
+                ("nSamplesPerSec", ctypes.c_ulong), ("nAvgBytesPerSec", ctypes.c_ulong),
+                ("nBlockAlign", ctypes.c_ushort), ("wBitsPerSample", ctypes.c_ushort),
+                ("cbSize", ctypes.c_ushort)]
+
+
+class _PROPVARIANT(ctypes.Structure):
+    _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort),
+                ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
+                ("blobSize", ctypes.c_ulong), ("pad", ctypes.c_ulong),
+                ("pBlob", ctypes.c_void_p)]
+
+
+class _PROCESS_LOOPBACK_PARAMS(ctypes.Structure):
+    _fields_ = [("TargetProcessId", ctypes.c_ulong),
+                ("ProcessLoopbackMode", ctypes.c_int)]
+
+
+class _ACTIVATION_PARAMS(ctypes.Structure):
+    _fields_ = [("ActivationType", ctypes.c_int),
+                ("ProcessLoopbackParams", _PROCESS_LOOPBACK_PARAMS)]
+
+
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong),
+                ("th32ProcessID", ctypes.c_ulong), ("th32DefaultHeapID", ctypes.c_void_p),
+                ("th32ModuleID", ctypes.c_ulong), ("cntThreads", ctypes.c_ulong),
+                ("th32ParentProcessID", ctypes.c_ulong), ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", ctypes.c_ulong), ("szExeFile", ctypes.c_wchar * 260)]
+
+
+class _OSVERSIONINFOW(ctypes.Structure):
+    _fields_ = [("dwOSVersionInfoSize", ctypes.c_ulong), ("dwMajorVersion", ctypes.c_ulong),
+                ("dwMinorVersion", ctypes.c_ulong), ("dwBuildNumber", ctypes.c_ulong),
+                ("dwPlatformId", ctypes.c_ulong), ("szCSDVersion", ctypes.c_wchar * 128)]
+
+
+def _vcall(ptr, index: int, restype, argtypes: list, *args):
+    """按 vtable 下标调一个原始 COM 接口指针。"""
+    vtbl = ctypes.cast(ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    proto = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)
+    return proto(vtbl[index])(ptr, *args)
+
+
+def _com_release(ptr) -> None:
+    if ptr:
+        try:
+            _vcall(ptr, 2, ctypes.c_ulong, [])
+        except Exception:                        # noqa: BLE001 — 释放失败不该拖垮收尾
+            pass
+
+
+def _windows_build() -> int:
+    """真实 build 号（`RtlGetVersion`；`GetVersionEx` 会被兼容层骗）。"""
+    try:
+        info = _OSVERSIONINFOW()
+        info.dwOSVersionInfoSize = ctypes.sizeof(info)
+        if ctypes.WinDLL("ntdll").RtlGetVersion(ctypes.byref(info)) == 0:
+            return int(info.dwBuildNumber)
+    except Exception:                            # noqa: BLE001
+        pass
+    return 0
+
+
+def process_loopback_available() -> tuple[bool, str]:
+    """这条腿在这台机器上能不能用。返回 (可用, 原因)；原因会进日志。"""
+    build = _windows_build()
+    if build and build < PROCESS_LOOPBACK_MIN_BUILD:
+        return False, f"系统 build {build} < {PROCESS_LOOPBACK_MIN_BUILD}"
+    try:
+        api = getattr(ctypes.WinDLL("Mmdevapi.dll"), "ActivateAudioInterfaceAsync", None)
+    except Exception as exc:                     # noqa: BLE001
+        return False, f"Mmdevapi 不可用：{type(exc).__name__}"
+    if api is None:
+        return False, "Mmdevapi 里没有 ActivateAudioInterfaceAsync"
+    return True, f"build {build or '?'}"
+
+
+def find_process_pid(exe_name: str = "VRChat.exe") -> int | None:
+    """按可执行文件名找进程（Toolhelp 快照）。找不到返回 None。
+
+    ⚠️ 必须打**真正出声的那个进程**：venv 的 `python.exe` 是跳板，`Popen.pid` 与实际
+    发声线程所属进程不同 → 瞄准跳板会「激活成功 + 完美静音」（实测踩过）。
+    VRChat 场景打 `VRChat.exe` 自身即可；进程树模式会把它的子进程一起带上。
+    """
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    th32cs_snapproc = 0x00000002
+    invalid = ctypes.c_void_p(-1).value
+    k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    snap = k32.CreateToolhelp32Snapshot(th32cs_snapproc, 0)
+    if not snap or snap == invalid:
+        return None
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        want = exe_name.lower()
+        found: list[int] = []
+        ok = k32.Process32FirstW(ctypes.c_void_p(snap), ctypes.byref(entry))
+        while ok:
+            if str(entry.szExeFile).lower() == want:
+                found.append(int(entry.th32ProcessID))
+            ok = k32.Process32NextW(ctypes.c_void_p(snap), ctypes.byref(entry))
+        if not found:
+            return None
+        if len(found) > 1:
+            print(f"[loopback] 匹配到 {len(found)} 个 {exe_name}（PID {found}），取第一个",
+                  flush=True)
+        return found[0]
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(snap))
+
+
+def pid_alive(pid: int) -> bool:
+    """进程是否还活着（`STILL_ACTIVE`）。用于判断「VRChat 退出 → 回等待」。"""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    handle = k32.OpenProcess(0x1000, False, int(pid))      # QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong(0)
+        if not k32.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code)):
+            return True                                    # 查不到就别当它死了
+        return code.value == 259                           # STILL_ACTIVE
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(handle))
+
+
+#: COM 回调只给得到 `this` 指针 → 用它反查实例（每个采集流一个 handler）。
+_HANDLER_BY_ADDR: dict[int, "_CompletionHandler"] = {}
+
+
+def _handler_of(this):
+    try:
+        return _HANDLER_BY_ADDR.get(int(this))
+    except (TypeError, ValueError):
+        return None
+
+
+def _h_query_interface(this, priid, ppv):
+    inst = _handler_of(this)
+    if not ppv:
+        return _E_NOINTERFACE
+    ppv[0] = None
+    riid = priid.contents
+    if riid in (_IID_IUNKNOWN, _IID_IAGILEOBJECT,
+                _IID_IACTIVATEAUDIOINTERFACECOMPLETIONHANDLER):
+        ppv[0] = ctypes.c_void_p(this)
+        return 0
+    if riid == _IID_IMARSHAL and inst is not None and inst._ftm:
+        out = ctypes.c_void_p()
+        hr = _vcall(inst._ftm, 0, _HRESULT,
+                    [ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)],
+                    ctypes.byref(_IID_IMARSHAL), ctypes.byref(out))
+        ppv[0] = out
+        return hr
+    return _E_NOINTERFACE
+
+
+def _h_addref(this):                             # noqa: ANN001, ARG001
+    # 引用计数只服务激活这一小段：探活对象本身不会被别人长期持有，返回非零即可。
+    return 2
+
+
+def _h_release(this):                            # noqa: ANN001, ARG001
+    return 1
+
+
+def _h_activate_completed(this, op):             # noqa: ANN001, ARG001
+    inst = _handler_of(this)
+    if inst is not None:
+        inst.fired += 1
+        ctypes.WinDLL("kernel32").SetEvent(inst.event)
+    return 0
+
+
+# ctypes 的 Structure 字段类型必须是 **WinFunctionType 实例**（不是裸函数），
+# 而且这些实例要活到进程结束 —— 挂在模块级即天然保活。
+_H_QI = _QI_FN(_h_query_interface)
+_H_AR = _AR_FN(_h_addref)
+_H_RL = _AR_FN(_h_release)
+_H_AC = _AC_FN(_h_activate_completed)
+
+
+class _HandlerVtbl(ctypes.Structure):
+    _fields_ = [("QueryInterface", _QI_FN), ("AddRef", _AR_FN),
+                ("Release", _AR_FN), ("ActivateCompleted", _AC_FN)]
+
+
+class _HandlerObj(ctypes.Structure):
+    _fields_ = [("lpVtbl", ctypes.POINTER(_HandlerVtbl))]
+
+
+class _CompletionHandler:
+    """`IActivateAudioInterfaceCompletionHandler` 的 ctypes 实现（agile）。
+
+    为什么要 agile：`ActivateAudioInterfaceAsync` 的回调可能从**别的线程**打进来
+    （实测回调线程 ≠ 调用线程）。不聚合 Free-Threaded Marshaler 就会被 COM 判
+    `E_ILLEGAL_METHOD_CALL`。这里照 OBS 的口径：`CoCreateFreeThreadedMarshaler`
+    + `QueryInterface` 应答 `IUnknown / IAgileObject / 自己 / IMarshal`。
+    """
+
+    def __init__(self) -> None:
+        self._keep: list = []
+        self._ftm = ctypes.c_void_p()
+        self.event = ctypes.WinDLL("kernel32").CreateEventW(None, False, False, None)
+        self.fired = 0
+        tbl = _HandlerVtbl(_H_QI, _H_AR, _H_RL, _H_AC)
+        obj = _HandlerObj(ctypes.pointer(tbl))
+        self._keep.extend([tbl, obj])
+        self._addr = ctypes.addressof(obj)
+        _HANDLER_BY_ADDR[self._addr] = self
+        hr = ctypes.WinDLL("ole32").CoCreateFreeThreadedMarshaler(
+            ctypes.c_void_p(self._addr), ctypes.byref(self._ftm))
+        if hr < 0:
+            _HANDLER_BY_ADDR.pop(self._addr, None)
+            raise RuntimeError(f"CoCreateFreeThreadedMarshaler 失败：{_hr_name(hr)}")
+
+    def close(self) -> None:
+        _HANDLER_BY_ADDR.pop(self._addr, None)
+        self._keep.clear()
+        self._ftm = ctypes.c_void_p()
+
+
+class ProcessLoopbackSource(QueueAudioSource):
+    """只抓一个进程（树）的 WASAPI 采集流。出参**int16le 立体声 48k**。
+
+    生命周期：`open_process_loopback()` 里完成激活 + Initialize + Start（失败就抛，
+    让调用方回落到端点模式）；之后后台线程只负责 `GetBuffer`；`close()` 里 Stop +
+    释放接口。
+    """
+
+    label = "loopback"
+
+    def __init__(self, loop, *, pid: int, rate: int = 48000,
+                 client=None, capture=None, event=None, handler=None) -> None:
+        super().__init__(loop, rate=rate, channels=2)
+        self.pid = int(pid)
+        self._client = client
+        self._capture = capture
+        self._event = event
+        self._handler = handler
+        self._bits = 32
+        self._block_align = 2 * 32 // 8
+        self._com_inited = False
+
+    # ---- 对外小接口（engine 用来判断「进程没了 → 回等待」）
+    def process_gone(self) -> bool:
+        return not pid_alive(self.pid)
+
+    # ---- 采集线程
+    def _pump(self, stop: threading.Event) -> None:
+        k32 = ctypes.WinDLL("kernel32")
+        while not stop.is_set():
+            k32.WaitForSingleObject(ctypes.c_void_p(self._event), 50)
+            while not stop.is_set():
+                n = ctypes.c_ulong(0)
+                hr = _vcall(self._capture, 5, _HRESULT,
+                            [ctypes.POINTER(ctypes.c_ulong)], ctypes.byref(n))
+                if hr < 0:
+                    log.warning("[loopback] 进程采集 GetNextPacketSize 失败：0x%08X %s",
+                                hr & 0xFFFFFFFF, _hr_name(hr))
+                    return
+                if n.value == 0:
+                    break
+                pdata = ctypes.POINTER(ctypes.c_ubyte)()
+                frames = ctypes.c_ulong(0)
+                flags = ctypes.c_ulong(0)
+                devpos = ctypes.c_ulonglong(0)
+                qpc = ctypes.c_ulonglong(0)
+                hr = _vcall(self._capture, 3, _HRESULT,
+                            [ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+                             ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+                             ctypes.POINTER(ctypes.c_ulonglong),
+                             ctypes.POINTER(ctypes.c_ulonglong)],
+                            ctypes.byref(pdata), ctypes.byref(frames),
+                            ctypes.byref(flags), ctypes.byref(devpos), ctypes.byref(qpc))
+                if hr < 0:
+                    log.warning("[loopback] 进程采集 GetBuffer 失败：0x%08X %s",
+                                hr & 0xFFFFFFFF, _hr_name(hr))
+                    return
+                nf = int(frames.value)
+                # 静音块实测**不带** SILENT 标志（就是全零数据），但 pdata 可能是空指针
+                if (flags.value & _AUDCLNT_BUFFERFLAGS_SILENT) or not pdata or nf <= 0:
+                    self._emit(b"\x00\x00" * max(0, nf) * 2)
+                else:
+                    raw = ctypes.string_at(pdata, nf * self._block_align)
+                    self._emit(_float32_to_s16(raw))
+                _vcall(self._capture, 4, _HRESULT, [ctypes.c_ulong], nf)
+
+    def _teardown(self) -> None:
+        try:
+            if self._client is not None:
+                _vcall(self._client, 11, _HRESULT, [])          # Stop
+        except Exception:                                        # noqa: BLE001
+            pass
+        for ptr in (self._capture, self._client):
+            _com_release(ptr)
+        self._capture = self._client = None
+        if self._event:
+            ctypes.WinDLL("kernel32").CloseHandle(ctypes.c_void_p(self._event))
+            self._event = None
+        if self._handler is not None:
+            self._handler.close()
+            self._handler = None
+        if self._com_inited:
+            try:
+                ctypes.WinDLL("ole32").CoUninitialize()
+            except Exception:                                    # noqa: BLE001
+                pass
+            self._com_inited = False
+
+
+def _float32_to_s16(raw: bytes) -> bytes:
+    """float32 交错立体声 → int16le（clamp ±1.0）。下游只认 int16，见模块头。"""
+    import numpy as np
+    a = np.frombuffer(raw, dtype=np.float32)
+    if not a.size:
+        return b""
+    a = np.clip(a, -1.0, 1.0) * 32767.0
+    return a.astype(np.int16).tobytes()
+
+
+def _build_process_format(rate: int = 48000, channels: int = 2) -> _WAVEFORMATEX:
+    """process loopback 的虚拟设备没有 mix format，只能按 OBS 的配方硬编码。"""
+    f = _WAVEFORMATEX()
+    ctypes.memset(ctypes.byref(f), 0, ctypes.sizeof(f))
+    f.wFormatTag = _WAVE_FORMAT_IEEE_FLOAT
+    f.nChannels = channels
+    f.nSamplesPerSec = rate
+    f.wBitsPerSample = 32
+    f.nBlockAlign = channels * 4
+    f.nAvgBytesPerSec = rate * f.nBlockAlign
+    f.cbSize = 0
+    return f
+
+
+def open_process_loopback(pid: int, *, rate: int = 48000) -> AudioSource:
+    """打开「只抓某个进程树」的采集流。失败抛 `RuntimeError`（调用方回落端点模式）。
+
+    为什么要**同步**激活：这样才能把「这台机器不支持 / VRChat 不让我抓」变成一次
+    明确的失败，而不是一条永远读不到数据的哑流（哑流会让上层一直显示"在采集"）。
+    """
+    import asyncio
+
+    ok, why = process_loopback_available()
+    if not ok:
+        raise RuntimeError(f"进程级采集不可用：{why}")
+    if not pid_alive(pid):
+        raise RuntimeError(f"目标进程 {pid} 不存在")
+
+    ole32 = ctypes.WinDLL("ole32")
+    mmdevapi = ctypes.WinDLL("Mmdevapi.dll")
+    ole32.CoInitializeEx(None, _COINIT_MULTITHREADED)     # MTA：接口可跨线程用
+
+    handler = _CompletionHandler()
+    params = _ACTIVATION_PARAMS()
+    params.ActivationType = _PROCESS_LOOPBACK_ACTIVATION_TYPE
+    params.ProcessLoopbackParams.TargetProcessId = int(pid)
+    params.ProcessLoopbackParams.ProcessLoopbackMode = _PROCESS_LOOPBACK_MODE_INCLUDE_TREE
+    pv = _PROPVARIANT()
+    pv.vt = _VT_BLOB
+    pv.blobSize = ctypes.sizeof(params)
+    pv.pBlob = ctypes.cast(ctypes.byref(params), ctypes.c_void_p)
+
+    mmdevapi.ActivateAudioInterfaceAsync.restype = _HRESULT
+    mmdevapi.ActivateAudioInterfaceAsync.argtypes = [
+        ctypes.c_wchar_p, ctypes.POINTER(_GUID), ctypes.POINTER(_PROPVARIANT),
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    op = ctypes.c_void_p()
+    hr = mmdevapi.ActivateAudioInterfaceAsync(
+        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, ctypes.byref(_IID_IAUDIOCLIENT),
+        ctypes.byref(pv), ctypes.c_void_p(handler._addr), ctypes.byref(op))
+    if hr < 0:
+        raise RuntimeError(f"ActivateAudioInterfaceAsync 失败：{_hr_name(hr)}")
+
+    ctypes.WinDLL("kernel32").WaitForSingleObject(ctypes.c_void_p(handler.event), 3000)
+    result = _HRESULT(0)
+    iface = ctypes.c_void_p()
+    hr2 = _vcall(op, 3, _HRESULT, [ctypes.POINTER(_HRESULT),
+                                   ctypes.POINTER(ctypes.c_void_p)],
+                 ctypes.byref(result), ctypes.byref(iface))
+    _com_release(op)
+    if hr2 < 0 or result.value < 0 or not iface:
+        raise RuntimeError(f"激活进程采集失败：hr={_hr_name(result.value)} op={_hr_name(hr2)}")
+
+    client = iface
+    fmt = _build_process_format(rate)
+    flags = _AUDCLNT_STREAMFLAGS_LOOPBACK | _AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+    hr = _vcall(client, 3, _HRESULT,
+                [ctypes.c_int, ctypes.c_ulong, ctypes.c_longlong, ctypes.c_longlong,
+                 ctypes.POINTER(_WAVEFORMATEX), ctypes.c_void_p],
+                _AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, ctypes.byref(fmt), None)
+    if hr < 0:
+        _com_release(client)
+        raise RuntimeError(f"Initialize 失败：{_hr_name(hr)}")
+
+    cap = ctypes.c_void_p()
+    hr = _vcall(client, 14, _HRESULT,
+                [ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)],
+                ctypes.byref(_IID_IAUDIOCAPTURECLIENT), ctypes.byref(cap))
+    if hr < 0 or not cap:
+        _com_release(client)
+        raise RuntimeError(f"GetService(IAudioCaptureClient) 失败：{_hr_name(hr)}")
+
+    k32 = ctypes.WinDLL("kernel32")
+    event = k32.CreateEventW(None, False, False, None)
+    hr = _vcall(client, 13, _HRESULT, [ctypes.c_void_p], ctypes.c_void_p(event))
+    if hr < 0:
+        _com_release(cap)
+        _com_release(client)
+        raise RuntimeError(f"SetEventHandle 失败：{_hr_name(hr)}")
+    hr = _vcall(client, 10, _HRESULT, [])                       # Start
+    if hr < 0:
+        _com_release(cap)
+        _com_release(client)
+        raise RuntimeError(f"Start 失败：{_hr_name(hr)}")
+
+    src = ProcessLoopbackSource(asyncio.get_running_loop(), pid=pid, rate=rate,
+                                client=client, capture=cap, event=event, handler=handler)
+    src._com_inited = True
+    src.start()
+    return src
+
 
 def create_wrist_overlay(cfg: Any, config_path: Any = None, dry_run: bool = False) -> Any:
     """手腕屏后端：Windows 用 pyopenvr 的 `IVROverlay`（`vlt/output/overlay.py`）。

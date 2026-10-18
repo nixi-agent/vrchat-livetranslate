@@ -1424,7 +1424,8 @@ class Engine:
             await run_loopback(self._proxy, None, device_name=loopback_name,
                                stop_event=self._stop_event,
                                on_status=self._events.on_status,
-                               gate=self._input_gate)
+                               gate=self._input_gate,
+                               loopback_mode=str(capture_cfg.get("loopback_mode") or "endpoint"))
             # 输入门限只接在这条腿：VRChat 输出 = 别人说话，远处小声的玩家该被滤掉。
 
     async def _feed_pcm(self, path: str) -> None:
@@ -1884,17 +1885,24 @@ def _gate_tail(gate: "_LevelGate | None") -> str:
 
 
 async def _pump_capture(session, tele, seconds: float, stop_event, label: str, opener,
-                       gate: "_LevelGate | None" = None) -> int:
+                       gate: "_LevelGate | None" = None,
+                       keep_alive: "Callable[[], bool] | None" = None) -> int:
     """共用的采集泵：开流 → 拉块 → 送会话 → 一定关流。返回送出的字节数。
 
     两个平台（Windows 的 PortAudio 回调 / Linux 的 pw-record 子进程）在这里被抹平，
     引擎只看到 `await source.read()`。关流顺序由 `AudioSource.close()` 内部保证。
+
+    `keep_alive`：可选的「这条腿还该不该继续」判据（每轮读之前问一次）。Windows 的
+    进程模式用它判断目标进程是否已退出 —— 进程没了就得结束这一段、回外层去等待，
+    否则 `read()` 只会一直返回 None（哑流），上层永远显示"在采集"。
     """
     source = opener()
     end = None if seconds <= 0 else time.perf_counter() + seconds
     sent = 0
     try:
         while (end is None or time.perf_counter() < end) and not _stop_requested(stop_event):
+            if keep_alive is not None and not keep_alive():
+                break
             chunk = await source.read(timeout=1.0)
             if chunk is None:
                 continue                      # 超时：还活着但暂时没数据
@@ -2157,7 +2165,8 @@ async def run_loopback(session, tele, patterns: list[str] | None = None,
                        seconds: float = 0.0, device_name: str | None = None,
                        stop_event: threading.Event | None = None,
                        on_status: Callable[[str, str], None] | None = None,
-                       gate: "_LevelGate | None" = None) -> None:
+                       gate: "_LevelGate | None" = None,
+                       loopback_mode: str = "endpoint") -> None:
     """采集 VRChat 的播放输出（= 别人说话）→ 推给会话。
     `gate` 是输入门限（`_LevelGate`）：VRChat 输出混了所有人，远处玩家声音小、
     本来就听不清，达不到门限的块就不上送（开闸时会带回 preroll 补句首）。
@@ -2167,24 +2176,54 @@ async def run_loopback(session, tele, patterns: list[str] | None = None,
     `_pump_vrchat_capture`）。#12 的教训：合并时漏了 Linux 侧，界面上门限
     「开着」、实际一条块都没判。
 
-    平台差异全部压在 `CaptureBackend.open_loopback()` 后面：
-      * Windows：WASAPI loopback（pyaudiowpatch），非阻塞轮询 + 读线程；
-                 端点由 `pick_loopback_target()` 挑（界面手选 / 回退链 / 默认输出）。
+    `loopback_mode`（`capture.loopback_mode`，默认 endpoint）：
+      * `endpoint`：抓某个系统输出端点的**混音**（旧行为；浏览器/音乐也会进来）。
+      * `process` ：只抓 VRChat 进程树（WASAPI process loopback）。平台不支持或
+        激活失败 → **回落 endpoint** 并留痕；VRChat 没启动时**等待**（不回落 ——
+        回落会把浏览器/音乐当游戏语音，正是 process 模式要消灭的东西）。
+
+    平台差异全部压在 `CaptureBackend.open_loopback()` / `open_process_loopback()` 后面：
+      * Windows：WASAPI loopback（pyaudiowpatch）或 process loopback（ctypes）；
       * Linux  ：`pw-record --target=<VRChat 输出流>`，**等 VRChat 出现再采**，
                  VRChat 退出（输出流消失）后回到等待，VRChat 重新启动自动续上。
     """
     if platform.IS_LINUX:
+        if loopback_mode == "process":
+            print("[loopback] Linux：loopback_mode=process 被忽略"
+                  "（这条腿本来就只抓 VRChat 的应用流）", flush=True)
         await _run_loopback_linux(session, tele, seconds, stop_event, on_status,
                                   gate=gate)
         return
 
+    if loopback_mode == "process":
+        ok, why = platform.process_loopback_available()
+        if not ok:
+            msg = f"进程模式不可用（{why}）→ 改用系统输出端点"
+            print(f"[loopback] ⚠️ {msg}", flush=True)
+            if on_status is not None:
+                on_status("warn", msg)
+        else:
+            await _run_loopback_process(session, tele, seconds=seconds,
+                                        stop_event=stop_event, on_status=on_status,
+                                        gate=gate)
+            return
+
+    await _run_loopback_endpoint(session, tele, patterns=patterns, seconds=seconds,
+                                 device_name=device_name, stop_event=stop_event,
+                                 on_status=on_status, gate=gate)
+
+
+async def _run_loopback_endpoint(session, tele, *, patterns: list[str] | None = None,
+                                 seconds: float = 0.0, device_name: str | None = None,
+                                 stop_event=None, on_status=None,
+                                 gate: "_LevelGate | None" = None) -> None:
+    """端点模式（旧行为）：挑一个系统输出端点，抓它的混音。"""
     target = pick_loopback_target(patterns, device_name)
     if target is None:
-        # ⚠️ 文案按平台分叉：这条分支只可能是 Windows（Linux 已在上面 return），
+        # ⚠️ 这条分支只可能是 Windows（Linux 在 run_loopback 里已分走），
         # 以前统一写「PipeWire/音频服务」，Windows 用户照着找 PipeWire 纯属误导。
-        hint = "PipeWire/音频服务" if platform.IS_LINUX else "系统音频服务（WASAPI）"
         print("[loopback] ❌ 没找到任何可采集的系统输出"
-              f"（VRChat 在跑吗？{hint}正常吗？）")
+              "（VRChat 在跑吗？系统音频服务（WASAPI）正常吗？）")
         return
     print(f"[loopback] 采集端点「{target.name}」{target.sample_rate}Hz ×{target.channels}ch"
           f" → 16kHz 单声道")
@@ -2194,6 +2233,75 @@ async def run_loopback(session, tele, patterns: list[str] | None = None,
                                    target, blocksize=CHUNK_BYTES),
                                gate=gate)
     print(f"[loopback] 采集结束，共 {sent} bytes ≈ {sent / 2 / 16000:.0f}s{_gate_tail(gate)}")
+
+
+async def _wait_for_vrchat_process(stop_event, on_status=None, *,
+                                   poll_s: float = 2.0) -> int | None:
+    """Windows：轮询等 `VRChat.exe` 出现。返回 None = 被「停止翻译」打断。
+
+    「等」而不是「回落端点」是刻意的：这条腿在 process 模式下的语义就是「只抓 VRChat」，
+    回落端点会把浏览器/音乐/系统提示音当成游戏内语音（那正是要消灭的东西）。
+    """
+    announced = False
+    while not _stop_requested(stop_event):
+        pid = platform.find_process_pid("VRChat.exe")
+        if pid:
+            return int(pid)
+        if not announced:
+            announced = True
+            msg = "等待 VRChat 进程（启动后会自动开始采集）"
+            print(f"[loopback] {msg}", flush=True)
+            if on_status is not None:
+                on_status("info", msg)
+        await asyncio.sleep(poll_s)
+    return None
+
+
+async def _run_loopback_process(session, tele, *, seconds: float = 0.0,
+                                stop_event=None, on_status=None,
+                                gate: "_LevelGate | None" = None) -> None:
+    """Windows 进程模式：**等 VRChat → 只抓它的进程树 → 进程退出再等**。
+
+    与 Linux 腿（`_run_loopback_linux`）同一个状态机。唯一的区别是「变化」的判据：
+    Linux 看播放流节点，这里看 PID 是否还活着（`ProcessLoopbackSource.process_gone`）——
+    采集流本身在目标进程退出后**不会报错**，只会一直出全零，光看 `read()` 是发现不了的。
+    """
+    total = 0
+    t0 = time.perf_counter()
+    while not _stop_requested(stop_event):
+        remain = 0.0 if seconds <= 0 else max(0.0, seconds - (time.perf_counter() - t0))
+        if seconds > 0 and remain <= 0:
+            break
+        pid = await _wait_for_vrchat_process(stop_event, on_status)
+        if pid is None:
+            break
+        print(f"[loopback] 进程模式：VRChat.exe (PID {pid}) → 只抓它的音频"
+              "（48kHz ×2ch，事件驱动）", flush=True)
+        if on_status is not None:
+            on_status("info", f"只采集 VRChat 音频（进程 {pid}）")
+        try:
+            source = platform.open_process_loopback(pid)
+        except Exception as exc:                 # noqa: BLE001 — 回退必须留痕，不许静默
+            msg = f"进程模式打开失败（{exc}）→ 回落系统输出端点"
+            print(f"[loopback] ⚠️ {msg}", flush=True)
+            if on_status is not None:
+                on_status("warn", msg)
+            await _run_loopback_endpoint(session, tele, seconds=remain,
+                                         stop_event=stop_event, on_status=on_status,
+                                         gate=gate)
+            return
+        sent = await _pump_capture(
+            session, tele, remain, stop_event, "loopback",
+            lambda s=source: s, gate=gate,
+            keep_alive=lambda s=source: not s.process_gone())
+        total += sent
+        if _stop_requested(stop_event) or seconds > 0:
+            break
+        print("[loopback] VRChat 进程已退出（或采集流断开）→ 等待重新启动", flush=True)
+        if on_status is not None:
+            on_status("warn", "VRChat 已退出 → 等待重新启动")
+    print(f"[loopback] 采集结束，共 {total} bytes ≈ {total / 2 / 16000:.0f}s{_gate_tail(gate)}")
+
 
 
 async def _run_loopback_linux(session, tele, seconds: float, stop_event,

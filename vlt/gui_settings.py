@@ -38,6 +38,7 @@ from .engine import (
     input_gate_settings,
 )
 from .i18n import t
+from .gui_audio import loopback_mode_label
 from .paths import APP_DIR
 from .ui_state import current_key_slot, provider
 from .ui_text import _persist_provider, _provider_choices
@@ -535,11 +536,16 @@ def build_settings_audio(gui, body: ttk.Frame) -> None:
     gui._mic_combo = ttk.Combobox(grid, values=[auto], state="readonly")
     gui._loopback_combo = None
     gui._audio_out_combo = None
+    gui._loopback_mode_combo = None
     rows = [(t("麦克风:"), gui._mic_combo)]
     if not gui._linux_fixed_audio:
         gui._loopback_combo = ttk.Combobox(grid, values=[auto], state="readonly")
         gui._audio_out_combo = ttk.Combobox(grid, values=[auto], state="readonly")
+        gui._loopback_mode_combo = ttk.Combobox(
+            grid, state="readonly",
+            values=[t("端点混音（含其它应用）"), t("只抓 VRChat（进程）")])
         rows += [(t("VRChat 音频:"), gui._loopback_combo),
+                 (t("采集方式:"), gui._loopback_mode_combo),
                  (t("译音输出:"), gui._audio_out_combo)]
     for i, (label, combo) in enumerate(rows):
         ttk.Label(grid, text=label, style="Dim.TLabel").grid(
@@ -554,6 +560,11 @@ def build_settings_audio(gui, body: ttk.Frame) -> None:
     if not gui._linux_fixed_audio:
         gui._loopback_combo.set(capture_cfg.get("loopback_device") or auto)
         gui._audio_out_combo.set(audio_cfg.get("device_name") or auto)
+        mode = str(capture_cfg.get("loopback_mode") or "endpoint")
+        gui._loopback_mode_combo.set(loopback_mode_label(mode))
+        if mode == "process":
+            # 进程模式只抓 VRChat，端点下拉没有意义；值保留，方便切回来
+            gui._loopback_combo.configure(state="disabled")
 
     if gui._linux_fixed_audio:
         ttk.Label(body, text=t("Linux：VRChat 音频与译音输出已自动处理"),

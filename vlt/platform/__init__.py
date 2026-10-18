@@ -28,6 +28,7 @@ IS_LINUX = sys.platform.startswith("linux")
 __all__ = [
     "IS_WINDOWS", "IS_LINUX",
     "backend", "device_backend",
+    "process_loopback_available", "find_process_pid", "pid_alive", "open_process_loopback",
     "child_env", "open_path", "find_cjk_font", "find_thai_font", "find_korean_font",
     "first_openable_font", "detect_ui_language",
     # 桌面叠加窗（issue #11）：缺失实现的平台会拿到下面的安全默认值
@@ -73,6 +74,41 @@ def capture_backend() -> Any:
     「我要枚举设备」还是「我要开一路采集」。
     """
     return backend()
+
+
+def process_loopback_available() -> tuple[bool, str]:
+    """「只抓某个进程树」的采集是否可用（Windows only；其它平台恒 False）。
+
+    Windows 走 WASAPI process loopback；Linux 本来就已经按应用流节点采集
+    （`linux.find_vrchat_output_streams`），所以这条腿只在 Windows 上需要选模式。
+    """
+    if not IS_WINDOWS:
+        return False, "仅 Windows 需要（Linux 已按应用流采集）"
+    try:
+        return backend().process_loopback_available()
+    except Exception as exc:                     # noqa: BLE001 — 探测失败不该让调用方崩
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def find_process_pid(exe_name: str = "VRChat.exe") -> int | None:
+    """按可执行文件名找进程（Windows only）。找不到返回 None。"""
+    if not IS_WINDOWS:
+        return None
+    return backend().find_process_pid(exe_name)
+
+
+def pid_alive(pid: int) -> bool:
+    """进程是否还活着（Windows only；其它平台按「活着」处理）。"""
+    if not IS_WINDOWS:
+        return True
+    return backend().pid_alive(pid)
+
+
+def open_process_loopback(pid: int) -> Any:
+    """打开「只抓该进程树」的采集流；失败抛 `RuntimeError`（调用方回落端点模式）。"""
+    if not IS_WINDOWS:
+        raise RuntimeError("进程级采集只在 Windows 上实现")
+    return backend().open_process_loopback(pid)
 
 
 def output_device_fallbacks(name: str, exclude: int | None = None) -> list[int]:

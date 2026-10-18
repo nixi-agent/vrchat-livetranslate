@@ -485,6 +485,12 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
         "capture": {
             "mic_device": str(raw_capture.get("mic_device") or ""),
             "loopback_device": str(raw_capture.get("loopback_device") or ""),
+            # 「别人说话」这条腿采什么：endpoint = 整个输出端点的混音（旧行为、默认）；
+            # process = 只抓 VRChat 进程树（WASAPI process loopback，Win10 21H2+）。
+            # 默认 endpoint 是刻意的：process 是新腿，先 opt-in，真机 A/B 绿了再翻默认。
+            "loopback_mode": _str_choice(
+                raw_capture.get("loopback_mode", "endpoint"), "endpoint",
+                key="capture.loopback_mode", choices=("endpoint", "process")),
             # 输入门限（只作用于 loopback = VRChat 输出「别人说话」那条腿）：
             # 原样透传，取值校验在 engine.input_gate_settings 里做（非法值留痕 + 回落默认值）。
             # ⚠️ 默认值必须与 engine 的 INPUT_GATE_DEFAULT_* 一致（这里不能 import engine：

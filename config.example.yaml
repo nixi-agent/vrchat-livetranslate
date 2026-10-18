@@ -78,6 +78,15 @@ capture:
   mic_device: ""            # 麦克风设备名；空 = 自动检测（默认设备）
   loopback_device: ""       # 「别人说话」的采集端点；空 = 自动回退链
                             # Linux 上就是 VRChat 输出到的那个 sink（见 GUIDE.linux.md 第六节）
+  # 「别人说话」这条腿采什么：
+  #   endpoint（默认）= 抓整个输出端点的混音 —— 浏览器、音乐、系统提示音也会被当成
+  #                     「游戏内语音」送进模型（旧行为）。
+  #   process        = 只抓 VRChat 进程树（WASAPI process loopback，Win10 21H2+ 支持）。
+  #                     VRChat 没启动时这条腿等待，启动后自动接上；重启也会自动续上。
+  #                     ⚠️ 这条腿的电平比 endpoint 高约 7dB，切过去后输入门限要重新调；
+  #                     用不惯随时改回 endpoint 即可（下次开始翻译才生效）。
+  # Linux 上本项被忽略（那边一直只抓 VRChat 的应用流节点）。
+  loopback_mode: endpoint
   # ---- 输入门限（只作用于 VRChat 输出 = 「别人说话」那条腿）----
   # 治什么：VRChat 把人声混成一路输出，远处玩家声音小、本来就听不清，以前照样被送给
   # 模型 → 白花钱还容易被翻成乱话。开启后按**每 100ms 块的 RMS 响度**（不是峰值：

@@ -39,6 +39,11 @@ import vlt.i18n as _i18n  # noqa: E402
 _i18n.detect_system_language = lambda: "zh"
 
 from vlt import gui_layout  # noqa: E402
+from vlt import platform as _plat  # noqa: E402
+
+#: Linux 没有耳返实现（主界面不建控件、设置页也没有音量/设备）→ Windows 专用用例需明确跳过，
+#: 不能判红（CI 的 linux-tests 腿就是这么挂的）。
+_SKIP_WIN = "  ⚠️ Linux：耳返无实现（控件不建）→ 跳过这条 Windows 专用用例"
 from vlt.gui import TranslationGUI  # noqa: E402
 
 
@@ -89,6 +94,9 @@ def _build() -> TranslationGUI:
 # ---------------------------------------------------------------- ① 位置
 
 def test_toggle_lives_in_output_row() -> None:
+    if _plat.IS_LINUX:
+        print(_SKIP_WIN)
+        return
     gui = _build()
     try:
         assert gui._monitor_check is not None, "Windows 主界面必须有耳返开关"
@@ -108,6 +116,9 @@ def test_toggle_lives_in_output_row() -> None:
 # ---------------------------------------------------------------- ② 接线
 
 def test_toggle_writes_config_and_restarts_monitor() -> None:
+    if _plat.IS_LINUX:
+        print(_SKIP_WIN)
+        return
     gui = _build()
     try:
         gui._proxy = _FakeProxy()                        # noqa: SLF001
@@ -131,6 +142,9 @@ def test_toggle_writes_config_and_restarts_monitor() -> None:
 
 
 def test_settings_page_keeps_only_volume_and_device() -> None:
+    if _plat.IS_LINUX:
+        print(_SKIP_WIN)
+        return
     gui = _build()
     try:
         win = gui._settings_win                             # noqa: SLF001
@@ -157,6 +171,9 @@ def test_settings_page_keeps_only_volume_and_device() -> None:
 
 
 def test_sidetone_without_voice_output_says_why() -> None:
+    if _plat.IS_LINUX:
+        print(_SKIP_WIN)
+        return
     gui = _build()
     try:
         gui._proxy = _FakeProxy()                        # noqa: SLF001
@@ -175,6 +192,9 @@ def test_sidetone_without_voice_output_says_why() -> None:
 
 def test_toggle_without_proxy_says_why() -> None:
     """没有麦克风代理（代理关掉 / 测试进程）时勾耳返：配置照常存，但要说清为什么没声。"""
+    if _plat.IS_LINUX:
+        print(_SKIP_WIN)
+        return
     gui = _build()
     try:
         gui._proxy = None                                # noqa: SLF001

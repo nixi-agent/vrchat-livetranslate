@@ -575,6 +575,46 @@ def build_settings_audio(gui, body: ttk.Frame) -> None:
                   style="Muted.TLabel", justify=tk.LEFT,
                   wraplength=SETTINGS_WRAP).pack(anchor=tk.W, pady=(6, 0))
 
+    # ---- 耳返（Windows）：勾选 + 输出设备 + 音量 ----
+    gui._monitor_check = None
+    gui._monitor_combo = None
+    gui._monitor_vol = None
+    gui._monitor_vol_lbl = None
+    gui._monitor_var = None
+    gui._monitor_vol_var = None
+    if not gui._linux_fixed_audio:
+        mon_cfg = audio_cfg.get("monitor") or {}
+        head = ttk.Frame(body)
+        head.pack(fill=tk.X, pady=(10, 0))
+        gui._monitor_var = tk.BooleanVar(master=body, value=bool(mon_cfg.get("enabled")))
+        gui._monitor_check = ttk.Checkbutton(
+            head, text=t("启用耳返（自己听译音）"), variable=gui._monitor_var,
+            command=lambda: gui._on_monitor_change())
+        gui._monitor_check.pack(side=tk.LEFT)
+        ttk.Label(head, text=t("耳返音量:"), style="Dim.TLabel").pack(
+            side=tk.LEFT, padx=(16, 4))
+        gui._monitor_vol_var = tk.DoubleVar(
+            master=body, value=float(mon_cfg.get("volume", 70) or 70))
+        gui._monitor_vol = ttk.Scale(
+            head, from_=0, to=100, orient=tk.HORIZONTAL, length=130,
+            variable=gui._monitor_vol_var, command=gui._on_monitor_volume)
+        gui._monitor_vol.pack(side=tk.LEFT)
+        gui._monitor_vol_lbl = ttk.Label(
+            head, text=f"{float(mon_cfg.get('volume', 70) or 70):.0f}%",
+            style="Dim.TLabel", width=5)
+        gui._monitor_vol_lbl.pack(side=tk.LEFT, padx=(6, 0))
+
+        row = ttk.Frame(body)
+        row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(row, text=t("耳返输出:"), style="Dim.TLabel").pack(side=tk.LEFT)
+        gui._monitor_combo = ttk.Combobox(row, values=[auto], state="readonly")
+        gui._monitor_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        gui._monitor_combo.set(mon_cfg.get("device_name") or auto)
+        gui._monitor_combo.bind("<<ComboboxSelected>>", lambda e: gui._on_monitor_change())
+        ttk.Label(body, text=t("耳返会同时放给你自己听；与 VRChat 音频同设备时采集会自动改为只抓 VRChat"),
+                  style="Muted.TLabel", justify=tk.LEFT, wraplength=SETTINGS_WRAP).pack(
+                      anchor=tk.W, pady=(4, 0))
+
     # ---- 麦克风代理（**两端都建**：Windows 走 PortAudio 输出流，Linux 走 pw-cat 管道 +
     #      运行时声明的虚拟麦。语义完全一致，见 vlt/output/micproxy*.py 的模块头）----
     gui._proxy_check = None

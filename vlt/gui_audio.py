@@ -48,6 +48,10 @@ class AudioCtx:
     loopback_combo: Any = None              # ttk.Combobox
     audio_out_combo: Any = None             # ttk.Combobox
     loopback_mode_combo: Any = None         # ttk.Combobox（端点混音 / 只抓 VRChat）
+    monitor_combo: Any = None               # ttk.Combobox（耳返输出设备）
+    monitor_var: Any = None                 # tk.BooleanVar（启用耳返）
+    monitor_vol_var: Any = None             # tk.DoubleVar（0-100）
+    monitor_vol_lbl: Any = None             # ttk.Label（xx%）
     linux_fixed_audio: bool = False
 
     # ── 门限控件 ──
@@ -70,6 +74,7 @@ def sync_from_gui(ctx: AudioCtx, gui) -> None:
     """从 gui 实例同步控件引用和回调到 AudioCtx。"""
     c = ctx; g = getattr
     for n in ("mic_combo", "loopback_combo", "audio_out_combo", "loopback_mode_combo",
+              "monitor_combo", "monitor_var", "monitor_vol_var", "monitor_vol_lbl",
               "gate_var", "gate_enabled_var",
               "gate_val_lbl", "gate_level_canvas", "gate_level_lbl"):
         setattr(c, n, g(gui, f"_{n}", None))
@@ -157,6 +162,8 @@ def on_device_scan_result(ctx: AudioCtx, cfg, mics, loops, outs,
     if not ctx.linux_fixed_audio:
         ctx.loopback_combo.configure(values=loop_display)
         ctx.audio_out_combo.configure(values=out_display)
+        if ctx.monitor_combo is not None:
+            ctx.monitor_combo.configure(values=out_display)
 
     # 恢复配置里的选择（如果设备在列表里）
     capture_cfg = {}
@@ -193,6 +200,14 @@ def on_device_scan_result(ctx: AudioCtx, cfg, mics, loops, outs,
         else:
             ctx.audio_out_combo.set(auto)
 
+        if ctx.monitor_combo is not None:
+            mon_name = str((audio_cfg.get("monitor") or {}).get("device_name") or "")
+            if mon_name and mon_name in names_holder["out"]:
+                ctx.monitor_combo.set(
+                    out_display[names_holder["out"].index(mon_name) + 1])
+            else:
+                ctx.monitor_combo.set(auto)
+
     if not mics and not loops and not outs:
         if ctx.set_status_fn:
             ctx.set_status_fn("warn", t("未扫描到设备（远程会话下枚举为空是正常的）"))
@@ -217,6 +232,44 @@ def loopback_mode_label(mode: str) -> str:
 def loopback_mode_key(label: str) -> str:
     """下拉项文案 → 配置值（认不出来就当 endpoint，绝不静默写成 process）。"""
     return "process" if label == t("只抓 VRChat（进程）") else "endpoint"
+
+
+def monitor_device_from_combo(combo, names_holder: dict) -> str:
+    """耳返下拉 → 配置里的设备名（「自动检测」= 空串）。"""
+    if combo is None:
+        return ""
+    text = combo.get()
+    auto = t("自动检测")
+    if not text or text == auto:
+        return ""
+    display_list = combo_values(combo)
+    idx = display_list.index(text) if text in display_list else -1
+    if idx > 0 and idx - 1 < len(names_holder.get("out", [])):
+        return names_holder["out"][idx - 1]
+    return ""
+
+
+def save_monitor_config(ctx: AudioCtx, cfg, enabled: bool, device: str,
+                        volume: float) -> None:
+    """耳返三项写回 `output.audio.monitor.*`（就地改，不整份重写）。"""
+    p = _config_mod.DEFAULT_CONFIG
+    if not p.exists():
+        return
+    try:
+        text = p.read_text(encoding="utf-8")
+        for key_path, val in (
+            (["output", "audio", "monitor", "enabled"], _fmt_scalar(bool(enabled))),
+            (["output", "audio", "monitor", "device_name"], _yaml_scalar(device)),
+            (["output", "audio", "monitor", "volume"], _fmt_scalar(float(volume))),
+        ):
+            text = _yaml_set_or_create(text, key_path, val)
+        _write_config_text(p, text)
+    except Exception as exc:                         # noqa: BLE001
+        print(f"[gui] 保存耳返配置失败：{exc}", flush=True)
+        return
+    if cfg is not None:
+        cfg.output.setdefault("audio", {}).setdefault("monitor", {}).update(
+            {"enabled": bool(enabled), "device_name": device, "volume": float(volume)})
 
 
 def on_device_change(ctx: AudioCtx, cfg, names_holder: dict) -> None:

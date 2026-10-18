@@ -60,6 +60,7 @@ from ..devices import resolve_device_name
 from .. import platform
 from . import level_match
 from .level_match import LevelConfig
+from .earmonitor import EarMonitor
 from .virtualmic import VirtualMic, pick_output_device
 
 #: 直通缓冲默认容量（毫秒）。必须 ≥ 一个麦克风输入块（~100ms），见模块头说明。
@@ -252,6 +253,9 @@ class TranslatedSink:
         buf = self._p._translated
         if buf is not None:
             buf.push(pcm_48k_stereo)
+        # 耳返：同一段（已过 level 增益与限幅的）PCM 再送一份给用户自己听。
+        # 只在这里 tap —— 见 earmonitor.py 模块头（「对方听到的」与「你听到的」是同一段）。
+        self._p._monitor_push(pcm_48k_stereo)
 
     def end_sentence(self) -> None:
         buf = self._p._translated
@@ -313,6 +317,9 @@ class MicProxy:
         #: （日志实证：9~10 次/5s 只在启动窗口出现，稳态为 0）。见 `_prime_ring`。
         self._got_mic_data = False
         self._sink = TranslatedSink(self)
+        # ---- 耳返（见 vlt/output/earmonitor.py）----
+        self._monitor_cfg: dict = dict(self._audio_cfg.get("monitor") or {})
+        self._monitor: EarMonitor | None = None
 
         # ---- 译音音量匹配（见 vlt/output/level_match.py）----
         # 麦克风「说话电平」参考**复用 `_mic_pump` 已经在读的那些块**，不再开第二个采集
@@ -395,6 +402,7 @@ class MicProxy:
             self._stop_mic_thread()
             return False
         self._opened = True
+        self._start_monitor()
         return True
 
     def _start_mic_thread(self) -> None:
@@ -437,6 +445,9 @@ class MicProxy:
         if th is not None and th.is_alive():
             th.join(timeout=2.0)
         self._thread = None
+        if self._monitor is not None:
+            self._monitor.close()
+            self._monitor = None
         if self._out_stream is not None:
             try:
                 self._out_stream.stop()
@@ -444,6 +455,49 @@ class MicProxy:
             except Exception:              # noqa: BLE001
                 pass
             self._out_stream = None
+
+    # ------------------------------------------------------------------ 耳返
+    @property
+    def monitor(self) -> EarMonitor | None:
+        """当前耳返实例（未启用 / 打开失败时为 None）。"""
+        return self._monitor
+
+    def _start_monitor(self) -> None:
+        """按配置开耳返。失败只禁用耳返，绝不影响代理本身。"""
+        cfg = self._monitor_cfg or {}
+        if not cfg.get("enabled"):
+            return
+        mon = EarMonitor(device_name=str(cfg.get("device_name") or ""),
+                         volume=cfg.get("volume", 70.0),
+                         on_status=self._on_status)
+        if mon.open():
+            self._monitor = mon
+        else:
+            self._monitor = None
+
+    def _monitor_push(self, pcm_48k_stereo: bytes) -> None:
+        mon = self._monitor
+        if mon is not None:
+            mon.push(pcm_48k_stereo)
+
+    def set_monitor_volume(self, volume: float) -> None:
+        """界面拖音量：立刻生效（缓冲里的旧音频也按新音量放）。"""
+        if self._monitor is not None:
+            self._monitor.set_volume(volume)
+
+    def restart_monitor(self, *, enabled: bool, device_name: str,
+                        volume: float) -> bool:
+        """界面改「耳返开关 / 设备」：热重开这一路（不动虚拟声卡与麦克风）。"""
+        if self._monitor is not None:
+            self._monitor.close()
+            self._monitor = None
+        self._monitor_cfg = {"enabled": bool(enabled),
+                             "device_name": str(device_name or ""),
+                             "volume": float(volume)}
+        self._audio_cfg["monitor"] = self._monitor_cfg
+        if enabled and self._opened:
+            self._start_monitor()
+        return self._monitor is not None
 
     # ------------------------------------------------------------------ 输出设备
     def _pick_output_device(self):

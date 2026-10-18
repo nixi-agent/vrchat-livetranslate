@@ -2069,6 +2069,66 @@ def pick_loopback_target(patterns: list[str] | None = None,
     return _as_target(loops[0])
 
 
+def _output_name_of(index: int) -> str:
+    """输出设备 index → 名字（拿不到返回空串，绝不抛）。"""
+    try:
+        backend = platform.device_backend()
+        for i, d in enumerate(backend.query_devices()):
+            if int(d.get("pa_index", i)) == int(index):
+                return str(d.get("name") or "")
+    except Exception:                            # noqa: BLE001
+        pass
+    return ""
+
+
+def _default_output_name() -> str:
+    try:
+        return _output_name_of(int(platform.device_backend().default_output_index()))
+    except Exception:                            # noqa: BLE001
+        return ""
+
+
+def monitor_capture_conflict(monitor_cfg: dict, capture_cfg: dict) -> bool:
+    """耳返设备与「别人说话」的采集端点是不是**同一个输出设备**。
+
+    为什么按端点判而不是按名字字符串：采集端点名是「输出设备名 + [Loopback]」
+    （`pyaudiowpatch` 的命名），要先剥后缀；任一侧留着「自动」就解析成系统默认输出。
+    拿不准（枚举失败 / 找不到目标）一律返回 False —— 宁可漏判、由用户自己听出来，
+    也不要因为一次枚举失败就把采集方式悄悄改掉。
+    """
+    mon_name = str((monitor_cfg or {}).get("device_name") or "").strip()
+    if not mon_name:
+        mon_name = _default_output_name()
+    else:
+        idx = resolve_device_name(mon_name, "output")
+        if idx is not None:
+            mon_name = _output_name_of(int(idx)) or mon_name
+    try:
+        target = pick_loopback_target(str((capture_cfg or {}).get("loopback_device") or "") or None)
+    except Exception:                            # noqa: BLE001
+        return False
+    if target is None:
+        return False
+    cap_name = _strip_loopback_suffix(target.name)
+    return bool(mon_name) and mon_name.strip().lower() == cap_name.strip().lower()
+
+
+def effective_loopback_mode(capture_cfg: dict, monitor_cfg: dict) -> str:
+    """耳返开着、且和采集端点是同一个设备时，把 `endpoint` 自动升级成 `process`。
+
+    为什么（用户口径）：耳返会把自己的译音放到那个端点上，端点 loopback 再把它听一遍
+    → 自己的话被当成「别人说的」再翻一遍。process 只抓 VRChat 进程树，耳返无论如何
+    都进不了采集。系统不支持 process 时**保持不变**，由调用方关掉耳返并留痕。
+    """
+    mode = str((capture_cfg or {}).get("loopback_mode") or "endpoint")
+    if not (monitor_cfg or {}).get("enabled") or mode != "endpoint":
+        return mode
+    if not monitor_capture_conflict(monitor_cfg, capture_cfg):
+        return mode
+    ok, _why = platform.process_loopback_available()
+    return "process" if ok else "endpoint"
+
+
 def pick_vrchat_targets() -> list[LoopbackTarget]:
     """Linux：定位 **VRChat 的全部音频输出流**（= 别人说话）。找不到返回空列表。
 

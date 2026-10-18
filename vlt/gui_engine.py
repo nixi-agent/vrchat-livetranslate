@@ -18,7 +18,8 @@ from .gui_sinks import (start_overlay, push_overlay as push_overlay, desktop_cfg
 from . import config as _cfg_mod
 from . import crashlog, gui_chat, gui_voice
 from .config import Direction
-from .engine import Engine, EngineEvents
+from .engine import (Engine, EngineEvents, effective_loopback_mode,
+                     monitor_capture_conflict)
 from .i18n import t
 from .output.micproxy import MODE_TRANSLATED
 from .ui_theme import CLOSE_WAIT_STOP_S, STOP_WAIT_S
@@ -266,12 +267,46 @@ def start(ctx: EngineCtx) -> bool:
             ctx.set_status_fn("info",
                               t("正在启动（双向）…") if len(specs) == 2 else t("正在启动…"))
 
+def apply_ear_monitor_policy(ctx: EngineCtx) -> None:
+    """开翻前处置「耳返 × 采集端点」的回路风险（每次开始翻译跑一次）。
+
+    两种结局，都不静默：
+      * 能切 process → 把内存里的 `capture.loopback_mode` 改成 process（只影响本次运行），
+        状态栏说明「已自动改为只抓 VRChat」；
+      * 切不了（旧系统）→ 关掉耳返 + warn，绝不留下会自我回译的回路。
+    配置**不写盘**：用户没主动改的设置不替他落盘，下次启动仍是原样。
+    """
+    cap = (ctx.cfg.output or {}).get("capture") or {}
+    mon = ((ctx.cfg.output or {}).get("audio") or {}).get("monitor") or {}
+    if not mon.get("enabled"):
+        return
+    if not monitor_capture_conflict(mon, cap):
+        return
+    if effective_loopback_mode(cap, mon) == "process":
+        cap["loopback_mode"] = "process"
+        on_engine_status(ctx.q, "info",
+                         "耳返与 VRChat 音频是同一个设备 → 采集自动改为只抓 VRChat"
+                         "（否则会把自己的译音再翻一遍）", "monitor")
+        return
+    proxy = _proxy_of(ctx)
+    if proxy is not None:
+        proxy.restart_monitor(enabled=False,
+                             device_name=str(mon.get("device_name") or ""),
+                             volume=float(mon.get("volume", 70) or 70))
+    mon["enabled"] = False
+    on_engine_status(ctx.q, "warn",
+                     "耳返已关闭：本机不支持「只抓 VRChat」的采集方式，"
+                     "系统输出采集会把耳返再翻一遍", "monitor")
+
+
 def start_engine(ctx: EngineCtx, index: int) -> None:
     """启动第 *index* 个引擎实例（递归错开 300ms 启动多条腿）。"""
     specs = ctx.specs
     if index >= len(specs):
         return
     who, direction, source, src_lang, tgt_lang = specs[index]
+    if index == 0:
+        apply_ear_monitor_policy(ctx)
     # 引擎不碰手腕屏：它由界面持有（一块屏显示两个方向的对话）。
     # 若交给两个引擎各自创建，会撞 `OverlayError_KeyInUse`（用户实测）。
     # chatbox 只发「我说的话」的译文——theirs 腿不需要它（与 engine._chatbox_wanted 同义，双保险）。

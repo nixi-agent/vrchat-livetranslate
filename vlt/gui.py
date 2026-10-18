@@ -458,6 +458,46 @@ class TranslationGUI(ProxyMethods):
         if new_mic != old_mic:
             self._apply_mic_change(new_mic)
     def _save_device_config(self, mic_name, loop_name, out_name) -> None: self._sync_audio_ctx(); gui_audio.save_device_config(self._audio_ctx, self._cfg, mic_name, loop_name, out_name)
+    # ── 耳返（sidetone）：勾选 / 设备 / 音量 ──
+    def _on_monitor_change(self, _event=None) -> None:
+        self._sync_audio_ctx()
+        en = bool(self._monitor_var.get())
+        vol = float(self._monitor_vol_var.get())
+        dev = gui_audio.monitor_device_from_combo(self._monitor_combo, self._names_holder)
+        gui_audio.save_monitor_config(self._audio_ctx, self._cfg, en, dev, vol)
+        if self._proxy is None:
+            return
+        ok = self._proxy.restart_monitor(enabled=en, device_name=dev, volume=vol)
+        if en and not ok:
+            self._set_status("warn", t("耳返打开失败（设备被占用或不可用），其余功能不受影响"))
+        elif en:
+            self._set_status("info", t("耳返：{device}，音量 {vol}%",
+                                      device=dev or t("系统默认输出"), vol=f"{vol:.0f}"))
+        else:
+            self._set_status("info", t("耳返已关闭"))
+
+    def _on_monitor_volume(self, value) -> None:
+        vol = float(value)
+        if self._monitor_vol_lbl is not None:
+            self._monitor_vol_lbl.configure(text=f"{vol:.0f}%")
+        if self._proxy is not None:
+            self._proxy.set_monitor_volume(vol)
+        job = getattr(self, "_monitor_save_job", None)
+        if job is not None:
+            try:
+                self._root.after_cancel(job)
+            except Exception:                          # noqa: BLE001
+                pass
+        self._monitor_save_job = self._root.after(300, self._save_monitor_volume)
+
+    def _save_monitor_volume(self) -> None:
+        self._monitor_save_job = None
+        self._sync_audio_ctx()
+        en = bool(self._monitor_var.get())
+        vol = float(self._monitor_vol_var.get())
+        dev = gui_audio.monitor_device_from_combo(self._monitor_combo, self._names_holder)
+        gui_audio.save_monitor_config(self._audio_ctx, self._cfg, en, dev, vol)
+
     def _on_gate_change(self, _v=None) -> None:
         self._sync_audio_ctx(); gui_audio.on_gate_change(self._audio_ctx, self._cfg, self._root, self._engines, self._gate_holder); self._gate_probe = self._gate_holder["probe"]; self._gate_save_job = self._gate_holder["save_job"]
     def _apply_gate_live(self) -> None: self._sync_audio_ctx(); gui_audio.apply_gate_live(self._audio_ctx, self._engines)

@@ -417,6 +417,9 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
     raw_level = raw_audio.get("level") or {}
     if not isinstance(raw_level, dict):
         raw_level = {}
+    raw_monitor = raw_audio.get("monitor") or {}
+    if not isinstance(raw_monitor, dict):
+        raw_monitor = {}
     raw_capture = raw.get("capture") or {}
     raw_textin = raw.get("text_input") or {}
     # room 段原样带出（脏值交给 RoomConfig.from_dict 回落 + 留痕）；
@@ -443,6 +446,15 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
                 # 「首次启用说明已弹过」标记：程序自己维护（见 gui_proxy_hint），用户不用管。
                 # 放在配置里而不是内存/状态文件：用户换机拷配置时不该再被弹一次。
                 "hint_shown": bool(raw_proxy.get("hint_shown", False)),
+            },
+            # 耳返（sidetone）：把译音再放一份给用户自己听，音量独立。
+            # ⚠️ 默认关闭：第一次开耳返的人常会以为「怎么有回声」，先让人主动开。
+            "monitor": {
+                "enabled": bool(raw_monitor.get("enabled", False)),
+                "device_name": str(raw_monitor.get("device_name") or ""),
+                "volume": _float_in_range(
+                    raw_monitor.get("volume", 70.0), 70.0,
+                    key="output.audio.monitor.volume", lo=0.0, hi=100.0),
             },
             # 译音音量（对齐麦克风）：治「译音比原声响/轻」。原声直通与译音**共用同一条**
             # 虚拟声卡输出流，VRChat 的麦克风音量只能整体调 → 两条腿的相对失配只能在程序内修。

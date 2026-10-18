@@ -141,6 +141,35 @@ def test_toggle_writes_config_and_restarts_monitor() -> None:
         gui._root.destroy()                              # noqa: SLF001
 
 
+def test_toggle_saves_config_without_settings_controls() -> None:
+    """有开关、但音量/设备控件还没建（懒加载 / headless）时，配置仍要保存。
+
+    审阅 #3（EMeowAGENT）：早先 `_on_monitor_change` 在「没有音量控件」时整体早退，
+    会把用户刚点的开关静默丢掉；现在只跳过 UI 同步，配置照常落盘。
+    """
+    if _plat.IS_LINUX:
+        print(_SKIP_WIN)
+        return
+    gui = _build()
+    try:
+        gui._proxy = None                                # noqa: SLF001
+        gui._monitor_vol_var = None                      # noqa: SLF001 — 模拟控件还没建
+        gui._monitor_combo = None                        # noqa: SLF001
+        gui._monitor_var.set(False)                      # noqa: SLF001
+        gui._on_monitor_change()                         # noqa: SLF001
+        raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+        assert raw["output"]["audio"]["monitor"]["enabled"] is False, \
+            f"没有音量控件时也必须保存开关：{raw['output']['audio']['monitor']}"
+        gui._monitor_var.set(True)                       # noqa: SLF001
+        gui._on_monitor_change()                         # noqa: SLF001
+        raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+        assert raw["output"]["audio"]["monitor"]["enabled"] is True
+        assert raw["output"]["audio"]["monitor"]["volume"] == 70.0, "沿用配置里的音量"
+        print("  无音量控件时开关照样落盘（沿用配置音量/设备）OK")
+    finally:
+        gui._root.destroy()                              # noqa: SLF001
+
+
 def test_settings_page_keeps_only_volume_and_device() -> None:
     if _plat.IS_LINUX:
         print(_SKIP_WIN)
@@ -232,6 +261,7 @@ if __name__ == "__main__":
     print("test_monitor_main_toggle:")
     test_toggle_lives_in_output_row()
     test_toggle_writes_config_and_restarts_monitor()
+    test_toggle_saves_config_without_settings_controls()
     test_settings_page_keeps_only_volume_and_device()
     test_sidetone_without_voice_output_says_why()
     test_toggle_without_proxy_says_why()

@@ -96,6 +96,9 @@ class ChatCtx:
 
     # ── 状态栏 ──
     last_status_level: str = "info"
+    #: 打字发送后的状态回报（`gui._set_status`）。拆分（6083052）后调用点漏传这个，
+    #: 导致回车直接 `'NoneType' object is not callable` —— 见 issue #110。
+    set_status_fn: Optional[Callable] = None
 
     # ── 房间轮询 ──
     room_status_next: float = 0.0
@@ -213,14 +216,14 @@ def build_input_row(parent, ctx: ChatCtx, cfg,
                                style="Key.TEntry")
     ctx.text_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
     ctx.text_entry.bind("<Return>",
-                        lambda _e: on_text_enter(ctx))
+                        lambda _e: _submit_typed(ctx))
     ctx.text_entry.bind("<Escape>",
                         lambda _e: ctx.text_var.set(""))
     attach_edit_menu_fn(ctx.text_entry)
     ctx.send_btn = ttk.Button(
         row, text=t("发送"),
         width=_char_width_for(t("发送"), ui_tk.FONT_UI, 8),
-        command=lambda: send_typed(ctx))
+        command=lambda: _submit_typed(ctx))
     ctx.send_btn.pack(side=tk.LEFT)
     ttk.Label(row, text=t("回车发送 · Esc 清空"),
               style="Muted.TLabel").pack(side=tk.LEFT, padx=(8, 0))
@@ -252,10 +255,28 @@ def set_text_input_enabled(ctx: ChatCtx, on: bool) -> None:
         w.state(["!disabled"] if on else ["disabled"])
 
 
+def _submit_typed(ctx: ChatCtx) -> str:
+    """输入行的**唯一入口**：回车与「发送」按钮都走这里（issue #110）。
+
+    拆分（6083052）后两个调用点各写一遍参数，结果都漏了 engines / engine_dirs /
+    set_status_fn —— 回车抛 `'NoneType' object is not callable`、按钮抛
+    `TypeError: missing 3 required positional arguments`，打字输入整整坏了三个版本。
+    现在只保留一个入口：以后改参数，回车和按钮不会分叉。
+    """
+    return on_text_enter(ctx, list(ctx.engines_ref), list(ctx.engine_dirs_ref),
+                         ctx.set_status_fn)
+
+
 def on_text_enter(ctx: ChatCtx, engines: list = (), engine_dirs: list = (), set_status_fn=None) -> str:
     """Entry 的 ``<Return>`` 回调：发送并吃掉事件。"""
     send_typed(ctx, list(engines), list(engine_dirs), set_status_fn)
     return "break"                  # 吃掉回车：否则 Tk 会再响一声提示音
+
+
+def _notify(set_status_fn, level: str, msg: str) -> None:
+    """状态回报：headless / 测试里 `set_status_fn` 可能是 None（不许因此崩掉发送）。"""
+    if set_status_fn is not None:
+        set_status_fn(level, msg)
 
 
 def send_typed(ctx: ChatCtx, engines: list, engine_dirs: list,
@@ -268,15 +289,15 @@ def send_typed(ctx: ChatCtx, engines: list, engine_dirs: list,
         return
     targets = [e for e, dirn in zip(engines, engine_dirs) if dirn == "mine"]
     if not targets:
-        set_status_fn("warn", t("打字替代的是麦克风 —— 先点「开始翻译」，"
-                                "且方向要含「我说」"))
+        _notify(set_status_fn, "warn", t("打字替代的是麦克风 —— 先点「开始翻译」，"
+                                        "且方向要含「我说」"))
         return
     sent = sum(1 for e in targets if e.send_text(text))
     if sent:
         ctx.text_var.set("")      # 清空：肉眼确认已发出
-        set_status_fn("info", t("打字已送出（{n} 字），翻译中…", n=len(text)))
+        _notify(set_status_fn, "info", t("打字已送出（{n} 字），翻译中…", n=len(text)))
     else:
-        set_status_fn("warn", t("引擎还没就绪，稍后重试"))
+        _notify(set_status_fn, "warn", t("引擎还没就绪，稍后重试"))
 
 
 # ================================================================ API 密钥
@@ -536,6 +557,7 @@ def refresh_status(ctx: ChatCtx, engines: list, direction_var,
 def setup_poll_ctx(ctx: ChatCtx, gui) -> None:
     """设置 ChatCtx 上的回调引用（从 gui 实例读取）。"""
     c = ctx; c.q = gui._q; c.engines_ref = gui._engines; c.engine_dirs_ref = gui._engine_dirs
+    c.set_status_fn = gui._set_status          # 打字发送的状态回报（issue #110）
     c.room_status_next = gui._room_status_next; c.gate_level_tick = gui._gate_level_tick
     # 活引用：闭包捕获的是 gui 实例，取值发生在**每跳 poll 里**，所以
     # 桌面字幕/手腕屏晚于构建期创建也能被 tick（见 ChatCtx 里那段说明）

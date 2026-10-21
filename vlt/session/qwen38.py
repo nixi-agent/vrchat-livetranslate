@@ -149,15 +149,16 @@ class QwenLiveTranslateSession(LiveTranslateSession):
     def turn_detection_payload(self) -> dict:
         """服务端断句配置（实测数据见 `base.DEFAULT_VAD_SILENCE_MS` 上方注释）。
 
-        ⚠️ **测试分支口径：固定 server_vad**。老配置里的 `speaker_detection` 是旧默认 /
-        旧诊断包的写法（实测端到端 2.5s，完全不填更是 4.0s），而 server_vad + 500ms
-        只要 0.53s。合并进 main 之前要改成「配置优先 + 默认 server_vad」。
+        **固定 server_vad**：`speaker_detection`（老默认 / 旧诊断包的写法）实测
+        「说完→译文」2.5s，完全不填更是 4.0s，而 server_vad + 500ms 只要 0.5s。
+        本程序不消费模型的说话人标签（`speaker_detection` 的唯一附加能力），
+        因此丢掉它没有功能损失 —— 配置里写别的值一律按 server_vad 处理并留痕。
         """
         configured = (self.cfg.turn_detection or "").strip().lower()
-        td: dict = {"type": "server_vad"}
         if configured and configured != "server_vad":
-            print(f"[session] ⚠️ 配置 turn_detection={configured!r} → 本测试包固定用 "
-                  f"server_vad（实测 2.5~4.0s → 0.5s）", flush=True)
+            print(f"[session] ⚠️ 配置 turn_detection={configured!r} 已废弃 → 按 server_vad "
+                  f"处理（实测 2.5~4.0s → 0.5s）", flush=True)
+        td: dict = {"type": "server_vad"}
         if self.cfg.silence_duration_ms:
             td["silence_duration_ms"] = int(self.cfg.silence_duration_ms)
         return td

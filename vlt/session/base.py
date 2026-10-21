@@ -105,7 +105,9 @@ class SessionConfig:
     output_audio: bool = False          # True → ["text","audio"]，同时拿译音
     voice: str = "Tina"                 # 实测：不指定会抛 Voice 'Chelsie' is not supported
     hotwords: dict[str, str] = field(default_factory=dict)
-    turn_detection: str | None = None   # None = 用服务端默认（3.8 为 speaker_detection）
+    # ⚠️ 已废弃：恒用 server_vad（见 qwen38.turn_detection_payload）。保留字段只为
+    # 读取老配置时打一行「已废弃」留痕，不再改变下发内容。
+    turn_detection: str | None = None
     # 服务端静音断句阈值（ms）。实测：默认/ speaker_detection 都在 2.5~4s 才收尾，
     # 而 server_vad + 500ms 只要 0.53s → 由 qwen38 的 _turn_detection_payload 下发。
     silence_duration_ms: int = DEFAULT_VAD_SILENCE_MS

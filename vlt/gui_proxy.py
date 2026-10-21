@@ -440,6 +440,11 @@ class ProxyMethods:
         out = self._cfg.output if isinstance(self._cfg.output, dict) else {}
         return str((out.get("capture") or {}).get("mic_device") or "")
 
+    def _current_out_device(self) -> str:
+        """`output.audio.device_name`（译音输出 / 虚拟声卡）。"""
+        out = self._cfg.output if isinstance(self._cfg.output, dict) else {}
+        return str((out.get("audio") or {}).get("device_name") or "")
+
 
     def _apply_mic_change(self, device_name: str) -> None:
         """麦克风变更后让**直通腿**即时生效：只重启代理的采集线程，不动虚拟声卡输出流
@@ -459,6 +464,35 @@ class ProxyMethods:
         print(f"[proxy] 直通麦克风已切换：{device_name or '自动检测'}"
               "（仅重启采集线程；翻译输入下轮生效）", flush=True)
         self._set_status("info", t("麦克风已切换（直通即时生效；翻译输入下轮生效）"))
+
+    def _apply_out_change(self, device_name: str) -> None:
+        """换「译音输出」设备后让**正在跑的代理**即时换端点（issue #111）。
+
+        代理只在 `start()` 时解析输出设备；不重开的话配置/界面都变了、声音还留在旧
+        端点，用户只能重启程序（且界面上毫无提示）。失败保留旧流，状态栏 + 日志各留
+        一条（禁静默降级）。代理没启用时只落盘，开启/下次启动时生效。
+        """
+        label = device_name or t("自动检测")
+        p = self._proxy
+        if p is None:
+            print(f"[proxy] 译音输出已保存：{label}（代理未启用，开启/下次启动时生效）",
+                  flush=True)
+            return
+        old = getattr(p, "out_device_name", "") or t("自动检测")
+        try:
+            ok = p.reopen_output(device_name or None)
+        except Exception as exc:                        # noqa: BLE001 — 绝不因切设备打断界面
+            print(f"[proxy] ⚠️ 切换译音输出失败：{type(exc).__name__}: {exc}"
+                  "（保持旧端点；已落盘，下次启动生效）", flush=True)
+            self._set_status("warn", t("译音输出已保存（切换未即时生效，下次启动生效）"))
+            return
+        if ok:
+            print(f"[proxy] 译音输出已切换：{old} → {label}", flush=True)
+            self._set_status("info", t("译音输出已切换（即时生效）"))
+        else:
+            print(f"[proxy] ⚠️ 译音输出切换失败 → 保持 {old}（已落盘，下次启动生效）",
+                  flush=True)
+            self._set_status("warn", t("译音输出已保存（切换未即时生效，下次启动生效）"))
 
     # ── 译音音量（固定增益 / 跟随麦克风）：控件 → 落盘 → 热更新 ──
     #    与「麦克风代理」同一条腿：参数住在 output.audio.level，真正施加增益的是

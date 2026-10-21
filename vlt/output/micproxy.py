@@ -450,12 +450,7 @@ class MicProxy:
             self._monitor.close()
             self._monitor = None
         if self._out_stream is not None:
-            try:
-                self._out_stream.stop()
-                self._out_stream.close()
-            except Exception:              # noqa: BLE001
-                pass
-            self._out_stream = None
+            self._close_out_stream()
 
     # ------------------------------------------------------------------ 耳返
     @property
@@ -565,6 +560,55 @@ class MicProxy:
                                 idx=dev, err=exc)
         self._on_status("error", "[proxy] 打开虚拟声卡失败：{err}（其余功能不受影响）",
                         err=last_exc)
+        return False
+
+    @property
+    def out_device_name(self) -> str:
+        """当前正在用的输出设备名（未打开时为空）。界面「译音输出=…」那行取的就是它。"""
+        return self._out_device[1] if self._out_device else ""
+
+    def _close_out_stream(self) -> None:
+        """关掉当前输出流（幂等、绝不抛）。"""
+        if self._out_stream is None:
+            return
+        try:
+            self._out_stream.stop()
+            self._out_stream.close()
+        except Exception:                  # noqa: BLE001
+            pass
+        self._out_stream = None
+        self._out_device = None
+
+    def reopen_output(self, device_name: str | None) -> bool:
+        """切换**译音输出**（虚拟声卡）设备 —— 设置页改设备后调这里（issue #111）。
+
+        为什么需要它：输出设备只在 `start()` 时解析一次，而设置页改「译音输出」只写
+        配置。不重开的话配置/界面都变了、声音还留在旧端点，用户只能重启程序，且界面
+        上没有任何提示。
+
+        只动输出流：麦克风采集线程与引擎手里的 `translated_sink` 都不受影响
+        （sink 是鸭子代理，`push` 转发到同一个代理实例）。失败时**换回旧端点**并返回
+        False，由调用方状态栏 + 日志各留一条（禁静默降级）。
+        """
+        new_name = device_name or ""
+        old = self._out_device
+        if not self._opened:
+            self._audio_cfg["device_name"] = new_name
+            return False                   # 没启动：配置即生效，下次 start() 用新设备
+        self._audio_cfg["device_name"] = new_name
+        picked = self._pick_output_device()
+        if picked is None:
+            self._on_status("warn", "[proxy] 切换译音输出失败：找不到设备 {dev}（保持旧端点）",
+                            dev=repr(new_name))
+            return False
+        idx, name, _rate, fallbacks = picked
+        if old is not None and old[0] == idx:
+            return True                    # 同一个设备：不重开（避免无谓静音）
+        self._close_out_stream()
+        if self._open_output(idx, name, fallbacks):
+            return True
+        if old is not None:                # 新设备打不开 → 换回旧端点
+            self._open_output(old[0], old[1], [])
         return False
 
     def _drain_translated(self, need: int) -> bytes:

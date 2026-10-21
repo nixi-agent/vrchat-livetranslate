@@ -453,10 +453,15 @@ class TranslationGUI(ProxyMethods):
     def _on_device_change(self, _event=None) -> None:
         self._sync_audio_ctx()
         old_mic = self._current_mic_device()
+        old_out = self._current_out_device()
         gui_audio.on_device_change(self._audio_ctx, self._cfg, self._names_holder)
         new_mic = self._current_mic_device()
         if new_mic != old_mic:
             self._apply_mic_change(new_mic)
+        # 译音输出（虚拟声卡）换了也要重开代理的输出流，否则声音留在旧端点（#111）
+        new_out = self._current_out_device()
+        if new_out != old_out:
+            self._apply_out_change(new_out)
     def _save_device_config(self, mic_name, loop_name, out_name) -> None: self._sync_audio_ctx(); gui_audio.save_device_config(self._audio_ctx, self._cfg, mic_name, loop_name, out_name)
     # ── 耳返（sidetone）：开关在主界面（输出行）/ 设备 / 音量在设置 ──
     def _on_monitor_change(self, _event=None) -> None:

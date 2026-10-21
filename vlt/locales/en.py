@@ -542,6 +542,11 @@ STRINGS: dict[str, str] = {
         "Microphone switched (passthrough applied now; translation input takes effect when translation restarts)",
     "麦克风已保存（切换未即时生效，下次启动生效）":
         "Microphone saved (not applied instantly; takes effect on next start)",
+    "译音输出已切换（即时生效）": "Translated output switched (applied instantly)",
+    "译音输出已保存（切换未即时生效，下次启动生效）":
+        "Translated output saved (not applied instantly; takes effect on next start)",
+    "切换译音输出失败：找不到设备 {dev}（保持旧端点）":
+        "Failed to switch translated output: device {dev} not found (keeping the old endpoint)",
     "缓冲已更新（即时生效）": "Buffers updated (applied instantly)",
     "缓冲已保存（译音缓冲下次开始翻译生效）":
         "Buffers saved (translated buffer applies next time translation starts)",

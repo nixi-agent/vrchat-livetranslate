@@ -14,7 +14,8 @@ import yaml
 
 from . import endpoints
 from .session.base import (SessionConfig, DEFAULT_FINAL_SILENCE_S,
-                           DEFAULT_FAST_FINAL_SILENCE_S, DEFAULT_FAST_FINAL_USER_QUIET_S)
+                           DEFAULT_FAST_FINAL_SILENCE_S, DEFAULT_FAST_FINAL_USER_QUIET_S,
+                           DEFAULT_VAD_SILENCE_MS, VAD_SILENCE_MS_MIN, VAD_SILENCE_MS_MAX)
 
 from .paths import APP_DIR, BUNDLE_DIR
 
@@ -137,6 +138,8 @@ class Direction:
             # 全局专有词库 + 本方向的覆盖，合并口径只有 merge_hotwords 一处
             hotwords=merge_hotwords(base.get("glossary"), self.hotwords),
             turn_detection=base.get("turn_detection"),
+            # 服务端静音断句阈值（实测：默认档 4s → 500ms 只要 0.5s）
+            silence_duration_ms=_vad_silence_ms(base.get("silence_duration_ms")),
             base_url=base["base_url"],
             # provider 只随会话带出去供日志/诊断；实际地址仍由 base_url 决定。
             provider=base.get("provider", endpoints.DEFAULT_PROVIDER),
@@ -230,6 +233,18 @@ def _int_clamped(value, default: int, *, key: str, lo: int, hi: int) -> int:
         print(f"[config] ⚠️ {key}={n} 超出合理范围 [{lo}, {hi}] → 夹到 {clamped}", flush=True)
         return clamped
     return n
+
+
+def _vad_silence_ms(value) -> int:
+    """服务端静音断句阈值（ms）。
+
+    **缺省不告警**：老用户的 config.yaml 里没有这个键，属正常情况（不能像脏值那样打 `⚠️`）；
+    只有真的写错/越界才留痕。
+    """
+    if value is None or value == "":
+        return DEFAULT_VAD_SILENCE_MS
+    return _int_clamped(value, DEFAULT_VAD_SILENCE_MS, key="session.silence_duration_ms",
+                        lo=VAD_SILENCE_MS_MIN, hi=VAD_SILENCE_MS_MAX)
 
 
 def _float_in_range(value, default: float, *, key: str, lo: float, hi: float,
@@ -374,6 +389,7 @@ def load_config(path: str | Path | None = None, api_key: str | None = None,
         "provider": provider,
         "voice": s.get("voice", "Tina"),
         "turn_detection": s.get("turn_detection"),
+        "silence_duration_ms": _vad_silence_ms(s.get("silence_duration_ms")),
         "reconnect_backoff": s.get("reconnect_backoff", [2, 5, 10, 30]),
         "max_new_sessions_per_minute": s.get("max_new_sessions_per_minute", 4),
         "final_silence_s": float(s.get("final_silence_s", DEFAULT_FINAL_SILENCE_S)),  # 默认值必须 > 服务端增量间隔（实测最大 2.3s），改小会让最终版在句子中间抢跑

@@ -32,6 +32,16 @@ session:
   # ⚠️ 代价：server_vad 按**静音**判停，speaker_detection 认「谁在说」→ 环境嘈杂、或你中途
   #    停顿较久时，更容易在句子中间断句（译文被切成更多小段）。吵的环境建议留空。
   turn_detection: null
+  # 服务端静音断句阈值（ms，范围 200~6000）。实测（2026-10-21，千问云 host，各 10 句）
+  # 「说完 → 最终译文」的端到端耗时：
+  #   不下发 turn_detection（服务端默认 speaker_detection） 4.0~4.2s
+  #   speaker_detection + 1000ms                            2.5s
+  #   server_vad + 1000ms                                   0.97s
+  #   server_vad + 500ms                                    0.53s   ← 默认
+  #   server_vad + 300ms                                    0.39s（会吞句首：10 句里 4 句丢开头）
+  # ⚠️ 本分支是「快断句」测试分支：固定用 server_vad（忽略上面的 turn_detection），
+  #    合并前要改成「配置优先 + 默认 server_vad」。
+  silence_duration_ms: 500
   # 静默兜底：服务端在持续音频下可能长时间不发 response.done，
   # 超过这个静默时长就把累计文本当最终版发出（保证「句末刷最终版」必达）。
   # ⚠️ 必须大于服务端的增量间隔（实测连续说话时相邻 delta 最大 2.3s）——

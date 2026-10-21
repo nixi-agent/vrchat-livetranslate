@@ -130,11 +130,34 @@ class QwenLiveTranslateSession(LiveTranslateSession):
                 raise RuntimeError(f"服务端拒绝会话：{json.dumps(first.get('error') or first, ensure_ascii=False)}")
         except asyncio.TimeoutError:
             pass
+        payload = self._session_payload()
         await self._ws.send(json.dumps({"event_id": "evt_update", "type": "session.update",
-                                        "session": self._session_payload()}))
+                                        "session": payload}))
+        td = (((payload.get("audio") or {}).get("input") or {}).get("turn_detection")
+              or payload.get("turn_detection") or {})
+        print(f"[session] 会话配置已下发：断句={td.get('type')}，"
+              f"静音断句={td.get('silence_duration_ms')}ms"
+              f" | 语言={self.cfg.source_lang or 'auto'}→{self.cfg.target_lang}"
+              f" | 音色={self.cfg.voice} | 模型={self.cfg.model}", flush=True)
         # 建「等 session.finished」的事件：必须在事件循环里建（close() 与接收循环共用）。
         self._finished_evt = asyncio.Event()
         self._recv_task = asyncio.create_task(self._recv_loop())
+
+    def turn_detection_payload(self) -> dict:
+        """服务端断句配置（实测数据见 `base.DEFAULT_VAD_SILENCE_MS` 上方注释）。
+
+        ⚠️ **测试分支口径：固定 server_vad**。老配置里的 `speaker_detection` 是旧默认 /
+        旧诊断包的写法（实测端到端 2.5s，完全不填更是 4.0s），而 server_vad + 500ms
+        只要 0.53s。合并进 main 之前要改成「配置优先 + 默认 server_vad」。
+        """
+        configured = (self.cfg.turn_detection or "").strip().lower()
+        td: dict = {"type": "server_vad"}
+        if configured and configured != "server_vad":
+            print(f"[session] ⚠️ 配置 turn_detection={configured!r} → 本测试包固定用 "
+                  f"server_vad（实测 2.5~4.0s → 0.5s）", flush=True)
+        if self.cfg.silence_duration_ms:
+            td["silence_duration_ms"] = int(self.cfg.silence_duration_ms)
+        return td
 
     def _session_payload(self) -> dict:
         """⚠️ 必须整体下发且必须含 translation（实测：缺任一必要字段会被整体拒绝）。"""
@@ -151,11 +174,11 @@ class QwenLiveTranslateSession(LiveTranslateSession):
             session["input_audio_transcription"] = {"language": self.cfg.source_lang}
         if self.cfg.hotwords:
             session["translation"]["corpus"] = {"phrases": self.cfg.hotwords}
-        if self.cfg.turn_detection:
-            if self._gen == "38":
-                session["audio"] = {"input": {"turn_detection": {"type": self.cfg.turn_detection}}}
-            else:
-                session["turn_detection"] = {"type": self.cfg.turn_detection}
+        td = self.turn_detection_payload()
+        if self._gen == "38":
+            session["audio"] = {"input": {"turn_detection": td}}
+        else:
+            session["turn_detection"] = td
         return session
 
     async def send_audio(self, pcm16_16k: bytes) -> None:

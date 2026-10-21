@@ -55,6 +55,18 @@ DEFAULT_FINAL_SILENCE_S = 3.0
 #    → 那个间隔恒为 ~0.1s，快路径永远不触发（实测脚本 out/check_pr49_mic_signal.py）。
 DEFAULT_FAST_FINAL_SILENCE_S = 1.1
 DEFAULT_FAST_FINAL_USER_QUIET_S = 0.5
+# ---- 服务端断句（turn_detection）----
+# 实测（2026-10-21，千问云 maas.qianwenaiapi.com，各 10 句）：说完 → 最终译文的端到端耗时
+#   不下发 turn_detection（服务端默认 speaker_detection）  4.0~4.2s
+#   speaker_detection + silence_duration_ms=1000           2.5s
+#   server_vad（默认 800ms）                                0.96s
+#   server_vad + 500ms                                      0.53s（15/15 句完整）
+#   server_vad + 300ms                                      0.39s，但会吞句首（10 句里 4 句丢开头）
+# 断句之后模型自己只要 0.15~0.2s ⇒ 慢在断句，不在模型。默认取 500ms（质量/延迟折中）。
+DEFAULT_VAD_SILENCE_MS = 500
+VAD_SILENCE_MS_MIN = 200
+VAD_SILENCE_MS_MAX = 6000
+
 
 
 def should_finalize(*, text_quiet_s: float, user_quiet_s: float | None,
@@ -94,6 +106,9 @@ class SessionConfig:
     voice: str = "Tina"                 # 实测：不指定会抛 Voice 'Chelsie' is not supported
     hotwords: dict[str, str] = field(default_factory=dict)
     turn_detection: str | None = None   # None = 用服务端默认（3.8 为 speaker_detection）
+    # 服务端静音断句阈值（ms）。实测：默认/ speaker_detection 都在 2.5~4s 才收尾，
+    # 而 server_vad + 500ms 只要 0.53s → 由 qwen38 的 _turn_detection_payload 下发。
+    silence_duration_ms: int = DEFAULT_VAD_SILENCE_MS
     # base_url 是**唯一的地址真相源**（默认值也走 endpoints 派生，不再写第二份域名字面量）。
     base_url: str = endpoints.default_base_url(endpoints.PROVIDER_QIANWEN)
     # provider **仅供日志与诊断**：实际连到哪永远以 base_url 为准（见 endpoints

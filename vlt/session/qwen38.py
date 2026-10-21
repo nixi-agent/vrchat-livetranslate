@@ -108,6 +108,9 @@ class QwenLiveTranslateSession(LiveTranslateSession):
         self._t_speech_start: float | None = None
         self._first_delta_ms: float | None = None
         self.first_delta_ms: float | None = None   # 对外暴露
+        # 断句延迟埋点（测试分支：给「说完→出字」留下可量化的日志）
+        self._t_stopped: float = 0.0
+        self._first_after_stop_ms: float | None = None
 
     # ------------------------------------------------------------ 生命周期
     async def start(self, on_text: TextHandler, on_audio: AudioHandler | None = None,
@@ -382,6 +385,12 @@ class QwenLiveTranslateSession(LiveTranslateSession):
             return
         if etype == "input_audio_buffer.speech_started":
             self._t_speech_start = time.perf_counter()
+            self._t_stopped = 0.0
+            self._first_after_stop_ms = None
+            return
+        if etype == "input_audio_buffer.speech_stopped":
+            self._t_stopped = time.perf_counter()
+            self._first_after_stop_ms = None
             return
         if etype == "response.created":
             self._buf.clear()
@@ -397,6 +406,8 @@ class QwenLiveTranslateSession(LiveTranslateSession):
                 self._emit(confirmed=final_text, pending="", is_final=True)
             else:
                 self._emit(confirmed="".join(self._buf), pending=pending, is_final=False)
+            if self._t_stopped and self._first_after_stop_ms is None:
+                self._first_after_stop_ms = (time.perf_counter() - self._t_stopped) * 1000
             return
 
         # --- 音频增量 ---
@@ -422,6 +433,13 @@ class QwenLiveTranslateSession(LiveTranslateSession):
             usage = (ev.get("response") or {}).get("usage") or {}
             # 某些情况下没有 done 事件带全文，则用累加值兜底（重复终结由 _emit 去重）
             self._emit(confirmed="".join(self._buf), pending="", is_final=True)
+            if self._t_stopped:
+                done_ms = (time.perf_counter() - self._t_stopped) * 1000
+                first = self._first_after_stop_ms
+                print(f"[turn] 断句→首字 {'—' if first is None else f'{first:.0f}ms'}"
+                      f" | 断句→完成 {done_ms:.0f}ms | 终版 {len(''.join(self._buf))} 字",
+                      flush=True)
+                self._t_stopped = 0.0
             if self.on_usage is not None and usage:
                 self.on_usage(usage)
             self._src_buf = []

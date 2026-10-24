@@ -250,7 +250,7 @@ HIDDEN=(
     vlt.output.openxr_overlay          # Linux 手腕屏后端（由 vlt/platform/linux.py 收）
     vlt.platform vlt.platform.audio vlt.platform.base vlt.platform.linux
     vlt.platform.wayland vlt.platform.x11 vlt.platform.overlay_pixels   # 桌面字幕原生窗（layer-shell / ARGB）+ 共用像素工具
-    vlt.session vlt.session.base vlt.session.qwen38
+    vlt.session vlt.session.base vlt.session.qwen38 vlt.session.chatgpt_live
     # 第三方：按需导入 / 运行时加载（音频第三方只在 Windows 侧，见文件头「反向裁剪」）
     miniaudio _miniaudio pythonosc websockets yaml
     PIL PIL.Image PIL.ImageDraw PIL.ImageTk numpy xr
@@ -270,7 +270,7 @@ HIDDEN=(
 # 带二进制/数据文件的库 → 连数据一起收
 COLLECT_ALL=(xr pythonosc)
 # Linux 产物里**不允许**出现 Windows 独占实现（与 build_exe.py 的 EXCLUDE_WIN 镜像）
-EXCLUDES=(vlt.platform.win vlt.output.openvr_overlay vlt.output.win_d3d11 openvr pyaudiowpatch pycaw comtypes sounddevice)
+EXCLUDES=(vlt.platform.win vlt.output.openvr_overlay vlt.output.win_d3d11 vlt.output.wrist_startup vlt.output.wrist_texture vlt.output.wrist_recovery vlt.output.wrist_maintenance openvr pyaudiowpatch pycaw comtypes sounddevice)
 
 PYI_ARGS=(
     --noconfirm --clean --noupx --onedir
@@ -324,7 +324,9 @@ names = set(pkg_archive_contents(exe))
 
 # ⚠️ 这份集合与上面的 EXCLUDES 是**两份**清单，加新的平台独占模块时必须同时改；
 #    tests/test_platform_purity.py 现在会断言两份的 vlt.* 集合一致（漏改即红）。
-forbidden = {"vlt.platform.win", "vlt.output.openvr_overlay", "vlt.output.win_d3d11"}
+forbidden = {"vlt.platform.win", "vlt.output.openvr_overlay", "vlt.output.win_d3d11",
+             "vlt.output.wrist_startup", "vlt.output.wrist_texture", "vlt.output.wrist_recovery",
+             "vlt.output.wrist_maintenance"}
 bad = sorted(n for n in names if any(n == f or n.startswith(f + ".") for f in forbidden))
 assert not bad, f"包里混进了 Windows 独占模块：{bad}"
 

@@ -7,18 +7,17 @@
 """
 from __future__ import annotations
 
-import queue
-import time
-from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 import tkinter as tk
 from tkinter import ttk
 
 from .i18n import t
-from .output.overlay import DegradedNoteRelay
+from .gui_chat_context import ChatCtx as ChatCtx
+from .gui_chat_poll import poll as poll
 from .ui_text import _Bubble
+from .session.chatgpt_output import allowed, current
 from .ui_theme import (
     BG,
     BORDER,
@@ -43,84 +42,6 @@ from .ui_theme import (
 #    `vlt/gui_desktop.py` 里 `ui_tk.FONT_UI` 那种写法才是对的，照它来。
 from . import ui_tk
 from .ui_tk import _char_width_for, round_rect
-
-
-# ================================================================ 上下文
-
-@dataclass
-class ChatCtx:
-    """聊天 / 轮询 / 状态功能所需的全部 **控件引用** 与 **回调**。
-
-    可变状态（``bubbles`` / ``current`` / ``canvas_w`` 等）由 gui.py 的薄壳
-    方法管理，本模块的函数通过参数接收，不直接持有。
-    """
-    # ── 聊天区控件 ──
-    canvas: Any = None                    # tk.Canvas
-    vsb: Any = None                       # ttk.Scrollbar
-    status_dot: Any = None                # tk.Label（彩色圆点）
-    status_label: Any = None              # ttk.Label
-    stats_label: Any = None               # ttk.Label
-
-    # ── 输入行控件 ──
-    text_var: Any = None                  # tk.StringVar
-    text_entry: Any = None                # ttk.Entry
-    send_btn: Any = None                  # ttk.Button
-
-    # ── 聊天状态 ──
-    bubbles: list = field(default_factory=list)    # list[_Bubble]
-    current: dict = field(default_factory=dict)    # dict[str, _Bubble] 流式增量
-    auto_scroll: bool = True
-    canvas_w: int = 1
-    relayout_job: Any = None              # root.after 句柄
-    placeholder_drawn: bool = False       # 空聊天区占位提示是否已画（避免重复画）
-
-    # ── 轮询队列 ──
-    q: Any = None                         # queue.Queue
-    poll_job: Any = None                  # root.after 句柄（poll 循环）
-
-    # ── 引擎引用（poll 使用） ──
-    engines_ref: list = field(default_factory=list)       # 可变 list 容器
-    engine_dirs_ref: list = field(default_factory=list)   # 同上
-
-    # ── 每跳现取的活引用（**不许缓存实例**） ──
-    # 桌面字幕 / 手腕屏是「开始翻译」后才建的，而构建期就跑起了 poll：那时它们还是
-    # None。早先拆分（6083052）把这里做成单元素 list 容器，却**从没写回** ——
-    # poll 永远读到 None → `tick()` 一次都不跑 → 桌面字幕「收不到内容 / 拖不动 /
-    # 配置热重载失效」（三条症状同源）。现在改成每跳现取，谁先谁后都对。
-    overlay_out_fn: Optional[Callable] = None      # () -> Overlay | None
-    desktop_out_fn: Optional[Callable] = None      # () -> DesktopOverlay | None
-    pending_starts_fn: Optional[Callable] = None   # () -> int
-    # 手腕屏**降级说明**的转发（判重与引擎 `_pump_loop` 那条路**共用同一个类**）：
-    # 实例由本模块每跳现取 `overlay_out_fn()`，所以这里只放判重状态，不持有实例。
-    overlay_note_relay: DegradedNoteRelay = field(default_factory=DegradedNoteRelay)
-
-    # ── 状态栏 ──
-    last_status_level: str = "info"
-    #: 打字发送后的状态回报（`gui._set_status`）。拆分（6083052）后调用点漏传这个，
-    #: 导致回车直接 `'NoneType' object is not callable` —— 见 issue #110。
-    set_status_fn: Optional[Callable] = None
-
-    # ── 房间轮询 ──
-    room_status_next: float = 0.0
-
-    # ── 门限轮询 ──
-    gate_level_tick: int = 0
-
-    # ── 回调 ──
-    push_overlay_fn: Optional[Callable] = None     # () -> None
-    push_desktop_fn: Optional[Callable] = None     # () -> None
-    on_device_scan_result_fn: Optional[Callable] = None
-    on_update_check_result_fn: Optional[Callable] = None
-    on_download_progress_fn: Optional[Callable] = None
-    on_download_done_fn: Optional[Callable] = None
-    on_download_error_fn: Optional[Callable] = None
-    on_voice_preview_done_fn: Optional[Callable] = None
-    refresh_room_status_fn: Optional[Callable] = None
-    sync_gate_level_fn: Optional[Callable] = None
-    refresh_gate_level_fn: Optional[Callable] = None
-    # 开始/停止单按钮控制：stop_done 事件 + 「引擎全部退出」兜底都要把按钮态刷回 idle
-    power_state_fn: Optional[Callable] = None          # (state) -> None
-
 
 # ================================================================ UI 构建
 
@@ -256,13 +177,7 @@ def set_text_input_enabled(ctx: ChatCtx, on: bool) -> None:
 
 
 def _submit_typed(ctx: ChatCtx) -> str:
-    """输入行的**唯一入口**：回车与「发送」按钮都走这里（issue #110）。
-
-    拆分（6083052）后两个调用点各写一遍参数，结果都漏了 engines / engine_dirs /
-    set_status_fn —— 回车抛 `'NoneType' object is not callable`、按钮抛
-    `TypeError: missing 3 required positional arguments`，打字输入整整坏了三个版本。
-    现在只保留一个入口：以后改参数，回车和按钮不会分叉。
-    """
+    """Route both input controls through the current engines and status callback."""
     return on_text_enter(ctx, list(ctx.engines_ref), list(ctx.engine_dirs_ref),
                          ctx.set_status_fn)
 
@@ -272,9 +187,7 @@ def on_text_enter(ctx: ChatCtx, engines: list = (), engine_dirs: list = (), set_
     send_typed(ctx, list(engines), list(engine_dirs), set_status_fn)
     return "break"                  # 吃掉回车：否则 Tk 会再响一声提示音
 
-
 def _notify(set_status_fn, level: str, msg: str) -> None:
-    """状态回报：headless / 测试里 `set_status_fn` 可能是 None（不许因此崩掉发送）。"""
     if set_status_fn is not None:
         set_status_fn(level, msg)
 
@@ -345,11 +258,22 @@ def on_canvas_configure(ctx: ChatCtx, root: tk.Misc, event=None) -> None:
 
 # ================================================================ 聊天气泡
 
+def _bubble_end(b: _Bubble) -> int:
+    return b.y + b.h + (8 if b.h else 0)
+
+
 def add_text(ctx: ChatCtx, source: str, text: str, is_final: bool,
              who: str = "mine", label: str = "") -> None:
     """添加/更新一条聊天气泡（流式增量就地重画，终版封口）。"""
+    approval = current()
+    if not allowed(approval, who):
+        return
     now_str = datetime.now().strftime("%H:%M:%S")
     cur = ctx.current.get(who)
+    if cur is not None and (cur.approval is not approval or not allowed(cur.approval, who)):
+        cur.final = True
+        ctx.current.pop(who, None)
+        cur = None
     if cur is not None:
         # 流式增量：就地重画同一条气泡（终版只做"封口"，绝不新插第二条）
         cur.source = source
@@ -366,10 +290,10 @@ def add_text(ctx: ChatCtx, source: str, text: str, is_final: bool,
         return
     # 没有正在刷新的气泡 → 新建
     b = _Bubble(who=who, source=source, text=text, ts=now_str,
-                final=is_final, label=label)
+                final=is_final, label=label, approval=approval)
     if not is_final:
         ctx.current[who] = b
-    b.y = (ctx.bubbles[-1].y + ctx.bubbles[-1].h + 8) if ctx.bubbles else 8
+    b.y = _bubble_end(ctx.bubbles[-1]) if ctx.bubbles else 8
     ctx.bubbles.append(b)
     if ctx.canvas is not None:
         _clear_placeholder(ctx)
@@ -387,6 +311,9 @@ def draw_bubble(ctx: ChatCtx, b: _Bubble) -> int:
     你要读的永远是下面那行大字。服务端没返回原文（或原文与译文相同）时
     只画译文，不留空行。
     """
+    if not allowed(b.approval, b.who):
+        b.items, b.h = [], 0
+        return b.y
     cv = ctx.canvas
     w = ctx.canvas_w if ctx.canvas_w > 1 else 600
     maxw = int(w * 0.62)                       # width 参数自带自动换行
@@ -446,9 +373,9 @@ def redraw_current(ctx: ChatCtx, b: _Bubble) -> None:
     """流式增量：删掉旧图元，在同一个起始 y 位置重画同一条气泡。"""
     for iid in b.items:
         ctx.canvas.delete(iid)
-    old_h = b.h
+    old_end = _bubble_end(b)
     draw_bubble(ctx, b)
-    delta = b.h - old_h
+    delta = _bubble_end(b) - old_end
     if delta:
         # 气泡长高时把下面的气泡整体下移，避免重叠
         idx = ctx.bubbles.index(b)
@@ -467,7 +394,7 @@ def trim(ctx: ChatCtx) -> None:
         old = ctx.bubbles.pop(0)
         if ctx.current.get(old.who) is old:
             ctx.current.pop(old.who, None)
-        removed += old.h + 8
+        removed += _bubble_end(old) - old.y
         for iid in old.items:
             ctx.canvas.delete(iid)
     if removed:
@@ -483,7 +410,7 @@ def update_scrollregion(ctx: ChatCtx) -> None:
     content = 8
     if ctx.bubbles:
         last = ctx.bubbles[-1]
-        content = last.y + last.h + 8
+        content = _bubble_end(last)
     h = ctx.canvas.winfo_height()
     ctx.canvas.configure(
         scrollregion=(0, 0, max(ctx.canvas_w, 1), max(content, h)))
@@ -571,130 +498,3 @@ def setup_poll_ctx(ctx: ChatCtx, gui) -> None:
     c.refresh_room_status_fn = gui._refresh_room_status_label; c.sync_gate_level_fn = gui._sync_gate_level_probe
     c.refresh_gate_level_fn = gui._refresh_gate_level
     c.power_state_fn = gui._set_power_state
-
-
-def poll(ctx: ChatCtx, root: tk.Misc,
-         set_status_fn: Callable,
-         add_text_fn: Callable,
-         refresh_status_fn: Callable,
-         stats: dict,
-         ) -> None:
-    """主轮询：从队列读取消息并分发到各处理器（每 50ms 一次）。
-
-    手腕屏 / 桌面字幕实例**不通过参数传进来** —— 它们是「开始翻译」后才创建的，
-    而本循环在构建期就起跑了；一律走 ``ctx.*_out_fn()`` 每跳现取（见 ChatCtx）。
-    """
-    try:
-        while True:
-            item = ctx.q.get_nowait()
-            kind = item[0]
-            if kind == "text":
-                add_text_fn(item[2], item[3], item[4], who=item[1])
-                if ctx.push_overlay_fn:
-                    ctx.push_overlay_fn()
-                if ctx.push_desktop_fn:
-                    ctx.push_desktop_fn()
-            elif kind == "status":
-                set_status_fn(item[1], item[2])
-            elif kind == "stats":
-                stats.update(item[1])
-                refresh_status_fn()
-            elif kind == "devices":
-                if ctx.on_device_scan_result_fn:
-                    ctx.on_device_scan_result_fn(item[1], item[2], item[3])
-            elif kind == "devices_error":
-                set_status_fn("warn",
-                              t("设备扫描失败：{msg}", msg=item[1]))
-                # gui.py 薄壳负责把 _device_scan_pending 置 False
-            elif kind == "update_check":
-                if ctx.on_update_check_result_fn:
-                    ctx.on_update_check_result_fn(
-                        item[1], item[2], item[3], item[4])
-            elif kind == "update_progress":
-                if ctx.on_download_progress_fn:
-                    ctx.on_download_progress_fn(item[1], item[2])
-            elif kind == "update_download_done":
-                if ctx.on_download_done_fn:
-                    ctx.on_download_done_fn(item[1])
-            elif kind == "update_download_error":
-                if ctx.on_download_error_fn:
-                    ctx.on_download_error_fn(item[1])
-            elif kind == "room":
-                # 远端成员的一句话：进聊天气泡
-                add_text_fn("", item[3], item[4],
-                            who=f"peer:{item[2]}", label=item[1])
-                if ctx.push_overlay_fn:
-                    ctx.push_overlay_fn()
-            elif kind == "room_status":
-                # 房间链路状态：按行首符号定状态栏颜色级别
-                txt = str(item[1])
-                level = ("error" if txt.startswith("❌")
-                         else "warn" if txt.startswith("⚠️")
-                         else "info")
-                set_status_fn(level, txt)
-            elif kind == "voice_preview":
-                if ctx.on_voice_preview_done_fn:
-                    ctx.on_voice_preview_done_fn(
-                        item[1], item[2], item[3])
-            elif kind == "stop_done":
-                # 引擎收尾完成 → 单按钮刷回 idle（超时也要放开，宁可让用户再点一次也不能把界面锁死）
-                _, elapsed, n_engines, incomplete = item
-                if ctx.power_state_fn:
-                    ctx.power_state_fn("idle")
-                print(f"[gui] 停止收尾完成：{n_engines} 个引擎，"
-                      f"用时 {elapsed:.2f}s"
-                      + ("（有引擎超时未退出，仍在关设备）"
-                         if incomplete else ""),
-                      flush=True)
-                if ctx.last_status_level != "error":
-                    if incomplete:
-                        set_status_fn("warn",
-                                      t("已停止（上一次会话仍在收尾）"))
-                    else:
-                        set_status_fn("info", t("已停止"))
-    except queue.Empty:
-        pass
-
-    # 引擎全部退出 → 恢复按钮
-    engines = ctx.engines_ref
-    pending_starts = ctx.pending_starts_fn() if ctx.pending_starts_fn else 0
-    if (pending_starts == 0 and engines
-            and all(not e.running for e in engines)):
-        if ctx.power_state_fn:
-            ctx.power_state_fn("idle")
-        if ctx.last_status_level != "error":
-            set_status_fn("info", t("已停止"))
-        # gui.py 薄壳负责清空 engines / engine_dirs
-
-    # 手腕屏 / 桌面字幕的热重载 / 淡出。
-    # ⚠️ 必须**每跳现取**：两个实例都是「开始翻译」后才创建的，构建期这里还是 None；
-    #    早先缓存进 list 容器却从不写回 → tick() 永不执行（桌面字幕内容/拖动/热重载全废）。
-    ov = ctx.overlay_out_fn() if ctx.overlay_out_fn else None
-    if ov is not None:
-        ov.tick()
-        # 手腕屏的**降级说明**也要推给状态栏 —— GUI 下 `Engine._overlay` 恒为 None（实例由界面
-        # 持有），引擎 `_pump_loop` 里那条转发在这里根本跑不到：只打日志的话用户永远看不到
-        # 「面板为什么偶尔不刷新」（#98 合并后复审发现的缺口，见 issue #99）。
-        # 判重与那条路共用 `DegradedNoteRelay`，只在变化时推（降级 warn / 恢复 info）。
-        ctx.overlay_note_relay.relay(ov, set_status_fn)
-    dov = ctx.desktop_out_fn() if ctx.desktop_out_fn else None
-    if dov is not None:
-        dov.tick()
-
-    # 房间行状态每 0.5s 刷一次
-    _now = time.monotonic()
-    if _now >= ctx.room_status_next:
-        ctx.room_status_next = _now + 0.5
-        if ctx.refresh_room_status_fn:
-            ctx.refresh_room_status_fn()
-
-    # 输入门限的实时电平条：每 100ms 刷一次（poll 本身 50ms 一跳）
-    ctx.gate_level_tick += 1
-    if ctx.gate_level_tick % 2 == 0:
-        if ctx.sync_gate_level_fn:
-            ctx.sync_gate_level_fn()
-        if ctx.canvas is not None and ctx.refresh_gate_level_fn:
-            ctx.refresh_gate_level_fn()
-
-    ctx.poll_job = root.after(50, lambda: poll(
-        ctx, root, set_status_fn, add_text_fn, refresh_status_fn, stats))

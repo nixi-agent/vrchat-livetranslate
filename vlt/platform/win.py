@@ -879,12 +879,13 @@ def _handler_of(this):
 
 def _h_query_interface(this, priid, ppv):
     inst = _handler_of(this)
-    if not ppv:
+    if not ppv or inst is None:
         return _E_NOINTERFACE
     ppv[0] = None
     riid = priid.contents
     if riid in (_IID_IUNKNOWN, _IID_IAGILEOBJECT,
                 _IID_IACTIVATEAUDIOINTERFACECOMPLETIONHANDLER):
+        _h_addref(this)
         ppv[0] = ctypes.c_void_p(this)
         return 0
     if riid == _IID_IMARSHAL and inst is not None and inst._ftm:
@@ -898,19 +899,24 @@ def _h_query_interface(this, priid, ppv):
 
 
 def _h_addref(this):                             # noqa: ANN001, ARG001
-    # 引用计数只服务激活这一小段：探活对象本身不会被别人长期持有，返回非零即可。
-    return 2
+    inst = _handler_of(this)
+    if inst is None:
+        return 0
+    with inst._lock:
+        inst._refs += 1
+        return inst._refs
 
 
 def _h_release(this):                            # noqa: ANN001, ARG001
-    return 1
+    inst = _handler_of(this)
+    return inst._release() if inst is not None else 0
 
 
 def _h_activate_completed(this, op):             # noqa: ANN001, ARG001
     inst = _handler_of(this)
     if inst is not None:
         inst.fired += 1
-        ctypes.WinDLL("kernel32").SetEvent(inst.event)
+        ctypes.WinDLL("kernel32").SetEvent(ctypes.c_void_p(inst.event))
     return 0
 
 
@@ -943,7 +949,14 @@ class _CompletionHandler:
     def __init__(self) -> None:
         self._keep: list = []
         self._ftm = ctypes.c_void_p()
-        self.event = ctypes.WinDLL("kernel32").CreateEventW(None, False, False, None)
+        self._lock = threading.Lock()
+        self._refs = 1
+        self._closed = False
+        kernel = ctypes.WinDLL("kernel32")
+        kernel.CreateEventW.restype = ctypes.c_void_p
+        self.event = kernel.CreateEventW(None, False, False, None)
+        if not self.event:
+            raise RuntimeError('CreateEventW failed for process activation')
         self.fired = 0
         tbl = _HandlerVtbl(_H_QI, _H_AR, _H_RL, _H_AC)
         obj = _HandlerObj(ctypes.pointer(tbl))
@@ -953,13 +966,30 @@ class _CompletionHandler:
         hr = ctypes.WinDLL("ole32").CoCreateFreeThreadedMarshaler(
             ctypes.c_void_p(self._addr), ctypes.byref(self._ftm))
         if hr < 0:
-            _HANDLER_BY_ADDR.pop(self._addr, None)
+            self.close()
             raise RuntimeError(f"CoCreateFreeThreadedMarshaler 失败：{_hr_name(hr)}")
 
     def close(self) -> None:
-        _HANDLER_BY_ADDR.pop(self._addr, None)
-        self._keep.clear()
-        self._ftm = ctypes.c_void_p()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._release()
+
+    def _release(self) -> int:
+        with self._lock:
+            self._refs -= 1
+            remaining = self._refs
+        if remaining == 0:
+            # Windows retains its own reference until an outstanding activation finishes.
+            _HANDLER_BY_ADDR.pop(self._addr, None)
+            _com_release(self._ftm)
+            self._ftm = ctypes.c_void_p()
+            if self.event:
+                ctypes.WinDLL('kernel32').CloseHandle(ctypes.c_void_p(self.event))
+                self.event = None
+            self._keep.clear()
+        return remaining
 
 
 class ProcessLoopbackSource(QueueAudioSource):
@@ -983,6 +1013,21 @@ class ProcessLoopbackSource(QueueAudioSource):
         self._bits = 32
         self._block_align = 2 * 32 // 8
         self._com_inited = False
+        self._ended = threading.Event()
+
+    @property
+    def finished(self) -> bool:
+        return self._ended.is_set() and self._queue.empty()
+
+    def _run(self) -> None:
+        try:
+            super()._run()
+        finally:
+            try:
+                # Order EOF after every PCM enqueue already posted by this worker.
+                self._loop.call_soon_threadsafe(self._ended.set)
+            except RuntimeError:
+                self._ended.set()
 
     # ---- 对外小接口（engine 用来判断「进程没了 → 回等待」）
     def process_gone(self) -> bool:
@@ -1091,76 +1136,95 @@ def open_process_loopback(pid: int, *, rate: int = 48000) -> AudioSource:
 
     ole32 = ctypes.WinDLL("ole32")
     mmdevapi = ctypes.WinDLL("Mmdevapi.dll")
-    ole32.CoInitializeEx(None, _COINIT_MULTITHREADED)     # MTA：接口可跨线程用
-
-    handler = _CompletionHandler()
-    params = _ACTIVATION_PARAMS()
-    params.ActivationType = _PROCESS_LOOPBACK_ACTIVATION_TYPE
-    params.ProcessLoopbackParams.TargetProcessId = int(pid)
-    params.ProcessLoopbackParams.ProcessLoopbackMode = _PROCESS_LOOPBACK_MODE_INCLUDE_TREE
-    pv = _PROPVARIANT()
-    pv.vt = _VT_BLOB
-    pv.blobSize = ctypes.sizeof(params)
-    pv.pBlob = ctypes.cast(ctypes.byref(params), ctypes.c_void_p)
-
-    mmdevapi.ActivateAudioInterfaceAsync.restype = _HRESULT
-    mmdevapi.ActivateAudioInterfaceAsync.argtypes = [
-        ctypes.c_wchar_p, ctypes.POINTER(_GUID), ctypes.POINTER(_PROPVARIANT),
-        ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    initialized = ole32.CoInitializeEx(None, _COINIT_MULTITHREADED)
+    if initialized < 0:
+        raise RuntimeError(f"CoInitializeEx failed: {_hr_name(initialized)}")
+    handler = client = cap = event = None
     op = ctypes.c_void_p()
-    hr = mmdevapi.ActivateAudioInterfaceAsync(
-        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, ctypes.byref(_IID_IAUDIOCLIENT),
-        ctypes.byref(pv), ctypes.c_void_p(handler._addr), ctypes.byref(op))
-    if hr < 0:
-        raise RuntimeError(f"ActivateAudioInterfaceAsync 失败：{_hr_name(hr)}")
+    transferred = False
+    try:
+        handler = _CompletionHandler()
+        params = _ACTIVATION_PARAMS()
+        params.ActivationType = _PROCESS_LOOPBACK_ACTIVATION_TYPE
+        params.ProcessLoopbackParams.TargetProcessId = int(pid)
+        params.ProcessLoopbackParams.ProcessLoopbackMode = _PROCESS_LOOPBACK_MODE_INCLUDE_TREE
+        pv = _PROPVARIANT()
+        pv.vt = _VT_BLOB
+        pv.blobSize = ctypes.sizeof(params)
+        pv.pBlob = ctypes.cast(ctypes.byref(params), ctypes.c_void_p)
 
-    ctypes.WinDLL("kernel32").WaitForSingleObject(ctypes.c_void_p(handler.event), 3000)
-    result = _HRESULT(0)
-    iface = ctypes.c_void_p()
-    hr2 = _vcall(op, 3, _HRESULT, [ctypes.POINTER(_HRESULT),
-                                   ctypes.POINTER(ctypes.c_void_p)],
-                 ctypes.byref(result), ctypes.byref(iface))
-    _com_release(op)
-    if hr2 < 0 or result.value < 0 or not iface:
-        raise RuntimeError(f"激活进程采集失败：hr={_hr_name(result.value)} op={_hr_name(hr2)}")
+        mmdevapi.ActivateAudioInterfaceAsync.restype = _HRESULT
+        mmdevapi.ActivateAudioInterfaceAsync.argtypes = [
+            ctypes.c_wchar_p, ctypes.POINTER(_GUID), ctypes.POINTER(_PROPVARIANT),
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        op = ctypes.c_void_p()
+        hr = mmdevapi.ActivateAudioInterfaceAsync(
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, ctypes.byref(_IID_IAUDIOCLIENT),
+            ctypes.byref(pv), ctypes.c_void_p(handler._addr), ctypes.byref(op))
+        if hr < 0:
+            raise RuntimeError(f"ActivateAudioInterfaceAsync 失败：{_hr_name(hr)}")
 
-    client = iface
-    fmt = _build_process_format(rate)
-    flags = _AUDCLNT_STREAMFLAGS_LOOPBACK | _AUDCLNT_STREAMFLAGS_EVENTCALLBACK
-    hr = _vcall(client, 3, _HRESULT,
-                [ctypes.c_int, ctypes.c_ulong, ctypes.c_longlong, ctypes.c_longlong,
-                 ctypes.POINTER(_WAVEFORMATEX), ctypes.c_void_p],
-                _AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, ctypes.byref(fmt), None)
-    if hr < 0:
-        _com_release(client)
-        raise RuntimeError(f"Initialize 失败：{_hr_name(hr)}")
+        if ctypes.WinDLL("kernel32").WaitForSingleObject(ctypes.c_void_p(handler.event), 3000) != 0:
+            raise RuntimeError("Process capture activation timed out")
+        result = _HRESULT(0)
+        iface = ctypes.c_void_p()
+        hr2 = _vcall(op, 3, _HRESULT, [ctypes.POINTER(_HRESULT),
+                                       ctypes.POINTER(ctypes.c_void_p)],
+                     ctypes.byref(result), ctypes.byref(iface))
+        _com_release(op)
+        op = None
+        client = iface
+        if hr2 < 0 or result.value < 0 or not iface:
+            raise RuntimeError(f"激活进程采集失败：hr={_hr_name(result.value)} op={_hr_name(hr2)}")
 
-    cap = ctypes.c_void_p()
-    hr = _vcall(client, 14, _HRESULT,
-                [ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)],
-                ctypes.byref(_IID_IAUDIOCAPTURECLIENT), ctypes.byref(cap))
-    if hr < 0 or not cap:
-        _com_release(client)
-        raise RuntimeError(f"GetService(IAudioCaptureClient) 失败：{_hr_name(hr)}")
+        fmt = _build_process_format(rate)
+        flags = _AUDCLNT_STREAMFLAGS_LOOPBACK | _AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+        hr = _vcall(client, 3, _HRESULT,
+                    [ctypes.c_int, ctypes.c_ulong, ctypes.c_longlong, ctypes.c_longlong,
+                     ctypes.POINTER(_WAVEFORMATEX), ctypes.c_void_p],
+                    _AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, ctypes.byref(fmt), None)
+        if hr < 0:
+            raise RuntimeError(f"Initialize 失败：{_hr_name(hr)}")
 
-    k32 = ctypes.WinDLL("kernel32")
-    event = k32.CreateEventW(None, False, False, None)
-    hr = _vcall(client, 13, _HRESULT, [ctypes.c_void_p], ctypes.c_void_p(event))
-    if hr < 0:
-        _com_release(cap)
-        _com_release(client)
-        raise RuntimeError(f"SetEventHandle 失败：{_hr_name(hr)}")
-    hr = _vcall(client, 10, _HRESULT, [])                       # Start
-    if hr < 0:
-        _com_release(cap)
-        _com_release(client)
-        raise RuntimeError(f"Start 失败：{_hr_name(hr)}")
+        cap = ctypes.c_void_p()
+        hr = _vcall(client, 14, _HRESULT,
+                    [ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)],
+                    ctypes.byref(_IID_IAUDIOCAPTURECLIENT), ctypes.byref(cap))
+        if hr < 0 or not cap:
+            raise RuntimeError(f"GetService(IAudioCaptureClient) 失败：{_hr_name(hr)}")
 
-    src = ProcessLoopbackSource(asyncio.get_running_loop(), pid=pid, rate=rate,
-                                client=client, capture=cap, event=event, handler=handler)
-    src._com_inited = True
-    src.start()
-    return src
+        k32 = ctypes.WinDLL("kernel32")
+        k32.CreateEventW.restype = ctypes.c_void_p
+        event = k32.CreateEventW(None, False, False, None)
+        if not event:
+            raise RuntimeError("CreateEventW failed for process capture")
+        hr = _vcall(client, 13, _HRESULT, [ctypes.c_void_p], ctypes.c_void_p(event))
+        if hr < 0:
+            raise RuntimeError(f"SetEventHandle 失败：{_hr_name(hr)}")
+        hr = _vcall(client, 10, _HRESULT, [])                       # Start
+        if hr < 0:
+            raise RuntimeError(f"Start 失败：{_hr_name(hr)}")
+
+        src = ProcessLoopbackSource(asyncio.get_running_loop(), pid=pid, rate=rate,
+                                    client=client, capture=cap, event=event, handler=handler)
+        src._com_inited = True
+        transferred = True
+        try:
+            src.start()
+        except BaseException:
+            src.close()
+            raise
+        return src
+    finally:
+        _com_release(op)
+        if not transferred:
+            _com_release(cap)
+            _com_release(client)
+            if event:
+                ctypes.WinDLL('kernel32').CloseHandle(ctypes.c_void_p(event))
+            if handler is not None:
+                handler.close()
+            ole32.CoUninitialize()
 
 
 def create_wrist_overlay(cfg: Any, config_path: Any = None, dry_run: bool = False) -> Any:

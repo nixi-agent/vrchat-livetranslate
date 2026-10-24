@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from unittest.mock import call, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -163,12 +164,17 @@ def test_room_code() -> None:
     assert len(ALPHABET) == 32, f"字符集不是 32 个：{len(ALPHABET)}"
     for ch in "ILOU":
         assert ch not in ALPHABET, f"字符集里混进了易混字符 {ch}"
-    for _ in range(300):
-        code = new_room_code()
-        assert len(code) == ROOM_CODE_LEN, f"长度不对：{code!r}"
-        assert is_valid_room_code(code), f"自己生成的码居然不合法：{code!r}"
-        assert all(c in ALPHABET for c in code)
-    assert len({new_room_code() for _ in range(300)}) == 300, "300 次生成出现重复（随机源有问题）"
+    # 格式测试不应依赖有限随机空间恰好没有碰撞。
+    codes = ["".join(ALPHABET[(value >> (5 * digit)) & 31]
+                     for digit in range(ROOM_CODE_LEN - 1, -1, -1)) for value in range(300)]
+    with patch('vlt.room.protocol.secrets.choice', side_effect="".join(codes * 2)) as random_char:
+        for _ in range(300):
+            code = new_room_code()
+            assert len(code) == ROOM_CODE_LEN, f"长度不对：{code!r}"
+            assert is_valid_room_code(code), f"自己生成的码居然不合法：{code!r}"
+            assert all(c in ALPHABET for c in code)
+        assert len({new_room_code() for _ in range(300)}) == 300, "300 次生成出现重复（随机源有问题）"
+    assert random_char.call_args_list == [call(ALPHABET)] * (600 * ROOM_CODE_LEN)
 
     good = ["ABCD1234", "abcd1234", "  abcd-1234  ", "00000000", "ZZZZZZZZ",
             "ABCDI234"]                     # I → 1，口语里就是这么念的
@@ -185,11 +191,13 @@ def test_room_code() -> None:
 
 def test_peer_id_format() -> None:
     """成员 id 格式：`p_` + 6 位 hex（方案 §4 的 `me` 字段）。"""
-    ids = {new_peer_id() for _ in range(200)}
+    with patch('vlt.room.protocol.secrets.token_hex', side_effect=[f'{i:06x}' for i in range(200)]) as random_hex:
+        ids = {new_peer_id() for _ in range(200)}
     assert len(ids) == 200, "成员 id 撞了"
     for pid in ids:
         assert pid.startswith("p_") and len(pid) == 8, f"格式不对：{pid!r}"
         int(pid[2:], 16)                                # 后 6 位必须是 hex
+    assert random_hex.call_args_list == [call(3)] * 200
     print("  成员 id 格式 OK")
 
 

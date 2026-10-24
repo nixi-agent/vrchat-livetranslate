@@ -152,7 +152,7 @@ def test_buffer_keeps_newest():
     vm.push(b"\xCC" * chunk_bytes)                 # 第三句（未封口）
 
     with vm._lock:
-        chunks = [c for c, _e in vm._buf]
+        chunks = [c for c, _e, _approval in vm._buf]
     first_chunk = chunks[0]
     assert first_chunk[0:1] == b"\xBB" or first_chunk[0:1] == b"\xCC", \
         f"最旧的整句应被丢弃，实际第一个是 {first_chunk[0:1]!r}"
@@ -377,7 +377,7 @@ def test_overflow_drops_whole_sentences_only():
         vm.push(bytes([tag]) * SENT)
         vm.end_sentence()
 
-    joined = b"".join(c for c, _e in vm._buf)
+    joined = b"".join(c for c, _e, _approval in vm._buf)
     assert joined, "全被丢光了（应该还留着最新的）"
     for tag in (1, 2, 3, 4, 5):
         n = joined.count(bytes([tag]))
@@ -405,7 +405,7 @@ def test_playing_sentence_not_dropped():
         vm.push(bytes([tag]) * SENT)
         vm.end_sentence()
 
-    joined = b"".join(c for c, _e in vm._buf)
+    joined = b"".join(c for c, _e, _approval in vm._buf)
     assert joined.count(b"\x01") > 0, "正在播放的第一句被丢掉了 —— 会听到半句话"
     print(f"  正在播的那句没被丢 OK（第 1 句剩 {joined.count(bytes([1])) / (48000*4):.2f}s）")
 

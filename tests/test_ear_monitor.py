@@ -110,6 +110,7 @@ def test_ring_drops_oldest_and_pads_silence() -> None:
 
     out = np.full((BLOCK_FRAMES, 2), 7, dtype=np.int16)    # 故意预先填非零
     m._buf.clear()                                         # noqa: SLF001
+    m._approvals.clear()
     m._callback(out, BLOCK_FRAMES, None, None)             # noqa: SLF001
     assert not out.any(), "欠载必须补零（不能留上一帧的残音）"
     print("  缓冲：超限丢最旧 + 欠载补零 OK")
@@ -277,11 +278,13 @@ class _FakeBuf:
     def push(self, pcm: bytes) -> None:
         self.pushed.append(pcm)
 
-    def drain_block(self, need: int) -> bytes | None:
+    def drain_block(self, need: int, on_chunk=None) -> bytes | None:
         if not self.blocks:
             return None
         d = self.blocks.pop(0)
         assert len(d) == need, f"剧本块长不对：{len(d)} != {need}"
+        if on_chunk is not None:
+            on_chunk(d)
         return d
 
 
@@ -393,7 +396,7 @@ def test_conflict_detection() -> None:
     r2 = _patch(E, "resolve_device_name", lambda name, kind: 5 if name == "Speakers" else None)
     r3 = _patch(E, "_output_name_of", lambda idx: "Speakers")
     r4 = _patch(E, "pick_loopback_target",
-                lambda name=None: E.LoopbackTarget(id="9", name="Speakers [Loopback]",
+                lambda patterns=None, device_name=None: E.LoopbackTarget(id="9", name="Speakers [Loopback]",
                                                    sample_rate=48000, channels=2))
     try:
         assert E.monitor_capture_conflict({"enabled": True, "device_name": ""},

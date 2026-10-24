@@ -18,6 +18,7 @@ from .room.client import RoomClient
 from .room.model import ConnectionState, RoomConfig, RoomMessage
 from .room.protocol import new_room_code
 from .room.publisher import SourcePublisher, should_publish
+from .session.chatgpt_output import allowed, current
 from .ui_state import room_status_text
 
 
@@ -239,6 +240,12 @@ def publish_to_room(room: Any,
         if not should_publish(source_id, room_cfg.enabled,
                               room_cfg.broadcast_source):
             return
+        approval = current()
+        if not allowed(approval, 'mine') or (approval is not None and not is_final):
+            return
+        if approval is not None:
+            # 核准段已完整封句；不继承旧串流的 partial 或重复 done 判据。
+            publisher.reset()
         for item in publisher.feed(src_text, is_final):
             room.publish(item.utt, item.rev, item.text, item.is_final)
     except Exception as exc:            # noqa: BLE001

@@ -9,6 +9,7 @@ import time
 from typing import Callable
 
 from ..platform import child_env
+from ..session.chatgpt_output import allowed, current, scope
 
 log = logging.getLogger(__name__)
 
@@ -101,9 +102,10 @@ class VirtualMic:
         self._max_buffer_ms = max_buffer_ms
         self._on_status = on_status
 
-        self._buf: collections.deque[tuple[bytes, bool]] = collections.deque()   # (chunk, 是否句尾)
+        self._buf: collections.deque[tuple[bytes, bool, object]] = collections.deque()  # PCM、句尾、核准身份
         self._buf_bytes = 0
         self._head_started = False          # 队首那句是否已经开始播放（开始播的句子不丢）
+        self._dropping_sentence = False
         self._lock = threading.Lock()
         self._stream = None
         self._primed = False
@@ -163,7 +165,16 @@ class VirtualMic:
         with self._lock:
             self._buf.clear()
             self._buf_bytes = 0
+            self._head_started = False
+            self._dropping_sentence = False
         self._primed = False
+
+    def can_accept_complete(self, stereo_bytes: int) -> bool:
+        if type(stereo_bytes) is not int or not 0 < stereo_bytes <= 17_280_000 or stereo_bytes % 4:
+            return False
+        with self._lock:
+            self._discard_invalid()
+            return not self._buf or self._buf_bytes + stereo_bytes <= int(self._max_buffer_ms * self._bytes_per_ms)
 
     def push(self, pcm_48k_stereo: bytes) -> None:
         """推入已重采样的 48kHz 立体声 PCM。
@@ -172,22 +183,44 @@ class VirtualMic:
         一个个 chunk 丢，表现为「上一句 TTS 还没说完就切到了下一句」。
         宁可让缓冲长一点（TTS 落后），也不要让人听到半句话。
         """
-        if not pcm_48k_stereo:
+        approval = current()
+        if not pcm_48k_stereo or not allowed(approval, 'mine'):
+            return
+        size = getattr(approval, '_audio_bytes', 0)
+        complete = type(size) is int and size > 0 and len(pcm_48k_stereo) == size * 4
+        if complete and size > 4_320_000:
+            log.warning("[virtualmic] 完整候选超过 90 秒上限，未入队")
             return
         with self._lock:
-            self._buf.append((pcm_48k_stereo, False))
+            self._discard_invalid()
+            if self._dropping_sentence and not complete:
+                return
+            self._dropping_sentence = False
+            # Admission's exact mono byte count identifies the sealed stereo packet, not partial pushes.
+            self._buf.append((pcm_48k_stereo, complete, approval))
             self._buf_bytes += len(pcm_48k_stereo)
             self._last_push_ts = time.monotonic()
             max_bytes = int(self._max_buffer_ms * self._bytes_per_ms)
             hard_bytes = max_bytes * 4          # 兜底硬上限（见下）
-            while self._buf_bytes > max_bytes:
+            while self._buf_bytes > max_bytes and not (complete and len(self._buf) == 1):
                 if self._drop_oldest_whole_sentence():
                     continue
-                # 一句完整的都没有（异常情况：句尾标记一直没来）→ 退化丢最旧 chunk，
+                # 没有可丢的完整句：保留已起播句，仅无句界时退化丢最旧 chunk。
                 # 但**必须大声报出来**：这种情况说明句边界判定失效了。
                 # 只在超过硬上限（4×）时才这么做，避免正常情况被误切。
                 if self._buf_bytes > hard_bytes and len(self._buf) > 1:
-                    chunk, _e = self._buf.popleft()
+                    if self._head_started and any(end for _, end, _ in self._buf):
+                        dropped = 0
+                        while not self._buf[-1][1]:
+                            chunk, _, _ = self._buf.pop()
+                            dropped += len(chunk)
+                        self._buf_bytes -= dropped
+                        if dropped:
+                            self._dropping_sentence = True
+                            log.warning("[virtualmic] 缓冲超硬上限：丢弃后续未封口句，"
+                                        "保留正在播放的句尾，等待新句边界")
+                        break
+                    chunk, _e, _approval = self._buf.popleft()
                     self._buf_bytes -= len(chunk)
                     log.warning("[virtualmic] 没有任何完整句子可丢、缓冲已超硬上限 %.0fms："
                                 "退化丢弃最旧 %.0fms 的 chunk（句尾标记一直没来？）",
@@ -204,9 +237,13 @@ class VirtualMic:
         另外短句封口后可以立刻起播，不必干等 buffer_ms。
         """
         with self._lock:
+            self._dropping_sentence = False
+            self._discard_invalid()
+            if not self._buf:
+                self._head_started = False
             if self._buf and not self._buf[-1][1]:
-                chunk, _ = self._buf[-1]
-                self._buf[-1] = (chunk, True)
+                chunk, _, approval = self._buf[-1]
+                self._buf[-1] = (chunk, True, approval)
             self._maybe_prime()
 
     def _drop_oldest_whole_sentence(self) -> int:
@@ -215,7 +252,7 @@ class VirtualMic:
         调用者必须已持有 self._lock。
         """
         items = list(self._buf)
-        ends = [i for i, (_c, e) in enumerate(items) if e]
+        ends = [i for i, (_c, e, _approval) in enumerate(items) if e]
         if not ends:
             return 0                                    # 还没有任何完整句子
         # 正在播放的那句 = 第一个句尾之前（若已开始播，就不能动它）
@@ -223,7 +260,7 @@ class VirtualMic:
         nxt = next((i for i in ends if i >= start), None)
         if nxt is None:
             return 0                                    # 后面没有更完整的句子
-        dropped = sum(len(c) for c, _e in items[start:nxt + 1])
+        dropped = sum(len(c) for c, _e, _approval in items[start:nxt + 1])
         self._buf = collections.deque(items[:start] + items[nxt + 1:])
         self._buf_bytes -= dropped
         if start == 0:
@@ -232,22 +269,44 @@ class VirtualMic:
                     dropped / self._bytes_per_ms)
         return dropped
 
+    def _discard_invalid(self) -> None:
+        """调用方持锁；撤销剩余 PCM，不让旧队首阻挡新段落。"""
+        kept = [item for item in self._buf if allowed(item[2], 'mine')]
+        if len(kept) != len(self._buf):
+            if not kept or kept[0] is not self._buf[0]:
+                self._head_started = False
+            self._buf = collections.deque(kept)
+            self._buf_bytes = sum(len(item[0]) for item in kept)
+            if not kept:
+                self._primed = False
+                self._dropping_sentence = False
+
     def _maybe_prime(self) -> None:
         """决定是不是可以起播了。调用者必须已持有 self._lock。
 
-        两种起播条件：
+        起播条件：
         1. 攒够 buffer_ms（正常情况，避免开头断续）；
-        2. **数据已经停更超过 PRIME_TIMEOUT_S** —— 兜底，否则整段译音短于
+        2. 完整句已封口，不等待后续分片；
+        3. **数据已经停更超过 PRIME_TIMEOUT_S** —— 兜底，否则整段译音短于
            buffer_ms 时会永远卡在缓冲里不出声（没人再来解封）。
         """
+        self._discard_invalid()
         if self._primed or self._buf_bytes == 0:
             return
         need = int(self._buffer_ms * self._bytes_per_ms)
         idle = time.monotonic() - self._last_push_ts
-        if self._buf_bytes >= need or idle >= PRIME_TIMEOUT_S:
+        if self._buf_bytes >= need or self._buf[-1][1] or idle >= PRIME_TIMEOUT_S:
             self._primed = True
 
-    def _drain(self, need_bytes: int) -> bytes:
+    def _can_drain(self, need_bytes: int) -> bool:
+        """调用方持锁：句中短分片等补齐，封句或停更后才排空尾音。"""
+        return self._primed and (
+            self._buf_bytes >= need_bytes
+            or bool(self._buf and self._buf[-1][1])
+            or time.monotonic() - self._last_push_ts >= PRIME_TIMEOUT_S
+        )
+
+    def _drain(self, need_bytes: int, on_chunk=None) -> bytes:
         """从队首排空 need_bytes 字节，不足的部分补静音。**调用者必须已持有 self._lock。**
 
         抽出来是为了让两个平台共用同一段「排空 + 整句记账」逻辑：
@@ -256,12 +315,20 @@ class VirtualMic:
         """
         out = bytearray()
         while len(out) < need_bytes and self._buf:
-            chunk, ends = self._buf[0]
+            chunk, ends, approval = self._buf[0]
+            if not allowed(approval, 'mine'):
+                self._buf.popleft()
+                self._buf_bytes -= len(chunk)
+                self._head_started = False
+                continue
             self._head_started = True
             take = min(need_bytes - len(out), len(chunk))
+            if on_chunk is not None:
+                with scope(approval):
+                    on_chunk(chunk[:take])
             out.extend(chunk[:take])
             if take < len(chunk):
-                self._buf[0] = (chunk[take:], ends)
+                self._buf[0] = (chunk[take:], ends, approval)
             else:
                 self._buf.popleft()
                 if ends:
@@ -276,7 +343,7 @@ class VirtualMic:
             log.debug("[virtualmic] callback status: %s", status)
         with self._lock:
             self._maybe_prime()                        # 停更超时也要起播（短译音兜底）
-            if not self._primed or self._buf_bytes < need_bytes:
+            if not self._can_drain(need_bytes):
                 outdata[:] = b"\x00" * need_bytes
                 return
             outdata[:] = self._drain(need_bytes)
@@ -367,7 +434,7 @@ class PwCatVirtualMic(VirtualMic):
                 else:
                     with self._lock:
                         self._maybe_prime()
-                        if self._primed:
+                        if self._can_drain(self._chunk):
                             data = self._drain(self._chunk)
                         else:
                             data = b"\x00" * self._chunk      # 还没攒够 → 出静音（与回调一致）
@@ -414,6 +481,8 @@ class PwCatVirtualMic(VirtualMic):
         with self._lock:
             self._buf.clear()
             self._buf_bytes = 0
+            self._head_started = False
+            self._dropping_sentence = False
         self._primed = False
 
     def stderr_tail(self) -> str:

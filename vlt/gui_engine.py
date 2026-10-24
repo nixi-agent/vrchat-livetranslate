@@ -16,7 +16,7 @@ from .gui_sinks import (start_overlay, push_overlay as push_overlay, desktop_cfg
     start_desktop, stop_desktop, push_desktop as push_desktop, toggle_desktop_drag as toggle_desktop_drag,
     schedule_desktop_save as schedule_desktop_save, save_desktop_cfg as save_desktop_cfg, _stop_overlay)
 from . import config as _cfg_mod
-from . import crashlog, gui_chat, gui_voice
+from . import crashlog, gui_chat, gui_voice, endpoints
 from .config import Direction
 from .engine import (Engine, EngineEvents, effective_loopback_mode,
                      monitor_capture_conflict)
@@ -135,7 +135,8 @@ def start(ctx: EngineCtx) -> bool:
     # 防呆：key 可能在运行期被保存/清除/改环境，先重解再检查
     if ctx.refresh_api_key_fn:
         ctx.refresh_api_key_fn()
-    if not (ctx.cfg.session_base.get("api_key") or "").strip():
+    chatgpt = ctx.cfg.session_base.get("provider") == endpoints.PROVIDER_CHATGPT
+    if not chatgpt and not (ctx.cfg.session_base.get("api_key") or "").strip():
         # 没 key 就别白连一次（会撞 401），直接把用户送到填 key 的地方
         if ctx.set_status_fn:
             ctx.set_status_fn("error", t("还没配置 API key —— 点右上角「API key ›」填一个再开始"))
@@ -253,7 +254,7 @@ def start(ctx: EngineCtx) -> bool:
     # 按钮态
     set_power_state(ctx, "running")
     if ctx.set_text_input_enabled_fn:
-        ctx.set_text_input_enabled_fn(d in ("mine", "dual"))
+        ctx.set_text_input_enabled_fn(d in ("mine", "dual") and not chatgpt)
 
     warns = [w for w in (audio_warn, chatbox_warn) if w]
     if warns:

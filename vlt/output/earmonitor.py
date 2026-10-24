@@ -51,10 +51,14 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
+from contextlib import contextmanager
 import subprocess
 import threading
+from weakref import WeakSet
 
 from .. import platform
+from ..session.chatgpt_output import allowed, current
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +69,39 @@ SAMPLE_RATE = 48000
 CHANNELS = 2
 BYTES_PER_FRAME = CHANNELS * 2          # int16 立体声
 BLOCK_FRAMES = 480                      # 10ms
+_ROUTE_LOCK = threading.RLock()
+_CAPTURE_ENDPOINTS = {}
+_MONITORS = WeakSet()
+
+
+def _feedback(device_name):
+    if not _CAPTURE_ENDPOINTS:
+        return False
+    from ..engine import monitor_capture_conflict, _strip_loopback_suffix
+    return any(device_name.strip().casefold() == _strip_loopback_suffix(cfg['loopback_device']).strip().casefold()
+               or monitor_capture_conflict({'device_name': device_name}, cfg)
+               for cfg in _CAPTURE_ENDPOINTS.values())
+
+
+def _stop_feedback(monitor):
+    monitor.close()
+    print('[monitor] 耳返已关闭：与正在采集的输出端点相同（避免自身译音回译）', flush=True)
+    monitor._on_status('warn', '耳返已关闭')
+
+
+@contextmanager
+def endpoint_capture(device_name):
+    owner = object()
+    try:
+        with _ROUTE_LOCK:
+            _CAPTURE_ENDPOINTS[owner] = {'loopback_device': device_name}
+            for monitor in tuple(_MONITORS):
+                if monitor.opened and _feedback(monitor.device_name):
+                    _stop_feedback(monitor)
+        yield
+    finally:
+        with _ROUTE_LOCK:
+            _CAPTURE_ENDPOINTS.pop(owner, None)
 
 
 class EarMonitor:
@@ -79,6 +116,7 @@ class EarMonitor:
         self._on_status = on_status or (lambda *_a: None)
         self._lock = threading.Lock()
         self._buf = bytearray()
+        self._approvals = deque()
         self._cap_bytes = int(SAMPLE_RATE * BYTES_PER_FRAME * DEFAULT_BUFFER_MS / 1000)
         self._stream = None
         self._proc: subprocess.Popen | None = None      # Linux：pw-cat 管道
@@ -103,19 +141,34 @@ class EarMonitor:
 
     def push(self, pcm_48k_stereo: bytes) -> None:
         """送一段 PCM 进监听缓冲。**不阻塞**：满了就丢最旧的（宁可丢监听，不拖引擎）。"""
-        if not self._opened or not pcm_48k_stereo:
+        approval = current()
+        if not self._opened or not pcm_48k_stereo or not allowed(approval, 'mine'):
             return
         with self._lock:
             self._buf.extend(pcm_48k_stereo)
+            self._approvals.append((len(pcm_48k_stereo), approval))
             over = len(self._buf) - self._cap_bytes
             if over > 0:
-                del self._buf[:over]
+                self._take(over)
                 self._dropped_chunks += 1
 
     def set_volume(self, volume: float) -> None:
         self._volume = self._clamp(volume)
 
     def open(self) -> bool:
+        with _ROUTE_LOCK:
+            if _feedback(self.device_name):
+                _stop_feedback(self)
+                return False
+            opened = self._open_unchecked()
+            if opened and _feedback(self.device_name):
+                _stop_feedback(self)
+                return False
+            if opened:
+                _MONITORS.add(self)
+            return opened
+
+    def _open_unchecked(self) -> bool:
         """打开监听输出。失败返回 False（只影响耳返）。"""
         if self._opened:
             return True
@@ -171,6 +224,11 @@ class EarMonitor:
         return False
 
     def close(self) -> None:
+        with _ROUTE_LOCK:
+            self._close_unchecked()
+            _MONITORS.discard(self)
+
+    def _close_unchecked(self) -> None:
         self._opened = False
         self._stop.set()
         stream, self._stream = self._stream, None
@@ -206,6 +264,7 @@ class EarMonitor:
         self._stop.clear()
         with self._lock:
             self._buf.clear()
+            self._approvals.clear()
 
     # ------------------------------------------------------------ Linux 输出
     def _open_pwcat(self) -> bool:
@@ -312,6 +371,7 @@ class EarMonitor:
                 pass
         with self._lock:
             self._buf.clear()
+            self._approvals.clear()
         self._on_status("warn", msg)
 
     # ------------------------------------------------------------ 内部
@@ -323,12 +383,26 @@ class EarMonitor:
             v = 70.0
         return max(0.0, min(100.0, v))
 
+    def _take(self, size: int) -> bytes:
+        # Playback is delayed: preserve byte boundaries and recheck each original approval.
+        data = bytearray(self._buf[:size])
+        del self._buf[:size]
+        offset = 0
+        while offset < len(data):
+            count, approval = self._approvals.popleft()
+            take = min(count, len(data) - offset)
+            if not allowed(approval, 'mine'):
+                data[offset:offset + take] = b'\x00' * take
+            if count > take:
+                self._approvals.appendleft((count - take, approval))
+            offset += take
+        return bytes(data)
+
     def _callback(self, outdata, frames, time_info, status) -> None:   # noqa: ANN001, ARG002
         need = int(frames) * BYTES_PER_FRAME
         with self._lock:
             take = min(len(self._buf), need)
-            chunk = bytes(self._buf[:take])
-            del self._buf[:take]
+            chunk = self._take(take)
         if take < need:
             chunk += b"\x00" * (need - take)
         gain = self._volume / 100.0

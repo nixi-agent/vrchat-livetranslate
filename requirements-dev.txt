@@ -11,3 +11,4 @@
 
 ruff>=0.6            # 静态检查。CI 以 `F,E9` 为**阻断**门禁（规则固化在 ruff.toml）
 coverage>=7.0        # 测试覆盖率统计。CI 只出摘要，**不设阈值、不阻断**
+-r requirements-chatgpt.txt  # 訂閱語音的離線契約測試，不會連線或使用額度

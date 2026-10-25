@@ -7,6 +7,8 @@
 - 旧域名 wss://dashscope.aliyuncs.com/api-ws/v1/realtime 可用（无需 WorkspaceId）
 - session.update **必须带 translation**，否则 `Invalid translation parameter.`（服务端不做字段合并）
 - voice 必须显式给，否则抛 `Voice 'Chelsie' is not supported.`（即使纯文本模式也校验）
+  ⚠️ 3.8 在千问云 maas 线路（默认线路）只认 `audio.output.voice`，顶层 `voice` 会被
+  回显但**不出声**（两条线路实测见 `_session_payload` 里的注释）；3.5 只认顶层 `voice`。
 - 首文本增量约 +1.0s，首音频增量约 +1.2~1.5s
 - RPM 10，且**每次 WS 连接算一次请求**
 """
@@ -219,6 +221,17 @@ class QwenLiveTranslateSession(LiveTranslateSession):
         td = self.turn_detection_payload()
         if self._gen == "38":
             session["audio"] = {"input": {"turn_detection": td}}
+            # ⚠️ 3.8 的音色**必须**再写一份到 `audio.output.voice` —— 千问云 maas 线路
+            # （`maas.qianwenaiapi.com`，界面默认线路）只认这个字段：顶层 `voice` 会被
+            # 原样回显在 session.updated 里，但**完全不参与出音**，服务端永远用默认
+            # `Tina`。真机/直连实测（2026-10-25）：
+            #   · 顶层 voice=NotARealVoiceXYZ → session.updated 成功、照常出音、音色还是 Tina；
+            #   · audio.output.voice=NotARealVoiceXYZ → 1007 `Voice ... is not supported.`；
+            #   · audio.output.voice=Ethan → F0 中位 149Hz（Tina 276Hz），音色真的换了。
+            # 老 dashscope 域名两处都认（它会把 audio.output.voice 镜像回顶层 voice），
+            # 所以「两处都写」是两条线路的公共安全交集；3.5 只认顶层 voice，保持原样。
+            if self.cfg.voice:
+                session["audio"]["output"] = {"voice": self.cfg.voice}
         else:
             session["turn_detection"] = td
         return session

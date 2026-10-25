@@ -470,7 +470,7 @@ class TranslationGUI(ProxyMethods):
             self._apply_out_change(new_out)
     def _save_device_config(self, mic_name, loop_name, out_name) -> None: self._sync_audio_ctx(); gui_audio.save_device_config(self._audio_ctx, self._cfg, mic_name, loop_name, out_name)
     # ── 耳返（sidetone）：开关在主界面（输出行）/ 设备 / 音量在设置 ──
-    def _on_monitor_change(self, _event=None) -> None:
+    def _on_monitor_change(self, _event=None, *, picked_device: bool = False) -> None:
         self._sync_audio_ctx()
         var = getattr(self, "_monitor_var", None)
         if var is None:
@@ -480,25 +480,28 @@ class TranslationGUI(ProxyMethods):
         if getattr(self, "_monitor_vol_var", None) is not None:
             vol = float(self._monitor_vol_var.get())
             dev = gui_audio.monitor_device_from_combo(self._monitor_combo, self._names_holder)
-            have_controls = True
         else:
             # ⚠️ 有开关但音量/设备控件还没建（懒加载 / headless）：**配置照常保存**
             #    —— 早先这里整体早退，会把用户刚点的开关静默丢掉（EMeowAGENT 审阅 #3）。
             mon_cfg = ((self._cfg.output or {}).get("audio") or {}).get("monitor") or {}
             vol = float(mon_cfg.get("volume", 70) or 70)
             dev = str(mon_cfg.get("device_name") or "")
-            have_controls = False
         gui_audio.save_monitor_config(self._audio_ctx, self._cfg, en, dev, vol)
-        # 设置页的音量/设备跟着变灰（开关只有主界面那一个）
-        if have_controls:
-            gui_settings.sync_monitor_controls(self)
+        # 设置页的音量/设备**不跟开关灰化**（两者都是纯配置，见 build_settings_audio），
+        # 这里没有需要同步的可用态；开关只有主界面那一个。
         # 耳返放的是「译音输出」那条腿的音频：那条腿没开就只剩静音 —— 照开流（配置一致、
         # 之后打开译音输出立刻有声音），但状态栏要说清为什么没声。
         no_leg = en and not bool(self._vmic_var.get())
+        # 耳返关着时**也能**在设置页选设备（下拉不再跟着开关灰化）：这时只说「选好了，
+        # 去勾开关」，别报成「耳返已关闭」—— 否则用户以为自己的选择没生效。
+        off_msg = (t("耳返输出已选：{device}（主界面勾上「耳返」才出声）", device=dev)
+                   if (picked_device and dev) else t("耳返已关闭"))
         if self._proxy is None:
-            if no_leg:
+            if not en:
+                self._set_status("info", off_msg)
+            elif no_leg:
                 self._set_status("info", t("耳返要配合「译音输出」才有声音"))
-            elif en:
+            else:
                 # 耳返是挂在麦克风代理那条流上的 tap：没有代理就没有任何音频流。
                 self._set_status("warn", t("耳返要麦克风代理才能出声（设置 → 音频 → 麦克风代理）"))
             return
@@ -511,7 +514,7 @@ class TranslationGUI(ProxyMethods):
             self._set_status("info", t("耳返：{device}，音量 {vol}%",
                                       device=dev or t("系统默认输出"), vol=f"{vol:.0f}"))
         else:
-            self._set_status("info", t("耳返已关闭"))
+            self._set_status("info", off_msg)
 
     def _on_monitor_volume(self, value) -> None:
         vol = float(value)

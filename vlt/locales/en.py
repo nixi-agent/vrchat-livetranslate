@@ -172,6 +172,10 @@ STRINGS: dict[str, str] = {
     "耳返暂不支持当前平台": "Sidetone is not supported on this platform",
     "耳返：{device}，音量 {vol}%": "Sidetone: {device}, volume {vol}%",
     "耳返已关闭": "Sidetone off",
+    "耳返开关在主界面「输出」行（勾上才出声）":
+        "The Sidetone switch is in the main window's Output row (sound only while it is checked)",
+    "耳返输出已选：{device}（主界面勾上「耳返」才出声）":
+        "Sidetone output set to {device} (check Sidetone in the main window to hear it)",
     "耳返要配合「译音输出」才有声音": "Sidetone only produces sound together with the Voice Output switch",
     "耳返要麦克风代理才能出声（设置 → 音频 → 麦克风代理）": "Sidetone needs the Mic Proxy to produce sound (Settings → Audio → Mic Proxy)",
     "系统默认输出": "System default output",

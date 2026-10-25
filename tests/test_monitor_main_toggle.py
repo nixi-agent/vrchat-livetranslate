@@ -7,7 +7,8 @@
 1. 位置：主界面输出行 = chatbox / 手腕屏 / 译音输出 / **耳返** / 桌面字幕（耳返紧挨译音输出）；
 2. 唯一变量：`gui._monitor_var` 只有主界面那一份，设置页**不再**建第二个（旧实现两处各一个）；
 3. 接线：勾选 → 写 `output.audio.monitor.enabled` + `proxy.restart_monitor(...)`；
-4. 设置页只剩音量/设备，且它们的可用态跟着主界面开关走；
+4. 设置页只剩音量/设备：两者都与主界面开关**解耦**（始终可调/可选，纯配置动作；
+   灰掉会让人以为「点不开、卡在自动检测」，见测试者 2026-10-26 反馈）；
 5. 「译音输出」没勾时勾耳返 → 照开流（配置一致）但状态栏说明为什么没声；
 6. Linux（pw-cat 实现）→ 同样建主界面开关与设置页音量/设备。
 
@@ -176,17 +177,58 @@ def test_settings_page_keeps_only_volume_and_device() -> None:
                 (f"耳返音量滑条的 {key} 与门限滑条不一致："
                  f"{gui._monitor_vol.cget(key)!r} != {gui._gate_scale.cget(key)!r}")
 
-        # 可用态跟主界面开关走
+        # 可用态：音量滑条与设备下拉**都与主界面开关解耦**（纯配置，不灰化）
         gui._monitor_var.set(False)                       # noqa: SLF001
-        from vlt import gui_settings
-        gui_settings.sync_monitor_controls(gui)
-        assert str(gui._monitor_vol.cget("state")) == "disabled", gui._monitor_vol.cget("state")
-        assert str(gui._monitor_combo.cget("state")) == "disabled"
+        gui._root.update_idletasks()                      # noqa: SLF001
+        assert str(gui._monitor_vol.cget("state")) == "normal", \
+            f"耳返音量不该跟开关灰化（纯配置，先调好再勾开关）：{gui._monitor_vol.cget('state')!r}"
+        assert str(gui._monitor_combo.cget("state")) == "readonly", \
+            ("耳返输出下拉也不该跟着灰化：灰成 disabled 会让用户以为选项坏了、"
+             f"永远停在「自动检测」（测试者反馈）；实际 state={gui._monitor_combo.cget('state')!r}")
         gui._monitor_var.set(True)                       # noqa: SLF001
-        gui_settings.sync_monitor_controls(gui)
+        gui._root.update_idletasks()                      # noqa: SLF001
         assert str(gui._monitor_vol.cget("state")) == "normal", gui._monitor_vol.cget("state")
         assert str(gui._monitor_combo.cget("state")) == "readonly"
-        print("  设置页：只有音量/输出设备，且可用态跟随主界面开关 OK")
+
+        # 开关的位置必须写在设置页里（否则第一次进来的人不知道还要去主界面勾）
+        assert "耳返开关在主界面「输出」行（勾上才出声）" in texts, texts
+        print("  设置页：音量/设备都与开关解耦（始终可用）、并写明开关在主界面 OK")
+
+    finally:
+        gui._root.destroy()                              # noqa: SLF001
+
+
+def test_pick_device_while_sidetone_off() -> None:
+    """耳返**关着**也能在设置页调音量/选出设备：配置照存，状态栏说清「还要去勾开关」。
+
+    回归（测试者 2026-10-26）：早先 `sync_monitor_controls` 把「耳返音量 / 耳返输出」
+    跟着主界面开关一起灰掉，而 `monitor.enabled` 默认 false —— 第一次进设置页看到的是两个
+    点不动的死控件（下拉永远停在「自动检测」），日志里表现为「勾了又取消、设备从没选中」。
+    """
+    gui = _build()
+    try:
+        gui._proxy = _FakeProxy()                        # noqa: SLF001
+        gui._vmic_var.set(True)                          # noqa: SLF001 — 译音输出开着
+        gui._monitor_var.set(False)                      # noqa: SLF001
+        gui._on_monitor_change()                         # noqa: SLF001
+
+        dev = "耳机 (USB Audio Device)"
+        from vlt.i18n import t as _t
+        gui._names_holder["out"] = [dev]                  # noqa: SLF001 — 注入候选，不枚举真设备
+        gui._monitor_combo.configure(values=[_t("自动检测"), dev])   # noqa: SLF001
+        gui._monitor_combo.set(dev)                       # noqa: SLF001
+        gui._on_monitor_change(picked_device=True)        # noqa: SLF001 — 下拉选中那条路
+        gui._root.update_idletasks()                      # noqa: SLF001
+
+        raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+        mon = raw["output"]["audio"]["monitor"]
+        assert mon["device_name"] == dev, f"耳返设备没存进配置：{mon}"
+        assert mon["enabled"] is False, "选设备不许顺手把耳返打开"
+        assert gui._proxy.calls[-1] == {"enabled": False, "device_name": dev, "volume": 70.0}, \
+            gui._proxy.calls[-1]
+        status = str(gui._status_label.cget("text"))      # noqa: SLF001
+        assert "勾上" in status and dev in status, f"状态栏要说清还要去主界面勾：{status}"
+        print(f"  关着耳返也能选设备 → 落盘 + 状态栏「{status}」OK")
     finally:
         gui._root.destroy()                              # noqa: SLF001
 
@@ -247,6 +289,7 @@ if __name__ == "__main__":
     test_toggle_writes_config_and_restarts_monitor()
     test_toggle_saves_config_without_settings_controls()
     test_settings_page_keeps_only_volume_and_device()
+    test_pick_device_while_sidetone_off()
     test_sidetone_without_voice_output_says_why()
     test_toggle_without_proxy_says_why()
     test_toggle_on_linux_too()

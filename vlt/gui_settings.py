@@ -516,28 +516,6 @@ def signup_url(gui) -> str:
 
 # ================================================================ 音频页
 
-def sync_monitor_controls(gui) -> None:
-    """主界面「耳返」开关 → 设置页「耳返音量 / 耳返输出」的可用态。
-
-    开关本体在主界面（`gui._monitor_var`，唯一那个变量）；这里只负责灰化，避免出现
-    「主界面明明是关的，设置页还能拖音量」这种两处状态打架的观感。
-    控件还没建出来（headless / 本机没有该页）时两个都是 `None` → 什么都不做。
-    """
-    en = bool(gui._monitor_var.get()) if getattr(gui, "_monitor_var", None) is not None else False
-    vol = getattr(gui, "_monitor_vol", None)
-    combo = getattr(gui, "_monitor_combo", None)
-    if vol is not None:
-        try:
-            vol.configure(state="normal" if en else "disabled")
-        except Exception:                     # noqa: BLE001 — 纯外观，失败不挡流程
-            pass
-    if combo is not None:
-        try:
-            combo.configure(state="readonly" if en else "disabled")
-        except Exception:                     # noqa: BLE001
-            pass
-
-
 def build_settings_audio(gui, body: ttk.Frame) -> None:
     """「音频」页：设备选择 → 输入门限 → 译音音色。"""
     from .voices import REALTIME_VOICES, TTS_VOICES, voice_choices
@@ -623,16 +601,24 @@ def build_settings_audio(gui, body: ttk.Frame) -> None:
     row = ttk.Frame(body)
     row.pack(fill=tk.X, pady=(4, 0))
     ttk.Label(row, text=t("耳返输出:"), style="Dim.TLabel").pack(side=tk.LEFT)
+    # ⚠️ 这个下拉和上面的音量滑条**都不跟主界面开关灰化**（早先会，用户以为
+    #    「点不开、卡在自动检测」）：两者都是纯配置（不开流、不改运行态），
+    #    先调好、再勾开关才是正常顺序。真正决定有没有声的只有主界面那个开关。
     gui._monitor_combo = ttk.Combobox(row, values=[auto], state="readonly")
     gui._monitor_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
     gui._monitor_combo.set(mon_cfg.get("device_name") or auto)
-    gui._monitor_combo.bind("<<ComboboxSelected>>", lambda e: gui._on_monitor_change())
+    gui._monitor_combo.bind("<<ComboboxSelected>>",
+                            lambda e: gui._on_monitor_change(picked_device=True))
+    # 开关本体在主界面输出行（日常会开关），设置页这里只说一句在哪 —— 没有这句，
+    # 第一次进来的人根本不知道还要去主界面勾一下才会有声。
+    ttk.Label(body, text=t("耳返开关在主界面「输出」行（勾上才出声）"),
+              style="Muted.TLabel", justify=tk.LEFT, wraplength=SETTINGS_WRAP).pack(
+                  anchor=tk.W, pady=(4, 0))
     if not gui._linux_fixed_audio:
         # Linux 的采集固定只抓 VRChat 应用流，没有「同设备自动改 process」这一步。
         ttk.Label(body, text=t("耳返会同时放给你自己听；与 VRChat 音频同设备时采集会自动改为只抓 VRChat"),
                   style="Muted.TLabel", justify=tk.LEFT, wraplength=SETTINGS_WRAP).pack(
-                      anchor=tk.W, pady=(4, 0))
-    sync_monitor_controls(gui)
+                      anchor=tk.W, pady=(2, 0))
 
     # ---- 麦克风代理（**两端都建**：Windows 走 PortAudio 输出流，Linux 走 pw-cat 管道 +
     #      运行时声明的虚拟麦。语义完全一致，见 vlt/output/micproxy*.py 的模块头）----

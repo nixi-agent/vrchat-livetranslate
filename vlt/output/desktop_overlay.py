@@ -107,6 +107,7 @@ class DesktopOverlayConfig:
     size_px: tuple[int, int] = (1024, 360)
     alpha: float = ALPHA_DEFAULT          # 整窗透明度（用户要的「可改透明度」），0.2~1.0
     click_through: bool = True            # 鼠标穿透（拖动时临时关掉）
+    mode_pill: bool = True                # 面板右上角外侧的「原声/译音」胶囊（独立小窗、不抢焦点）
     follow: bool = True                   # 游戏窗口移动/缩放时跟随
     game_title: str = "VRChat"
     # ---- 视觉参数：**全在本段**，不从 overlay 段继承 ----
@@ -162,6 +163,7 @@ class DesktopOverlayConfig:
             size_px=own("size_px", base.size_px, _as_pair),
             alpha=clamp_alpha(own("alpha", base.alpha)),
             click_through=bool(own("click_through", base.click_through, _as_bool)),
+            mode_pill=bool(own("mode_pill", base.mode_pill, _as_bool)),
             follow=bool(own("follow", base.follow, _as_bool)),
             game_title=str(own("game_title", base.game_title, _as_str) or base.game_title),
             font=str(own("font", base.font, _as_str) or ""),
@@ -321,6 +323,33 @@ def resolve_position(cfg: DesktopOverlayConfig,
     return compute_position(cfg.anchor, cfg.offset, rect, size, area)
 
 
+# 「原声/译音」胶囊与面板之间的缝隙（外置时在面板上沿之上，内置时从面板上沿往里缩）
+PILL_GAP = 8
+
+
+def pill_position(panel_pos: tuple[int, int], panel_size: tuple[int, int],
+                  pill_size: tuple[int, int],
+                  area: tuple[int, int, int, int]) -> tuple[int, int]:
+    """胶囊贴在**面板右上角外侧**；顶部放不下时退回面板**内部**右上角。
+
+    `panel_pos`=(x, y) 面板当前屏幕坐标；`panel_size`=(w, h) 面板像素尺寸；
+    `pill_size`=(w, h) 胶囊像素尺寸；`area`=(l, t, r, b) 屏幕可用区域。
+
+    外侧优先：x 与面板右边对齐，y 在面板上沿再往上一个 :data:`PILL_GAP` —— 不挡字幕。
+    算出来的 y 顶出工作区（面板本身就贴着屏幕顶）→ 挪到面板内部右上角（内缩 PILL_GAP），
+    否则胶囊会被屏幕边缘吃掉一半。最后统一夹进工作区。
+    """
+    px, py = (int(v) for v in panel_pos)
+    pw, _ph = (int(v) for v in panel_size)
+    w, h = (int(v) for v in pill_size)
+    top = int(area[1])
+    x = px + pw - w
+    y = py - h - PILL_GAP
+    if y < top:                                   # 上面没地方了 → 放进面板内部右上角
+        x, y = x - PILL_GAP, py + PILL_GAP
+    return _clamp_into_area(x, y, w, h, area)
+
+
 # ---------------------------------------------------------------- 窗口本体
 class DesktopOverlay:
     """桌面字幕窗：生命周期 + 出图 + 跟随 + 配置热重载。
@@ -370,6 +399,15 @@ class DesktopOverlay:
         self._exstyles_dirty = False
         self._need_shape_mask = False     # Tk 回落 + 没色键（Linux）→ 每帧用形状蒙版抠底
         self._shape_warned = False
+        # ---- 「原声/译音」胶囊（独立的小 Toplevel：字幕窗是穿透的，里面画按钮点不着）----
+        self._pill: Any = None            # tk.Toplevel；None = 还没建 / 已销毁
+        self._pill_label: Any = None
+        self._pill_hwnd = 0
+        self._pill_text = ""              # 当前胶囊文字（dry-run 也记，供诊断/测试）
+        self._pill_cb: Any = None         # 点胶囊时调的回调（界面层注入）
+        self._pill_exstyles_dirty = False  # Tk 映射后扩展样式会被重写 → 下一跳补一次
+        self._pill_disabled_logged = False
+        self._pill_unavailable_logged = False
 
     # ---------- 生命周期 ----------
     def start(self) -> bool:
@@ -547,6 +585,7 @@ class DesktopOverlay:
         self._label = None
         self._photo = None
         self._hwnd = 0
+        self._destroy_pill()               # 胶囊是独立小窗：必须跟字幕一起收掉
         was_started = self._started
         self._started = False
         self._pump = False
@@ -729,6 +768,10 @@ class DesktopOverlay:
             # 改完立刻补一次会被它盖掉，所以留个脏标志，下一跳（GUI 50ms 一跳）再补。
             self._exstyles_dirty = False
             self._apply_exstyles()
+        if self._pill_exstyles_dirty and self._pill is not None:
+            # 胶囊首次映射后 Tk 会重写扩展样式（把「不抢焦点」冲掉）→ 下一跳补回来
+            self._pill_exstyles_dirty = False
+            self._apply_pill_exstyles()
         if self._dirty:
             self._redraw()
         if self._pump and self._root is not None:
@@ -767,6 +810,7 @@ class DesktopOverlay:
                 self._native.move(x, y)
             except Exception as exc:  # noqa: BLE001
                 print(f"[desktop] ⚠️ 移动原生窗失败：{type(exc).__name__}: {exc}")
+            self._place_pill()             # 原生窗那条腿建不出胶囊，这里是空操作
             return
         if self._win is None:
             return
@@ -777,6 +821,8 @@ class DesktopOverlay:
             self._win.update_idletasks()
         except Exception as exc:  # noqa: BLE001
             print(f"[desktop] ⚠️ 移动窗口失败：{type(exc).__name__}: {exc}")
+            return
+        self._place_pill()                 # 面板动了，胶囊跟着走（右上角外侧）
 
     def _own_hwnds(self) -> tuple[int, ...]:
         """本程序**自己**的窗口句柄（主界面 + 字幕窗）：找游戏窗口时必须排除。
@@ -788,6 +834,8 @@ class DesktopOverlay:
         out: list[int] = []
         if self._hwnd:
             out.append(int(self._hwnd))
+        if self._pill_hwnd:
+            out.append(int(self._pill_hwnd))
         if self._root is not None:
             try:
                 from ..platform import top_level_hwnd
@@ -904,6 +952,8 @@ class DesktopOverlay:
             self._win.geometry(f"+{x}+{y}")
         except Exception as exc:  # noqa: BLE001
             print(f"[desktop] ⚠️ 拖动窗口失败：{type(exc).__name__}: {exc}")
+            return
+        self._place_pill()          # 拖动时面板每动一下，胶囊跟着走
 
     def _on_drag_end(self, _ev: Any) -> None:
         if self._drag_from is None or self._win is None:
@@ -959,6 +1009,173 @@ class DesktopOverlay:
         self._apply_exstyles()
         self._exstyles_dirty = True
 
+    # ---------- 模式胶囊（原声 / 译音）----------
+    def set_mode_pill(self, text: str | None, cb: Any = None) -> None:
+        """在面板右上角外侧显示/更新「原声/译音」胶囊；`text=None` → 隐藏。
+
+        为什么是**独立小窗**而不是面板里画一个按钮：字幕窗默认鼠标穿透
+        （Windows 是 `WS_EX_TRANSPARENT`），整个窗口收不到鼠标事件 —— 面板里的
+        按钮永远点不着。这个 Toplevel 反过来：**不穿透**（要能被点），但用
+        `set_tool_window` 标成 `WS_EX_NOACTIVATE`（**不抢焦点**）—— 用户在 VRChat
+        里，焦点被抢走会中断操作（视角/移动会卡住），这正是本功能的全部意义。
+
+        `cb` 由界面层**注入**（就是主界面那颗按钮的同一条 `toggle_voice_mode`），
+        本模块（vlt/output/**）不 import vlt.gui —— 分层纪律。
+
+        `text=None` / 没配 `mode_pill` / dry-run 都不建窗；dry-run 只记
+        `self._pill_text`（现有离线用例依赖「绝不建窗」）。
+        """
+        text = (text or "").strip()
+        if not self.cfg.mode_pill:
+            if not self._pill_disabled_logged:
+                self._pill_disabled_logged = True
+                print("[desktop] mode_pill=false → 不显示「原声/译音」胶囊"
+                      "（主界面按钮照常可切）")
+            self._pill_cb = None
+            self._hide_pill()
+            return
+        if not text:
+            self._pill_cb = None
+            self._hide_pill()
+            return
+        self._pill_cb = cb
+        self._pill_text = text
+        if self.dry_run:
+            return                                     # 离线：只记文字，绝不建窗
+        if self._pill is None and not self._build_pill():
+            return
+        try:
+            self._pill_label.configure(text=text)
+            self._pill.deiconify()
+            self._pill.update_idletasks()
+        except Exception as exc:  # noqa: BLE001 — 胶囊坏了不许带崩字幕/翻译
+            print(f"[desktop] ⚠️ 更新胶囊文字失败（本次忽略）：{type(exc).__name__}: {exc}")
+            return
+        self._place_pill()
+        if self._pill_exstyles_dirty:
+            # 先设一次；**不清脏标志** —— Tk 映射后会再重写一遍，留给下一跳 tick 补
+            self._apply_pill_exstyles()
+
+    def _build_pill(self) -> bool:
+        """惰性建胶囊窗（第一次拿到文字时才建）。返回是否建成。"""
+        master = self._win.master if self._win is not None else self._root
+        if master is None:
+            # 原生叠加窗那条腿（Linux layer-shell / X11 ARGB）没有 Tk 主窗 → 建不出 Tk 胶囊
+            if not self._pill_unavailable_logged:
+                self._pill_unavailable_logged = True
+                print("[desktop] ⚠️ 没有 Tk 主窗（原生叠加窗后端）→「原声/译音」胶囊跳过"
+                      "（主界面按钮仍可切换）")
+            return False
+        try:
+            import tkinter as tk
+        except Exception as exc:  # noqa: BLE001 — 没有 Tk 就没有胶囊，字幕本身照常
+            print(f"[desktop] ⚠️ 建胶囊需要 Tk（不可用）：{type(exc).__name__}: {exc}")
+            return False
+        # 纯数据常量（ui_theme 不 import tkinter）；字体在 ui_tk 里，必须惰性导入 ——
+        # 否则无 Tk 的平台连 desktop_overlay 都 import 不了。
+        from ..ui_theme import ACCENT, PANEL, TEXT
+        from ..ui_tk import FONT_UI
+        try:
+            top = tk.Toplevel(master)
+            top.overrideredirect(True)                 # 无边框（不要标题栏）
+            top.attributes("-topmost", True)
+            top.configure(bg=ACCENT)                   # 1px 高亮描边（Label 四周露出来）
+            lbl = tk.Label(top, text=self._pill_text, bg=PANEL, fg=TEXT, font=FONT_UI,
+                           padx=8, pady=8, cursor="hand2")   # 内边距 8px：够大才好点
+            lbl.pack(padx=1, pady=1)                   # 圆角靠字面留白，不做真圆角
+        except Exception as exc:  # noqa: BLE001
+            print(f"[desktop] ⚠️ 建胶囊窗失败（字幕照常，只是不能从字幕上切档位）："
+                  f"{type(exc).__name__}: {exc}")
+            return False
+        self._pill, self._pill_label = top, lbl
+        # 只绑 Toplevel：Tk 的 bindtags 里 widget → class → **toplevel** → all，
+        # 点 Label 时事件会冒到 Toplevel 上的这个绑定；两处都绑会**触发两次**（实测）。
+        top.bind("<Button-1>", self._on_pill_click, add="+")
+        top.update_idletasks()                         # 让 HWND/几何真的落下去
+        self._resolve_pill_hwnd()
+        self._apply_pill_exstyles()
+        # Tk 首次映射会**再写一次**扩展样式（把「不抢焦点」冲掉）→ 下一跳补回来
+        self._pill_exstyles_dirty = True
+        print(f"[desktop] 已建「原声/译音」胶囊（点它切档位，不抢焦点）"
+              f" 文字={self._pill_text!r}")
+        return True
+
+    def _resolve_pill_hwnd(self) -> int:
+        """胶囊的顶层句柄（Tk 给的是子窗口）。失败留痕：否则用户会被莫名抢焦点。"""
+        if self._pill is None:
+            return 0
+        from ..platform import top_level_hwnd
+        try:
+            self._pill_hwnd = int(top_level_hwnd(int(self._pill.winfo_id())))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[desktop] ⚠️ 取胶囊句柄失败（{type(exc).__name__}: {exc}）"
+                  f" → 点胶囊可能把焦点从游戏里抢走")
+            self._pill_hwnd = 0
+        return self._pill_hwnd
+
+    def _apply_pill_exstyles(self) -> None:
+        """胶囊 = 工具窗（`WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW`）：不抢焦点、不进 alt-tab。
+
+        ⚠️ **不设**鼠标穿透 —— 它就是要被点的；穿透是字幕面板的事。
+        """
+        if self.dry_run or self._pill is None:
+            return
+        from ..platform import set_tool_window
+        if not self._pill_hwnd and not self._resolve_pill_hwnd():
+            return
+        if not set_tool_window(self._pill_hwnd):
+            print("[desktop] ⚠️ 胶囊「不抢焦点」没设上（本平台可能不支持）"
+                  " → 点它会从 VRChat 抢走焦点")
+
+    def _place_pill(self) -> None:
+        """按面板当前位置重算胶囊位置 —— 面板移动/缩放/拖动/换文字全走这里。"""
+        if self._pill is None:
+            return
+        try:
+            self._pill.update_idletasks()
+            px, py = self.position
+            pw, ph = int(self.cfg.size_px[0]), int(self.cfg.size_px[1])
+            size = (int(self._pill.winfo_reqwidth()), int(self._pill.winfo_reqheight()))
+            x, y = pill_position((px, py), (pw, ph), size, self._work_area())
+            # 「+x+y」两段都带加号：Tk 把 "-50" 读成「距右边 50」（多屏副屏坐标是负的）
+            self._pill.geometry(f"+{x}+{y}")
+        except Exception as exc:  # noqa: BLE001 — 摆错位置不值得打断字幕
+            print(f"[desktop] ⚠️ 摆放胶囊失败：{type(exc).__name__}: {exc}")
+
+    def _on_pill_click(self, _ev: Any = None) -> None:
+        cb = self._pill_cb
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception as exc:  # noqa: BLE001 — 切档位失败不许带崩字幕
+            print(f"[desktop] ⚠️ 胶囊回调失败：{type(exc).__name__}: {exc}")
+
+    def _hide_pill(self) -> None:
+        """隐藏胶囊（保留窗口，下次显示更快）。"""
+        self._pill_text = ""
+        if self._pill is None:
+            return
+        try:
+            self._pill.withdraw()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[desktop] ⚠️ 隐藏胶囊失败（忽略）：{type(exc).__name__}: {exc}")
+
+    def _destroy_pill(self) -> None:
+        """销毁胶囊窗并清引用（close / 热重载关掉 mode_pill 时用）。"""
+        pill, self._pill = self._pill, None
+        self._pill_label = None
+        self._pill_hwnd = 0
+        self._pill_text = ""
+        self._pill_cb = None
+        self._pill_exstyles_dirty = False
+        if pill is None:
+            return
+        try:
+            pill.destroy()
+        except Exception as exc:  # noqa: BLE001 — 关窗失败不值得打断退出流程
+            print(f"[desktop] ⚠️ 销毁胶囊窗时报错（已忽略）：{type(exc).__name__}: {exc}")
+
     # ---------- 热重载 ----------
     def _remember_cfg_mtime(self) -> None:
         if self.config_path is None:
@@ -994,6 +1211,9 @@ class DesktopOverlay:
             self._apply_alpha_only()
         if new.click_through != old.click_through:
             self._apply_exstyles()
+        if old.mode_pill and not new.mode_pill:
+            self._destroy_pill()          # 热重载关掉胶囊：立刻收掉，别留一个孤儿小窗
+            print("[desktop] ♻️ mode_pill 已关（「原声/译音」胶囊窗口已销毁）")
         if new.attach_to_game and not old.attach_to_game:
             self._find_game()
         if not new.attach_to_game:

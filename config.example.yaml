@@ -299,6 +299,8 @@ desktop_overlay:
   font_size: 36              # 译文字号（px）—— 4K 屏上嫌小就往上调（字号/面板一起看）
   source_font_size: 29       # 原文小字号（px）
   click_through: true        # 鼠标穿透（点字幕窗会点到 VRChat 上）；拖动的瞬间自动临时关掉
+  mode_pill: true            # 面板右上角外侧的「原声/译音」小胶囊：不开主窗口也能切档位
+                             #   （独立小窗、不抢焦点；点它是点这个胶囊，不是点字幕本身）
   follow: true               # VRChat 窗口移动时跟着走
 
 # 第三条腿：译音输出（模型译音 → 虚拟声卡 → VRChat 麦克风 → 对方听到）

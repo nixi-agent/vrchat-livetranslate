@@ -144,6 +144,30 @@ class TranslationGUI(ProxyMethods):
     def _on_voice_preview_done(self, kind, voice, err) -> None: gui_voice.on_voice_preview_done(self._voice_ctx, kind, voice, err, set_status=self._set_status)
     def _refresh_voice_mode_btn(self) -> None:
         self._voice_ctx.proxy = self._proxy; gui_voice.refresh_voice_mode_btn(self._voice_ctx, self._engines)
+        self._refresh_mode_pill()          # 胶囊与主界面按钮永远同一个文案/同一个回调
+    def _refresh_mode_pill(self) -> None:
+        """把「原声/译音」胶囊同步到桌面字幕（没字幕窗 / 没代理 / 翻译没跑 → 隐藏）。
+
+        用户反馈的原操作是「闭麦 → 切到 VLT 主窗口 → 点原声/译音 → 听 → 切回 VRChat
+        → 开麦」；胶囊就是为了省掉这一串：字幕旁边点一下，焦点不动、不用切窗口。
+
+        `cb` 与主界面那颗按钮**同一条**路径（gui_voice.toggle_voice_mode），
+        所以档位翻转、状态栏提示、按钮文案三者的行为完全一致。
+        """
+        out = self._desktop_out
+        if out is None:
+            return
+        setter = getattr(out, "set_mode_pill", None)
+        if setter is None:                 # 老/假实例（或原生窗那条腿不支持）：静默跳过
+            return
+        p = self._proxy
+        if p is None or not any(getattr(e, "running", False) for e in self._engines):
+            setter(None)                   # 没代理 / 翻译没跑：译音档切不过去，别给颗死按钮
+            return
+        setter(gui_voice.voice_mode_text(p),
+               lambda: gui_voice.toggle_voice_mode(
+                   self._voice_ctx, vmic_get=lambda: bool(self._vmic_var.get()),
+                   set_status=self._set_status, refresh_btn=self._refresh_voice_mode_btn))
     # ── 气泡显示原文 / 译文（只影响 chatbox）──
     def _chatbox_text_mode(self) -> str:
         from .engine import chatbox_text_mode
@@ -392,7 +416,9 @@ class TranslationGUI(ProxyMethods):
     def _push_overlay(self, force=False): self._engine_ctx.overlay_out = self._overlay_out; self._engine_ctx.bubbles = self._bubbles; gui_engine.push_overlay(self._engine_ctx, force=force)
     def _desktop_cfg(self): return gui_engine.desktop_cfg(self._cfg)
     def _start_desktop(self, *, force=False):
-        self._sync_engine_ctx(); r = gui_engine.start_desktop(self._engine_ctx, force=force); self._desktop_out = self._engine_ctx.desktop_out; self._unsync_engine_ctx(); return r
+        self._sync_engine_ctx(); r = gui_engine.start_desktop(self._engine_ctx, force=force); self._desktop_out = self._engine_ctx.desktop_out; self._unsync_engine_ctx()
+        if r: self._refresh_mode_pill()    # 字幕窗刚起来：胶囊立刻显示当前档位
+        return r
     def _on_desktop_toggle(self):
         if self._desktop_var.get():
             if self._start_desktop(force=True): self._set_status("info", t("桌面字幕已开启（拖到想要的位置；尺寸/字号/透明度见「设置 → 桌面字幕」）"))

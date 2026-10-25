@@ -90,6 +90,16 @@ def toggle_voice_mode(ctx: VoiceCtx, *,
     refresh_btn()
 
 
+def voice_mode_text(proxy: Any) -> str:
+    """当前档位对应的文案 —— 主界面按钮与桌面字幕胶囊**共用这一处**（别各写一份）。
+
+    两处各写一份的话，迟早出现「按钮写译音、字幕胶囊写原声」的自相矛盾。
+    """
+    if proxy is not None and proxy.mode == MODE_TRANSLATED:
+        return t("🗣 译音")
+    return t("🎙 原声")
+
+
 def refresh_voice_mode_btn(ctx: VoiceCtx, engines: list) -> None:
     """刷新主界面切换按钮的文案与可用态。"""
     btn = ctx.voice_mode_btn
@@ -97,10 +107,7 @@ def refresh_voice_mode_btn(ctx: VoiceCtx, engines: list) -> None:
         return
     p = ctx.proxy
     running = any(e.running for e in engines)
-    if p is not None and p.mode == MODE_TRANSLATED:
-        btn.configure(text=t("🗣 译音"))
-    else:
-        btn.configure(text=t("🎙 原声"))
+    btn.configure(text=voice_mode_text(p))
     btn.configure(state=(tk.NORMAL if (p is not None and running) else tk.DISABLED))
 
 

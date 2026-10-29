@@ -401,9 +401,10 @@ def add_text(ctx: ChatCtx, source: str, text: str, is_final: bool,
 def draw_bubble(ctx: ChatCtx, b: _Bubble) -> int:
     """按已验证配方画一条气泡，返回下一条气泡的起始 y。
 
-    每条气泡两行：**原文小字（上） + 译文大字（下）**——主次分明，
-    你要读的永远是下面那行大字。服务端没返回原文（或原文与译文相同）时
-    只画译文，不留空行。
+    每条气泡最多三行：**昵称 / 原文小字（上） + 译文大字（下）**——主次分明，
+    你要读的永远是下面那行大字。昵称只有房间成员 / 分玩家这类远端条目才有；
+    分玩家条目两者都有（昵称 + 原文），房间成员只有昵称（房间只传译文）。
+    原文与译文相同（或缺失）时不画，不留空行。
     """
     cv = ctx.canvas
     w = ctx.canvas_w if ctx.canvas_w > 1 else 600
@@ -417,13 +418,22 @@ def draw_bubble(ctx: ChatCtx, b: _Bubble) -> int:
 
     tid_small = None
     small_w = small_h = 0
-    # 小字行：远端成员优先显示**昵称**（谁在说），本机气泡仍是原文。
-    # 为空、或与大字译文相同时不画（省一行空白）。
-    small_raw = b.label if (b.label or "").strip() else b.source
-    small_key = (small_raw or "").strip()
-    if small_key and small_key != (b.text or "").strip():
+    # 小字区（最多两行）：昵称（谁在说）+ 原文。
+    #   · 房间成员只有昵称、没有原文（房间只传译文）；
+    #   · 分玩家条目两者都有 → 两行都画（只画昵称会把原文静默吞掉）；
+    #   · 本机气泡没有昵称 → 只画原文。
+    # 各自与译文、彼此去重：相同就不重复占一行（省空白）。
+    small_parts: list[str] = []
+    label_key = (b.label or "").strip()
+    source_key = (b.source or "").strip()
+    text_key = (b.text or "").strip()
+    if label_key and label_key != text_key:
+        small_parts.append(label_key)
+    if source_key and source_key not in (text_key, label_key):
+        small_parts.append(source_key)
+    if small_parts:
         tid_small = cv.create_text(
-            0, 0, text=small_raw, width=maxw, anchor="nw",
+            0, 0, text="\n".join(small_parts), width=maxw, anchor="nw",
             font=ui_tk.FONT_SMALL,
             fill=COLOR_SRC_MINE if b.who == "mine" else COLOR_SRC_THEIRS)
         sx1, sy1, sx2, sy2 = cv.bbox(tid_small)

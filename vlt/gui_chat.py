@@ -688,13 +688,14 @@ def poll(ctx: ChatCtx, root: tk.Misc,
                     ctx.on_voice_preview_done_fn(
                         item[1], item[2], item[3])
             elif kind == "stop_done":
-                # 引擎收尾完成 → 单按钮刷回 idle（超时也要放开，宁可让用户再点一次也不能把界面锁死）
+                # 引擎/分玩家腿收尾完成 → 单按钮刷回 idle（超时也要放开，宁可让用户再点一次也不能把界面锁死）
                 _, elapsed, n_engines, incomplete = item
                 if ctx.power_state_fn:
                     ctx.power_state_fn("idle")
-                print(f"[gui] 停止收尾完成：{n_engines} 个引擎，"
+                units = f"{n_engines} 个引擎" if n_engines else "分玩家腿"
+                print(f"[gui] 停止收尾完成：{units}，"
                       f"用时 {elapsed:.2f}s"
-                      + ("（有引擎超时未退出，仍在关设备）"
+                      + ("（有收尾对象超时未退出，仍在关设备）"
                          if incomplete else ""),
                       flush=True)
                 if ctx.last_status_level != "error":

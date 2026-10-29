@@ -508,7 +508,7 @@ def on_engine_status(q, lvl: str, msg: str, who: str) -> None:
 def stop(ctx: EngineCtx) -> None:
     """停止翻译：**绝不在界面线程等引擎收尾**（真机实测冻 20s = 窗口无响应）。
 
-    先对 **所有** 引擎并发下发停止信号（采集立刻停），收尾交给后台线程，
+    先对 **所有** 引擎 / 分玩家腿并发下发停止信号（采集立刻停），收尾交给后台线程，
     界面只留一行「正在停止…」，收尾完成由 ``_poll`` 从队列里收到通知再恢复。
     """
     ctx.pending_starts = 0
@@ -522,10 +522,12 @@ def stop(ctx: EngineCtx) -> None:
 
     # 分玩家腿：独立线程，异步收尾（join 最多 8s，不能卡界面）
     leg = getattr(ctx, "players_leg", None)
+    leg_thread = None
     if leg is not None:
         ctx.players_leg = None
-        threading.Thread(target=leg.stop, daemon=True,
-                         name="vlt-players-stop").start()
+        leg_thread = threading.Thread(target=leg.stop, daemon=True,
+                                      name="vlt-players-stop")
+        leg_thread.start()
 
     engines = list(ctx.engines)
     for eng in engines:
@@ -557,26 +559,33 @@ def stop(ctx: EngineCtx) -> None:
     if ctx.sync_gate_probe_fn:
         ctx.sync_gate_probe_fn()
 
-    if not engines:
-        # 没有引擎在手：但可能还有上一次的收尾在飞（只有 on_close 这条重复调用路径会走到）
+    if not engines and leg_thread is None:
+        # 没有引擎/腿在手：但可能还有上一次的收尾在飞（只有 on_close 这条重复调用路径会走到）
         if ctx.stop_done_evt and ctx.stop_done_evt.is_set():
             set_power_state(ctx, "idle")
         if ctx.set_status_fn:
             ctx.set_status_fn("info", t("已停止"))
         return
 
-    # 收尾期间禁掉「开始翻译」：旧引擎还在关麦克风/虚拟声卡，立刻重启会抢设备
+    # 收尾期间禁掉「开始翻译」：旧引擎还在关麦克风/虚拟声卡、分玩家腿还在关
+    # socket/会话，立刻重启会抢设备/撞授权
     set_power_state(ctx, "stopping")
     if ctx.set_status_fn:
         ctx.set_status_fn("info", t("正在停止…"))
 
     if ctx.stop_done_evt:
         ctx.stop_done_evt.clear()
-    threading.Thread(target=wait_stop_done, args=(ctx, engines), daemon=True,
-                     name="vlt-stop-wait").start()
+    threading.Thread(target=wait_stop_done, args=(ctx, engines, leg_thread),
+                     daemon=True, name="vlt-stop-wait").start()
 
-def wait_stop_done(ctx: EngineCtx, engines: list) -> None:
-    """（**后台线程**）等引擎真正收尾完，再入队让 ``_poll`` 恢复界面。绝不碰 Tk。"""
+def wait_stop_done(ctx: EngineCtx, engines: list,
+                   leg_thread: threading.Thread | None = None) -> None:
+    """（**后台线程**）等引擎/分玩家腿真正收尾完，再入队让 ``_poll`` 恢复界面。
+
+    ⚠️ 「别人说」+ 分玩家模式时 **没有任何混音引擎**（specs 被替换成空），
+    收尾对象只有分玩家腿。早先 `stop()` 在 `not engines` 分支直接返回，
+    既不投递 `stop_done` 也不刷 idle —— 点停止后按钮永远卡在运行态。
+    """
     t0 = time.monotonic()
     stuck: list[int] = []
     for i, eng in enumerate(engines):
@@ -585,10 +594,16 @@ def wait_stop_done(ctx: EngineCtx, engines: list) -> None:
                 stuck.append(i)
         except Exception as exc:          # noqa: BLE001
             print(f"[gui] ⚠️ 等引擎收尾出错（忽略）：{type(exc).__name__}: {exc}", flush=True)
+    if leg_thread is not None:
+        leg_thread.join(STOP_WAIT_S)
+        if leg_thread.is_alive():
+            stuck.append(len(engines))
+            print(f"[gui] ⚠️ 分玩家腿收尾超时（{STOP_WAIT_S:.0f}s）：仍在关 socket/会话"
+                  "（界面照常恢复，状态栏会如实提示仍在收尾）", flush=True)
     elapsed = time.monotonic() - t0
     if stuck:
-        print(f"[gui] ⚠️ 停止收尾超时（{STOP_WAIT_S:.0f}s）：第 {stuck} 个引擎还没退出"
-              "（仍在关麦克风/虚拟声卡；界面照常恢复，状态栏会如实提示仍在收尾）",
+        print(f"[gui] ⚠️ 停止收尾超时（{STOP_WAIT_S:.0f}s）：第 {stuck} 个收尾对象还没退出"
+              "（仍在关麦克风/虚拟声卡/分玩家腿；界面照常恢复，状态栏会如实提示仍在收尾）",
               flush=True)
     ctx.q.put(("stop_done", elapsed, len(engines), bool(stuck)))
     if ctx.stop_done_evt:

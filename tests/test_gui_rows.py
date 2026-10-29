@@ -111,6 +111,47 @@ def test_growing_bubble_shifts_later_bubbles() -> bool:
         gui._root.destroy()
 
 
+def test_peer_bubble_shows_nickname_and_source() -> bool:
+    """★ 分玩家气泡：昵称 / 原文 / 译文三行都要在（主窗口不能只显示译文）。
+
+    真实事故：分玩家条目复用了房间成员的渲染路径（`label` = 昵称），而气泡的
+    小字槽只画 `label if label else source` —— 昵称永远非空（最少也是 actorN），
+    原文就被静默吞掉，三块屏里只有主窗口少了原文。
+    """
+    from vlt.gui import TranslationGUI
+
+    gui = TranslationGUI()
+    try:
+        gui._root.geometry("920x620")
+        gui._root.update()
+        gui._add_text("こんにちは、元気？", "你好，最近怎么样？", True,
+                      who="peer:actor1301", label="阿诺owo")
+        gui._root.update()
+        b = gui._bubbles[-1]
+        texts = [str(gui._canvas.itemcget(iid, "text"))
+                 for iid in b.items if gui._canvas.type(iid) == "text"]
+        joined = "\n".join(texts)
+        for want, what in (("阿诺owo", "昵称"),
+                           ("こんにちは、元気？", "原文"),
+                           ("你好，最近怎么样？", "译文")):
+            assert want in joined, f"气泡里没有{what}（{want!r}）：{texts}"
+
+        # 房间成员：只有昵称、没有原文 → 小字区仍是一行，不留空行
+        gui._add_text("", "房间成员的译文", True,
+                      who="peer:room1", label="某成员")
+        gui._root.update()
+        rb = gui._bubbles[-1]
+        rtexts = [str(gui._canvas.itemcget(iid, "text"))
+                  for iid in rb.items if gui._canvas.type(iid) == "text"]
+        assert "某成员" in rtexts, f"房间气泡丢了昵称：{rtexts}"
+        assert all("\n" not in t for t in rtexts if t != "某成员"), \
+            f"房间气泡的小字区被塞了多余行：{rtexts}"
+        print(f"  ✓ 分玩家气泡含昵称/原文/译文；房间气泡仍只有昵称：{rtexts}")
+        return True
+    finally:
+        gui._root.destroy()
+
+
 def test_room_row_present_and_not_clipped() -> bool:
     """★ 房间行：独立成行、只留「连接房间」按钮 + 状态，且没被窗口裁掉。
 
@@ -517,6 +558,11 @@ def main() -> int:
         all_ok &= test_growing_bubble_shifts_later_bubbles()
     except AssertionError as exc:
         print(f"  ❌ 气泡长高时下移失败：{exc}")
+        all_ok = False
+    try:
+        all_ok &= test_peer_bubble_shows_nickname_and_source()
+    except AssertionError as exc:
+        print(f"  ❌ 分玩家气泡昵称/原文/译文检查失败：{exc}")
         all_ok = False
     try:
         all_ok &= test_room_row_present_and_not_clipped()

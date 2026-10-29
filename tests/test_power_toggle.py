@@ -321,6 +321,61 @@ def test_engine_wiring_running_stopping_idle() -> None:
     print("  ✓ 引擎接线：start→running、stop→stopping、stop_done+poll→idle（同一回调）")
 
 
+def test_players_only_stop_returns_to_idle() -> None:
+    """「别人说」+ 分玩家模式：没有混音引擎，停止也必须回到 idle。
+
+    真实事故：分玩家模式把 theirs 混音腿从 specs 里删掉 → `ctx.engines` 为空。
+    `stop()` 在 `not engines` 分支直接 return，既不投递 `stop_done` 也不刷 idle，
+    按钮永远卡在「开始翻译」的运行态（分玩家腿其实已经停了）。
+    """
+    gui = _make_gui()
+    recorded: list[str] = []
+    gui._set_power_state = recorded.append             # type: ignore[method-assign]
+    ctx = _arm_engine_ctx(gui)
+    ctx.power_state_fn = recorded.append
+    ctx.direction_var = _Var("theirs")                 # 只有「别人说」→ 没有混音腿
+    ctx.cfg.players = {"mode": "decrypt"}
+
+    class _FakeLeg:
+        running = True
+        stop_calls = 0
+
+        def stop(self, timeout: float = 8.0) -> None:  # noqa: ARG002
+            _FakeLeg.stop_calls += 1
+            _FakeLeg.running = False
+
+    started: list[bool] = []
+
+    def _fake_start_leg(ctx_, _cfg) -> None:           # noqa: ANN001
+        started.append(True)
+        ctx_.players_leg = _FakeLeg()
+
+    saved = gui_engine._start_players_leg
+    gui_engine._start_players_leg = _fake_start_leg    # type: ignore[assignment]
+    try:
+        with _fake_engine_class() as instances:
+            with contextlib.redirect_stdout(io.StringIO()):
+                gui_engine.start(ctx)
+            assert started, "分玩家模式没有启动分玩家腿"
+            assert recorded == ["running"], f"start 后应只记录 running：{recorded!r}"
+            assert not instances, "「别人说」+ 分玩家模式不该再建混音引擎"
+    finally:
+        gui_engine._start_players_leg = saved
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        gui_engine.stop(ctx)
+    assert "stopping" in recorded, f"停止收尾期间应记录到 stopping：{recorded!r}"
+    assert ctx.players_leg is None, "stop() 应立即摘掉 players_leg（防重复点开始）"
+
+    deadline = time.time() + 3.0
+    while time.time() < deadline and "idle" not in recorded:
+        gui._poll()
+        time.sleep(0.02)
+    assert "idle" in recorded, f"停止完成后应回到 idle：{recorded!r}"
+    assert _FakeLeg.stop_calls == 1, f"分玩家腿 stop 应调用一次：{_FakeLeg.stop_calls}"
+    print("  ✓ 只有分玩家腿时：stop→stopping→stop_done+poll→idle")
+
+
 # ---------------------------------------------------------------- 入口
 
 
@@ -333,6 +388,7 @@ def main() -> int:
         test_on_power_dispatch,
         test_set_power_state_refreshes_widget,
         test_engine_wiring_running_stopping_idle,
+        test_players_only_stop_returns_to_idle,
     ]
     print("test_power_toggle:")
     failed = 0

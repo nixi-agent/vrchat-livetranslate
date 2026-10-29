@@ -176,6 +176,9 @@ def build_settings_dialog(gui) -> None:
     build_settings_about(gui, settings_page(ctx, gui, t("关于")))
 
     gui._settings_pages = ctx.pages
+    # 滚轮守卫必须在页面建完之后装（控件都在 build_settings_* 里创建）
+    for _canvas, inner, _sb in ctx.pages:
+        guard_wheel_values(gui, inner)
     size_settings_window(gui, ctx)
     gui._settings_size = ctx.size
     gui._settings_ctx = ctx
@@ -255,6 +258,41 @@ def on_settings_wheel(gui, event) -> None:
     else:
         return
     canvas.yview_scroll(step * 3, "units")
+
+
+# Tk 自带滚轮改值的控件类型（class bindtag 上挂着 Scroll/MouseWheel）。
+_WHEEL_VALUE_CLASSES = ("TCombobox", "TSpinbox")
+_WHEEL_SEQS = ("<MouseWheel>", "<Button-4>", "<Button-5>")
+
+
+def _wheel_guard(gui, event):
+    """滚轮滑过下拉/数字框：只滚页面，**不改值**。"""
+    on_settings_wheel(gui, event)
+    return "break"
+
+
+def guard_wheel_values(gui, root) -> None:
+    """给设置页里的下拉框 / 数字框加滚轮守卫（只滚页面，不改设置值）。
+
+    ⚠️ 真机事故（2026-10）：设置页是整页可滚的，而 Tk 给 `TCombobox` /
+    `TSpinbox` 自带滚轮绑定 —— 指针滑过就改值，并直接触发
+    `<<ComboboxSelected>>` / `-command`（= 当场写 config.yaml）。用户只是滚了一页，
+    「距离策略」就从 order 变成 off、「同时翻译人数」从 4 变成 5，界面毫无提示。
+
+    控件级 bindtag 排在 class 之前：这里接住滚轮、手动滚页面再 ``break``，
+    class 上那条 `ttk::combobox::Scroll` / `ttk::spinbox::MouseWheel` 就不会执行。
+    """
+    stack = [root]
+    try:
+        while stack:
+            w = stack.pop()
+            if w.winfo_class() in _WHEEL_VALUE_CLASSES:
+                for seq in _WHEEL_SEQS:
+                    w.bind(seq, lambda e: _wheel_guard(gui, e))
+            stack.extend(w.winfo_children())
+    except Exception as exc:  # noqa: BLE001 - 守卫失败不该挡设置窗打开
+        print(f"[ui] ⚠️ 滚轮守卫安装失败（不影响其它功能）："
+              f"{type(exc).__name__}: {exc}", flush=True)
 
 
 def size_settings_window(gui, ctx: SettingsCtx | None = None) -> None:

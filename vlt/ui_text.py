@@ -192,7 +192,7 @@ class _Bubble:
     y: int = 0
     h: int = 0
     items: list = field(default_factory=list)
-    label: str = ""   # 远端成员昵称：作为小字显示在气泡上方（本机气泡为空）
+    label: str = ""   # 远端说话人昵称：小字第一行（本机为空；房间成员/分玩家才有）
 
 
 class _DownloadCancelled(Exception):

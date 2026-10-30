@@ -6,7 +6,8 @@
 2. **GUI 能把日志打成 zip 存到用户指定位置**，方便朋友出问题时发过来排查。
 
 ## 关键安全点
-导出包要经聊天工具发出去，所以**打包前逐文件脱敏**：扫到 `sk-xxxx` 形状就替换。
+导出包要经聊天工具发出去，所以**打包前逐文件脱敏**：扫到 `sk-xxxx` 形状就替换，
+配置里的房间认证字段另按 YAML 结构处理，损坏配置只导出说明。
 这条必须有测试盯着 —— 密钥泄露是不可逆的。
 """
 from __future__ import annotations
@@ -15,6 +16,9 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -81,7 +85,8 @@ def test_export_redacts_keys_and_includes_config() -> None:
     cfg.write_text("session:\n  model: x\n", encoding="utf-8")
 
     out = Path(tempfile.mkdtemp(prefix="vlt-expout-")) / "logs.zip"
-    path, n, size, redacted = crashlog.export_logs(out, log_dir=d, extra_files=[cfg])
+    with patch("vlt.paths.app_dir", return_value=d):
+        path, n, size, redacted = crashlog.export_logs(out, log_dir=d, extra_files=[cfg])
     assert path.exists() and path.suffix == ".zip", "没生成 zip"
     assert n >= 3, f"应至少打包 2 个日志 + 1 个配置，实际 {n}"
     assert redacted, "含密钥的文件应当被标为已脱敏"
@@ -97,9 +102,121 @@ def test_export_redacts_keys_and_includes_config() -> None:
     print(f"  导出 OK（{n} 个文件 / {size}B；脱敏 {redacted}）")
 
 
+def _export_config(text: str, name: str = "config.yaml") -> tuple[str, list[str]]:
+    """只用假配置调用真实导出入口，并确认源文件没有被改写。"""
+    from vlt import crashlog
+
+    with tempfile.TemporaryDirectory(prefix="vlt-redact-") as tmp:
+        app = Path(tmp)
+        logs = app / "logs"
+        logs.mkdir()
+        (logs / "gui_test.log").write_bytes("普通诊断日志\n".encode("utf-8"))
+        config = app / name
+        original = text.encode("utf-8")
+        config.write_bytes(original)
+        with patch("vlt.paths.app_dir", return_value=app):
+            archive, n, _, redacted = crashlog.export_logs(app / "export.zip")
+        assert n == 2, "测试只应导出沙箱内的日志与配置"
+        assert config.read_bytes() == original, "导出不得改写原配置"
+        with zipfile.ZipFile(archive) as zf:
+            assert zf.read("logs/gui_test.log").decode("utf-8") == "普通诊断日志\n"
+            exported = zf.read(name).decode("utf-8")
+            if name in redacted:
+                assert name in zf.read("说明.txt").decode("utf-8")
+        return exported, redacted
+
+
+def test_export_redacts_room_authentication() -> None:
+    """令牌无固定前缀；查询参数名可能编码，且旧 URL 里可能有多个令牌。"""
+    from urllib.parse import parse_qsl, urlsplit
+
+    secret = "仅供测试-房间口令"
+    url = ("wss://example.invalid/ws?mode=debug&room=TESTTEST"
+           "&k=old-key&tok=old-tok&%74oken=old-token&token=second-token")
+    text = yaml.safe_dump({
+        "session": {"model": "test-model"},
+        "room": {"token": secret, "server_url": url, "room_code": "TESTTEST"},
+    }, allow_unicode=True)
+    exported, redacted = _export_config(text)
+    for value in (secret, "old-key", "old-tok", "old-token", "second-token"):
+        assert value not in exported, "导出的配置仍包含房间认证凭据"
+    data = yaml.safe_load(exported)
+    assert data["session"]["model"] == "test-model"
+    assert data["room"]["room_code"] == "TESTTEST", "保留房间码用于排查"
+    parts = urlsplit(data["room"]["server_url"])
+    assert parts.netloc == "example.invalid" and parts.path == "/ws"
+    query = dict(parse_qsl(parts.query))
+    assert query["mode"] == "debug" and query["room"] == "TESTTEST"
+    assert redacted == ["config.yaml"]
+    print("  房间令牌 / URL 查询认证脱敏 OK（保留非敏感配置）")
+
+
+def test_export_redacts_yaml_variants() -> None:
+    """流式映射、多行、共享别名、合并与重复键都不能绕过字段脱敏。"""
+    secret = "synthetic-" + "room-credential"  # 假数据，避免凭据扫描误判
+    cases = [
+        f"'room': {{'token': '{secret}'}}\n",
+        f"room:\n  token: |\n    {secret}\n    第二行测试口令\n",
+        f"room: {{token: &key {secret}}}\ncopy: *key\n",
+        f"room:\n  token: &field token\n  *field: {secret}\n",
+        f"room: {{token: &field room}}\n*field: {{token: {secret}}}\n",
+        f"auth: &auth {{token: {secret}}}\nroom: {{<<: *auth}}\n",
+        f"auth: &auth {{token: {secret}}}\nroom: {{<<: [*auth, {{enabled: true}}]}}\n",
+        f"<<: {{room: {{token: {secret}}}}}\n",
+        f"room: {{token: {secret}, token: second-secret}}\nroom: {{token: third-secret}}\n",
+        f"auth: &auth {{<<: *auth, token: {secret}}}\nroom: {{<<: *auth}}\n",
+        ("endpoint: &url 'wss://example.invalid/ws?token=" + secret
+         + "'\nroom: {server_url: *url}\n"),
+    ]
+    for text in cases:
+        exported, redacted = _export_config(text)
+        for value in (secret, "第二行测试口令", "second-secret", "third-secret"):
+            assert value not in exported, "YAML 语法变体绕过了脱敏"
+        assert redacted == ["config.yaml"]
+        assert yaml.safe_load(exported) is not None
+    print(f"  YAML 语法变体脱敏 OK（{len(cases)} 种）")
+
+
+def test_export_omits_unsafe_config() -> None:
+    """损坏 YAML / 非预期结构只能导出说明，不能回退原文或泄露解析异常。"""
+    secret = "synthetic-" + "broken-credential"
+    cases = [
+        f"room:\n  token: {secret}\nbroken: [\n",
+        f"room: {{token: ['{secret}']}}\n",
+        f"room: {{server_url: {{token: {secret}}}}}\n",
+        f"room: [{secret}]\n",
+        f"- {secret}\n",
+        f"room: {{server_url: 'wss://[invalid?token={secret}'}}\n",
+    ]
+    for name in ("config.yaml", "config.yaml.broken"):
+        for text in cases:
+            exported, redacted = _export_config(text, name)
+            assert secret not in exported, "不安全配置的原文或解析异常被导出了"
+            assert "已省略" in exported, "应明确说明配置未被导出"
+            assert redacted == [name]
+    print("  损坏配置 / 非预期结构安全省略 OK（包含 .broken）")
+
+
+def test_export_preserves_non_sensitive_config() -> None:
+    """没有认证信息时保留原文、注释与空值，避免无谓重写诊断配置。"""
+    for text in (
+        "# 设备诊断\nsession:\n  model: test-model\n",
+        "room:\n  token: ''\n  server_url: wss://example.invalid/ws?mode=debug\n",
+        "# 尚未配置\n",
+    ):
+        exported, redacted = _export_config(text)
+        assert exported == text
+        assert not redacted
+    print("  非敏感配置原文保留 OK")
+
+
 if __name__ == "__main__":
     print("test_log_rotation:")
     test_prune_keeps_newest_and_respects_cap()
     test_rotation_switches_segment_not_stops()
     test_export_redacts_keys_and_includes_config()
+    test_export_redacts_room_authentication()
+    test_export_redacts_yaml_variants()
+    test_export_omits_unsafe_config()
+    test_export_preserves_non_sensitive_config()
     print("ALL PASSED")

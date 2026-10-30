@@ -24,7 +24,7 @@ from typing import Any
 import websockets
 
 from .base import (AudioHandler, LiveTranslateSession, SessionConfig, SessionNotReady,
-                   TextDelta, TextHandler, UsageHandler, should_finalize)
+                   TextDelta, TextHandler, UsageHandler, normalize_text, should_finalize)
 
 # 关闭握手的上限（秒）。**真链路实测（2026-09-30）：百炼服务端不回 close 帧** ——
 # `ws.close()` 稳吃 10.01s（两次测量一致），也就是 websockets 的默认 close_timeout，
@@ -108,6 +108,13 @@ class QwenLiveTranslateSession(LiveTranslateSession):
         self._src_buf: list[str] = []
         self._last_text_at: float = 0.0    # 最近一次文本增量时间（静默兜底用）
         self._last_final_text = ""         # 最近一次已发出的最终版文本（允许再次终结）
+        # 「这一轮已经终结到哪个字符」：晚到的增量只发新增那段，不会带上已经封口的旧文本
+        self._emitted_chars = 0
+        self._turn = 0                     # 每 response.created 自增；用于终版判重
+        self._last_final_turn = -1
+        self._family = ""                  # 本轮用的文本流：text | audio_transcript
+        self._family_warned = False
+        self._delta_count = 0              # 本轮收到的文本增量条数（诊断用）
         self._budget = ConnectionBudget(cfg.max_new_sessions_per_minute)
         # 延迟埋点
         self._t_speech_start: float | None = None
@@ -426,6 +433,42 @@ class QwenLiveTranslateSession(LiveTranslateSession):
             if self._finished_evt is not None:
                 self._finished_evt.set()
 
+    # ------------------------------------------------------------ 轮次边界
+
+    def _full_text(self) -> str:
+        return "".join(self._buf)
+
+    def _pending_text(self) -> str:
+        """本轮**还没终结**的那部分文本（已终结的部分不会再出现）。"""
+        full = self._full_text()
+        return full[self._emitted_chars:] if self._emitted_chars <= len(full) else full
+
+    def _advance(self) -> None:
+        self._emitted_chars = len(self._full_text())
+
+    def _reset_turn(self) -> None:
+        self._buf.clear()
+        self._emitted_chars = 0
+        self._src_buf = []
+        self._family = ""
+        self._delta_count = 0
+        self._turn += 1
+
+    def _final_remainder(self, authoritative: str | None) -> str:
+        """终版该发的那段：服务端给了全文就剥掉已发前缀，没给就用本地累积。"""
+        full = self._full_text()
+        emitted = full[:self._emitted_chars]
+        if authoritative is not None:
+            text = authoritative
+            if emitted:
+                if text.startswith(emitted):
+                    # 剥掉已发前缀；顺手吃掉前缀后残留的句读（否则会多出 "。ちょっと"）
+                    text = text[len(emitted):].lstrip(" 　。．.!！?？、，,～~…·")
+                elif normalize_text(text) == normalize_text(emitted):
+                    text = ""
+            return text.strip()
+        return full[self._emitted_chars:].strip()
+
     def _handle_event(self, ev: dict) -> None:
         etype = ev.get("type", "")
         if self.on_event is not None:
@@ -453,19 +496,34 @@ class QwenLiveTranslateSession(LiveTranslateSession):
             self._first_after_stop_ms = None
             return
         if etype == "response.created":
-            self._buf.clear()
+            self._reset_turn()
             return
 
         # --- 归一化文本（按代次分派）---
         textish = self._map_text_event(etype, ev)
         if textish is not None:
+            # 一轮里只认一条文本流：开了译音时服务端可能同时发 text.* 与
+            # audio_transcript.*，两族都累加会把同一句翻倍（实测症状：文本越来越长）。
+            family = ("transcript" if etype.startswith("response.audio_transcript.")
+                      else "text" if etype.startswith("response.text.") else "")
+            if family:
+                if self._family and self._family != family:
+                    if not self._family_warned:
+                        self._family_warned = True
+                        print(f"[session] ⚠️ 同一轮同时收到 text 与 {family} 两族文本 → "
+                              f"只认 {self._family}，另一族忽略", flush=True)
+                    return
+                self._family = family
             confirmed_delta, pending, final_text = textish
             if confirmed_delta:
                 self._buf.append(confirmed_delta)
+                self._delta_count += 1
             if final_text is not None:
-                self._emit(confirmed=final_text, pending="", is_final=True)
+                self._emit(confirmed=self._final_remainder(final_text),
+                           pending="", is_final=True)
+                self._advance()
             else:
-                self._emit(confirmed="".join(self._buf), pending=pending, is_final=False)
+                self._emit(confirmed=self._pending_text(), pending=pending, is_final=False)
             if self._t_stopped and self._first_after_stop_ms is None:
                 self._first_after_stop_ms = (time.perf_counter() - self._t_stopped) * 1000
             return
@@ -491,13 +549,17 @@ class QwenLiveTranslateSession(LiveTranslateSession):
         # --- 响应结束 ---
         if etype == "response.done":
             usage = (ev.get("response") or {}).get("usage") or {}
-            # 某些情况下没有 done 事件带全文，则用累加值兜底（重复终结由 _emit 去重）
-            self._emit(confirmed="".join(self._buf), pending="", is_final=True)
+            # 只发**还没终结**的那段：早一步的快封句已经封过的部分不再重复下发。
+            remainder = self._final_remainder(None)
+            self._emit(confirmed=remainder, pending="", is_final=True)
+            self._advance()
             if self._t_stopped:
                 done_ms = (time.perf_counter() - self._t_stopped) * 1000
                 first = self._first_after_stop_ms
                 print(f"[turn] 断句→首字 {'—' if first is None else f'{first:.0f}ms'}"
-                      f" | 断句→完成 {done_ms:.0f}ms | 终版 {len(''.join(self._buf))} 字",
+                      f" | 断句→完成 {done_ms:.0f}ms"
+                      f" | 终版 {len(remainder)} 字 / 本轮 {len(self._full_text())} 字"
+                      f" | {self._family or '?'}:{self._delta_count}",
                       flush=True)
                 self._t_stopped = 0.0
             if self.on_usage is not None and usage:
@@ -527,8 +589,11 @@ class QwenLiveTranslateSession(LiveTranslateSession):
         """
         if self._closing or not self._buf:
             return
-        cur = "".join(self._buf)
-        if cur == self._last_final_text:
+        cur = self._pending_text()
+        if not cur.strip():
+            return
+        if (self._turn == self._last_final_turn
+                and normalize_text(cur) == normalize_text(self._last_final_text)):
             return
         if not self._last_text_at:
             return
@@ -541,7 +606,10 @@ class QwenLiveTranslateSession(LiveTranslateSession):
                            silence_s=self.cfg.final_silence_s,
                            fast_silence_s=self.cfg.fast_final_silence_s,
                            fast_user_quiet_s=self.cfg.fast_final_user_quiet_s):
-            self._emit(confirmed=cur, pending="", is_final=True)
+            # 按 `_emit` 的返回值推进边界：真发出去了才推进。别用「文本变了没有」代理 ——
+            # 下一轮又说了同一句时文本不变，边界会停在 0，晚到增量就把已封口的旧句带回来。
+            if self._emit(confirmed=cur, pending="", is_final=True):
+                self._advance()
 
     def _map_text_event(self, etype: str, ev: dict) -> tuple[str, str, str | None] | None:
         """返回 (confirmed_delta, pending, final_text)；final_text 非 None 表示本段结束。
@@ -572,15 +640,27 @@ class QwenLiveTranslateSession(LiveTranslateSession):
                 return "", "", ev.get("transcript") or ev.get("text") or ""
         return None
 
-    def _emit(self, confirmed: str, pending: str, is_final: bool) -> None:
+    def _emit(self, confirmed: str, pending: str, is_final: bool) -> bool:
+        """把一条文本交给下游；返回**是否真的发出去了**。
+
+        返回值只给 `tick()` 用：它要据此决定是否推进已终结边界 `_emitted_chars`。
+        用「文本有没有变」代理「发没发出去」是不行的 —— 下一轮真的又说了同一句时
+        `_last_final_text` 不变，边界就停在 0，晚到的增量会把已封口的文本再带一遍。
+        """
         if self.on_text is None:
-            return
+            return False
         if is_final:
             # 终版去重集中在这里：静默兜底 / response.done / response.text.done 三条路径
-            # 可能对同一段文本都触发终结，重复下发会让下游（chatbox）白发一次。
-            if confirmed == self._last_final_text:
-                return
+            # 可能对同一段文本都触发终结，重复下发会让下游（chatbox / 字幕）白发一次。
+            # 只对**同一轮**判重：不同回合里真的说了同一句（"はい"/"好的"）要照发。
+            # 归一化后为空 = 只剩标点/空白（前缀剥离后常见）→ 不发，否则会多一条 "。"
+            if not normalize_text(confirmed):
+                return False
+            if (self._turn == self._last_final_turn
+                    and normalize_text(confirmed) == normalize_text(self._last_final_text)):
+                return False
             self._last_final_text = confirmed
+            self._last_final_turn = self._turn
         else:
             self._last_text_at = time.perf_counter()   # 静默兜底计时
         # 首个增量延迟埋点（以 speech_started 为基准）
@@ -590,3 +670,4 @@ class QwenLiveTranslateSession(LiveTranslateSession):
                 self.first_delta_ms = self._first_delta_ms
         self.on_text(TextDelta(confirmed=confirmed, pending=pending, is_final=is_final,
                                source="".join(self._src_buf)))
+        return True

@@ -6,11 +6,26 @@
 from __future__ import annotations
 
 import abc
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable
 
 from .. import endpoints
+
+#: 判重时忽略的「句末标点」——同一句只差标点时不该发两遍。
+_TRAILING_PUNCT = "。．.!！?？、，,～~…·"
+
+
+def normalize_text(text: str) -> str:
+    """折叠空白 + 去掉句末标点；**只用于「同一句」判重，不用于显示**。
+
+    实测：服务端的 `response.text.done` 与客户端静默兜底对同一句给出的标点可能不同
+    （`それは正しいですか？` vs `それは正しいですか`），逐字比较会当成两句 → 封口气泡后
+    又新建一条。归一化后再比就能挡住这种「同一句的两种写法」。
+    """
+    return re.sub(r"\s+", "", text or "").strip(_TRAILING_PUNCT)
+
 
 # ---------------------------------------------------------------- 归一化事件
 

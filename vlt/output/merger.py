@@ -2,6 +2,11 @@
 
 为什么要合并：chatbox 有 5 条/5 秒的漏桶限流，且气泡内容是被**整体替换**的，
 所以推给它的应该是「当前最完整的译文快照」，而不是碎片增量。
+
+⚠️ 这里**不做**跨回合去重 / 前缀剥离（早先试过，又被撤掉）：Merger 这层拿不到轮次身份，
+10s 窗口内「下一轮真的又说了一遍同一句」（はい / そうですね 这类短应答）会被整条丢掉，
+以上一句开头的长句还会被裁掉首词。同一句重复 / 晚到增量由会话层的 `_emitted_chars`
+（已终结字符边界）负责，见 `vlt/session/qwen38.py`。
 """
 from __future__ import annotations
 
@@ -22,16 +27,11 @@ class Merger:
         self.max_chars = max_chars
         self._last_sent: str = ""
         self._last_sent_at: float = 0.0
-        self._final_sent_for_current = False
         self._carry: str = ""            # 上一段最终译文（carry_over 时作为前缀）
         # 埋点
         self.sent_count = 0
         self.skipped_identical = 0
         self.first_sent_at: float | None = None
-
-    def start_utterance(self) -> None:
-        """新一段响应开始（response.created）。"""
-        self._final_sent_for_current = False
 
     def push(self, delta: TextDelta) -> None:
         text = delta.display                     # confirmed + pending（预测部分会被替换，不累加）
@@ -42,7 +42,6 @@ class Merger:
         if delta.is_final:
             self._carry = text
             self._emit(text, is_final=True, now=now)
-            self._final_sent_for_current = True
             return
 
         # 首个 delta 立即发；之后按 interval_s 节流
@@ -78,4 +77,4 @@ class Merger:
     def reset(self) -> None:
         self._last_sent = ""
         self._last_sent_at = 0.0
-        self._final_sent_for_current = False
+        self._carry = ""

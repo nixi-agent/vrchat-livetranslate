@@ -397,7 +397,7 @@ def _players_status_text(phase: str, detail: str) -> tuple[str, str]:
     if phase == "recording":
         return "info", "预热：正在记录玩家名（未开始翻译）"
     if phase == "acquiring":
-        return "info", f"预热：获取中（{detail or '正在获取密钥'}）"
+        return "info", f"预热：获取中 · {detail or '正在获取密钥'}"
     if phase in ("waiting_game",):
         return "info", "预热：等待 VRChat 进程"
     if phase in ("unauthorized", "blocked", "failed"):

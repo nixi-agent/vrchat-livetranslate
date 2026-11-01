@@ -460,7 +460,7 @@ class PlayerWarmup:
             return
         # **一次授权**做完：开抓包 + 采样 + 扫内存（同一个短命助手）。
         # 以前是「开抓包一个助手 + 扫内存一个助手」→ 用户被连着要两次密码。
-        self._set_phase(PHASE_ACQUIRING, "正在请求授权（系统密码弹窗）…")
+        self._set_phase(PHASE_ACQUIRING, "正在等待系统授权…")
         try:
             result = self._bootstrap(host)
         except Exception as exc:                          # noqa: BLE001

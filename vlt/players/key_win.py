@@ -82,30 +82,38 @@ PAGE_DELTA = 8192                              # 比基线多这么多页就算"
 DRAIN_BUDGET = 5.0
 DRAIN_INTERVAL = 0.15
 
-_native = ctypes.WinDLL("ntdll", use_last_error=True)
-_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_psapi = ctypes.WinDLL("psapi", use_last_error=True)
+# 非 Windows 上 `ctypes` 没有 `WinDLL`：本模块的**纯逻辑**（卷内偏移 → 扫描任务）
+# 必须能在 Linux CI 上 import，否则那部分只有 Windows 才跑得到用例。
+try:
+    _native = ctypes.WinDLL("ntdll", use_last_error=True)
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _psapi = ctypes.WinDLL("psapi", use_last_error=True)
+except (OSError, AttributeError):                    # pragma: no cover - 平台分派
+    _native = _k32 = _psapi = None
 
-_NtQuerySystemInformation = _native.NtQuerySystemInformation
-_NtQuerySystemInformation.restype = ctypes.c_long
-_NtQuerySystemInformation.argtypes = [
-    wt.ULONG, ctypes.c_void_p, wt.ULONG, ctypes.POINTER(wt.ULONG),
-]
-_NtSetSystemInformation = _native.NtSetSystemInformation
-_NtSetSystemInformation.restype = ctypes.c_long
-_NtSetSystemInformation.argtypes = [wt.ULONG, ctypes.c_void_p, wt.ULONG]
+if _native is not None:                              # pragma: no cover - 平台分派
+    _NtQuerySystemInformation = _native.NtQuerySystemInformation
+    _NtQuerySystemInformation.restype = ctypes.c_long
+    _NtQuerySystemInformation.argtypes = [
+        wt.ULONG, ctypes.c_void_p, wt.ULONG, ctypes.POINTER(wt.ULONG),
+    ]
+    _NtSetSystemInformation = _native.NtSetSystemInformation
+    _NtSetSystemInformation.restype = ctypes.c_long
+    _NtSetSystemInformation.argtypes = [wt.ULONG, ctypes.c_void_p, wt.ULONG]
 
-_k32.OpenProcess.restype = wt.HANDLE
-_k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
-_k32.CloseHandle.restype = wt.BOOL
-_k32.CloseHandle.argtypes = [wt.HANDLE]
-_k32.GetProcessTimes.restype = wt.BOOL
-_k32.GetProcessTimes.argtypes = [
-    wt.HANDLE, ctypes.POINTER(wt.FILETIME), ctypes.POINTER(wt.FILETIME),
-    ctypes.POINTER(wt.FILETIME), ctypes.POINTER(wt.FILETIME),
-]
-_psapi.EmptyWorkingSet.restype = wt.BOOL
-_psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
+    _k32.OpenProcess.restype = wt.HANDLE
+    _k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    _k32.CloseHandle.restype = wt.BOOL
+    _k32.CloseHandle.argtypes = [wt.HANDLE]
+    _k32.GetProcessTimes.restype = wt.BOOL
+    _k32.GetProcessTimes.argtypes = [
+        wt.HANDLE, ctypes.POINTER(wt.FILETIME), ctypes.POINTER(wt.FILETIME),
+        ctypes.POINTER(wt.FILETIME), ctypes.POINTER(wt.FILETIME),
+    ]
+    _psapi.EmptyWorkingSet.restype = wt.BOOL
+    _psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
+else:                                                # pragma: no cover - 平台分派
+    _NtQuerySystemInformation = _NtSetSystemInformation = None
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_QUERY_INFORMATION = 0x0400
@@ -228,7 +236,7 @@ class ScanHit:
     flow: tuple[bytes, bytes]      # (peerID, challenge)
     ok: int
     total: int
-    offset: int = 0                # pagefile 内的**卷内**偏移（不含磁盘 base）
+    offset: int = 0                # 盘上**绝对**偏移（任务在 _phys_tasks 之后）
 
     @property
     def fingerprint(self) -> str:
@@ -244,7 +252,7 @@ class ScanResult:
     elapsed_ms: float = 0.0
     needle_hits: int = 0
     regions: int = 0
-    stopped: str = "done"          # done | deadline | found
+    stopped: str = "done"          # done | deadline | found | partial
     needle: str = "q"
     region_bytes: int = 0
     fingerprints: list[str] = field(default_factory=list)
@@ -252,6 +260,8 @@ class ScanResult:
     chunks: int = 0
     threads: int = 0
     pagefile_mft: int = 0
+    unread_bytes: int = 0          # 应当扫、但读不到（盘打不开/读失败）的字节数
+    failed_disks: list[int] = field(default_factory=list)
 
 
 class SessionCache:
@@ -333,6 +343,15 @@ class _State:
         self.candidates: list[bytes] = []
         self.seen: set[bytes] = set()
         self.last_report = 0.0
+        # 「该扫但没读到」的字节与盘号：不许把「盘打不开」静默算成「扫过了没命中」，
+        # 否则上层会把 0% 覆盖率报成「扫了 X GiB 都不通过 GCM」。
+        self.unread = 0
+        self.failed_disks: set[int] = set()
+
+    def note_unread(self, nbytes: int, disk_no: int) -> None:
+        with self.lock:
+            self.unread += int(nbytes)
+            self.failed_disks.add(int(disk_no))
 
     def note_hits(self, n: int) -> None:
         with self.lock:
@@ -380,6 +399,28 @@ def _build_tasks(spans, chunk: int) -> list[tuple[int, int]]:
     return tasks
 
 
+def _phys_tasks(tasks: list[tuple[int, int]],
+                layout: "pagefile.Layout") -> list[tuple[int, int, int]]:
+    """卷内任务 → ``[(盘号, 盘上偏移, 字节数), ...]``（跨段的在段边界切开）。
+
+    这一步是「系统盘不是 `PhysicalDrive0`」那个 bug 的落脚点：以前任务只带
+    卷内偏移，worker 一律开 disk0，于是读的是另一块盘。现在每个任务自带盘号。
+    """
+    out: list[tuple[int, int, int]] = []
+    for off, size in tasks:
+        for disk_no, pos, n in layout.resolve(off, size):
+            if n > 0:
+                out.append((disk_no, pos, n))
+    want = sum(int(size) for _off, size in tasks)
+    got = sum(n for _d, _p, n in out)
+    if got != want:
+        # 映射丢了字节 = 这些偏移会被静默跳过。宁可炸，也不要报「扫完了没命中」。
+        raise ValueError(
+            f"卷→物理盘映射丢了 {want - got} 字节（任务 {want} → 映射 {got}）："
+            f"Layout 的分段没覆盖 pagefile 的区间")
+    return out
+
+
 def _scan_buffer(data: bytes, base_off: int, state: _State, auth: gcm_win.GcmAuth,
                  groups: list[tuple[tuple[bytes, bytes], list[bytes]]],
                  deadline: float, aad_kind: str) -> ScanHit | None:
@@ -414,18 +455,25 @@ def _scan_buffer(data: bytes, base_off: int, state: _State, auth: gcm_win.GcmAut
     return None
 
 
-def _worker(state: _State, tasks: list[tuple[int, int]], groups, *,
-            disk_no: int, base_offset: int, chunk: int, deadline: float,
-            aad_kind: str, name: str) -> None:
-    try:
-        disk = pagefile.Disk.open(disk_no, base_offset)
-    except OSError:
-        return
+def _worker(state: _State, tasks: list[tuple[int, int, int]], groups, *,
+            deadline: float, aad_kind: str) -> None:
+    """扫自己那份任务。任务是 ``(盘号, 盘上偏移, 字节数)``，按盘惰性开句柄。"""
+    disks: dict[int, pagefile.Disk] = {}
     try:
         with gcm_win.GcmAuth() as auth:
-            for off, size in tasks:
+            for disk_no, off, size in tasks:
                 if state.stop.is_set() or time.monotonic() >= deadline:
                     return
+                disk = disks.get(disk_no)
+                if disk is None:
+                    try:
+                        disk = pagefile.Disk.open(disk_no, 0)
+                    except OSError:
+                        # 这块盘打不开：**记下来**（上层要据此报「没扫全」），
+                        # 但不拖垮其它盘
+                        state.note_unread(size, disk_no)
+                        continue
+                    disks[disk_no] = disk
                 begin = max(((off - OVERLAP) // OVERLAP_ALIGN) * OVERLAP_ALIGN, 0)
                 span = off + size - begin
                 # 必须走 read_view：Disk.read 每块新建一个 8 MiB 的 ctypes 数组，
@@ -434,6 +482,7 @@ def _worker(state: _State, tasks: list[tuple[int, int]], groups, *,
                 try:
                     view = disk.read_view(begin, span)
                 except OSError:
+                    state.note_unread(size, disk_no)
                     continue
                 data = bytes(view)
                 view.release()
@@ -445,11 +494,28 @@ def _worker(state: _State, tasks: list[tuple[int, int]], groups, *,
                                 deadline, aad_kind) is not None:
                     return
     finally:
-        disk.close()
+        for disk in disks.values():
+            try:
+                disk.close()
+            except OSError:
+                pass
+
+
+def _layout_from_one_extent(spans, disk_no: int, base_offset: int) -> pagefile.Layout:
+    """老口径（单盘单段）合成一个 Layout，长度要**覆盖到 pagefile 的最远偏移**。
+
+    pagefile 的 spans 是卷内偏移（可能从卷中间的几 GiB 才开始），所以不能拿
+    「pagefile 总大小」当 extent 长度 —— 那样高位偏移全落到段外，任务数变 0，
+    扫描静默什么都不做。
+    """
+    end = max((int(off) + int(size) for off, size in spans), default=0)
+    return pagefile.Layout(
+        (pagefile.DiskExtent(int(disk_no), int(base_offset), end),))
 
 
 def scan_key(pf: pagefile.Pagefile, samples, *,
              disk_no: int = 0, base_offset: int | None = None,
+             layout: pagefile.Layout | None = None,
              threads: int = 0, chunk: int = CHUNK,
              deadline_s: float = SCAN_TIMEOUT, aad_kind: str = "hdr19",
              on_progress=None) -> ScanResult:
@@ -458,7 +524,9 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
     `samples` 是 `{(peerID, challenge): [密文包…]}`（与 `pf_scan.load_samples`、
     `dgram.Datagram` 的口径一致）。
 
-    `base_offset=None` 时自己查（非提权就能查，`pagefile.base_offset_for`）。
+    `layout` 是卷在物理盘上的分段（:class:`pagefile.Layout`）—— 给了它就用它
+    把「卷内偏移」翻成 `(盘号, 盘上偏移)`；不给时退回 `disk_no` / `base_offset`
+    （单盘单段的老口径，`base_offset=None` 时自己查，非提权就能查）。
     返回的 `ScanResult.hit` 为 None 表示没找到 —— 先确认内存压缩是不是又开了。
     """
     groups: list[tuple[tuple[bytes, bytes], list[bytes]]] = []
@@ -469,15 +537,17 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
     if not groups:
         raise ValueError("没有可用的 Photon 加密包样本（需要至少一个 flow 的 2 包）")
 
-    if base_offset is None:
-        got = pagefile.base_offset_for("C")
-        if got is None:
-            raise OSError("拿不到 C: 的分区起始偏移（pagefile.base_offset_for 返回 None）")
-        base_offset = got
-
     spans = pf.spans()
     total = sum(n for _off, n in spans)
-    tasks = _build_tasks(spans, chunk)
+    if layout is None:
+        if base_offset is None:
+            got = pagefile.base_offset_for("C")
+            if got is None:
+                raise OSError("拿不到 C: 的分区起始偏移（pagefile.base_offset_for 返回 None）")
+            base_offset = got
+        layout = _layout_from_one_extent(spans, disk_no, int(base_offset))
+
+    tasks = _phys_tasks(_build_tasks(spans, chunk), layout)
     nthreads = threads or min(8, max(2, (ctypes.cdll.kernel32.GetActiveProcessorCount(0) or 8)))
     nthreads = max(1, min(nthreads, 16))
 
@@ -486,7 +556,7 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
     t0 = time.monotonic()
 
     # 任务按块轮转分配：大块在前、交错，避免某个线程捡到全是零的后段
-    buckets: list[list[tuple[int, int]]] = [[] for _ in range(nthreads)]
+    buckets: list[list[tuple[int, int, int]]] = [[] for _ in range(nthreads)]
     for i, task in enumerate(tasks):
         buckets[i % nthreads].append(task)
 
@@ -494,8 +564,7 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
         threading.Thread(
             target=_worker, name=f"vlt-keywin-{i}", daemon=True,
             args=(state, buckets[i], groups),
-            kwargs=dict(disk_no=disk_no, base_offset=base_offset, chunk=chunk,
-                        deadline=deadline, aad_kind=aad_kind, name=f"w{i}"))
+            kwargs=dict(deadline=deadline, aad_kind=aad_kind))
         for i in range(nthreads)
     ]
     for w in workers:
@@ -521,13 +590,21 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
             w.join(timeout=1.0)
 
     elapsed_ms = (time.monotonic() - t0) * 1000.0
+    if state.hit:
+        stopped = "found"
+    elif state.unread:
+        stopped = "partial"          # 有字节根本没读到，不许报成「扫完了没命中」
+    elif time.monotonic() >= deadline:
+        stopped = "deadline"
+    else:
+        stopped = "done"
     result = ScanResult(
         candidates=list(state.candidates),
         scanned_bytes=state.scanned,
         elapsed_ms=elapsed_ms,
         needle_hits=state.needle_hits,
         regions=len(spans),
-        stopped="found" if state.hit else ("deadline" if time.monotonic() >= deadline else "done"),
+        stopped=stopped,
         needle="q",
         region_bytes=total,
         fingerprints=[key_fingerprint(k) for k in state.candidates[:64]],
@@ -535,6 +612,8 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
         chunks=state.chunks_done,
         threads=nthreads,
         pagefile_mft=pf.mft_index,
+        unread_bytes=state.unread,
+        failed_disks=sorted(state.failed_disks),
     )
     return result
 

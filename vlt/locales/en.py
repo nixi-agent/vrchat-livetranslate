@@ -607,6 +607,8 @@ STRINGS: dict[str, str] = {
     "等待 VRChat 进程…": "Waiting for the VRChat process…",
     "未授权（可点「重新授权」）": "Not authorized (click “Re-authorize”)",
     "已抓包，等待密钥…": "Capturing, waiting for the key…",
+    "获取中：{detail}": "Acquiring: {detail}",
+    "正在获取密钥…": "Acquiring the key…",
     "记录中：已识别 {n} 位玩家（{events} 条名字事件）": "Recording: {n} players identified ({events} name events)",
     "不可用：{detail}": "Unavailable: {detail}",
     "密钥：{fp}": "Key: {fp}",

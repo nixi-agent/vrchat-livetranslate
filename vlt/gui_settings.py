@@ -41,8 +41,6 @@ from .i18n import t
 from .players_settings import (
     MODE_DECRYPT,
     MODE_OFF,
-    PREWARM_AUTO,
-    PREWARM_OFF,
     PlayersSettings,
     parse_players,
 )
@@ -1021,7 +1019,6 @@ def build_settings_room(gui, body: ttk.Frame) -> None:
 # 不 import 它 —— Windows 产物里没有那个包，import 级引用会直接炸。
 
 _PLAYERS_MODES = ((MODE_OFF, "关闭"), (MODE_DECRYPT, "解密分玩家"))
-_PLAYERS_PREWARM = ((PREWARM_OFF, "关"), (PREWARM_AUTO, "自动（检测到 VRChat 就抓包记名字）"))
 _PLAYERS_DISTANCE = (
     ("off", "不用"),
     ("order", "按距离排序（推荐）"),
@@ -1061,7 +1058,7 @@ def save_players_setting(gui, key: str, value) -> None:
     players = dict(getattr(gui._cfg, "players", None) or {})
     players[key] = value
     gui._cfg.players = players
-    # 预热/模式改动即时生效；其余“下次开始翻译”生效（腿是开始翻译时按配置建的）
+    # 模式改动即时生效；其余“下次开始翻译”生效（腿是开始翻译时按配置建的）
     ctx = getattr(gui, "_engine_ctx", None)
     if ctx is not None:
         try:
@@ -1119,10 +1116,10 @@ def _players_label_width(*labels: str) -> int:
 
 
 def build_settings_players(gui, body: ttk.Frame) -> None:
-    """「设置 → 分玩家」：模式 / 预热 / 名额 / 音量 / 距离 / 状态。"""
+    """「设置 → 分玩家」：模式 / 名额 / 音量 / 距离 / 状态。"""
     ps: PlayersSettings = parse_players(getattr(gui._cfg, "players", None) or {})
     row_width = _players_label_width(
-        t("模式:"), t("预热:"), t("同时翻译人数:"), t("静音门限:"), t("门限滞回:"),
+        t("模式:"), t("同时翻译人数:"), t("静音门限:"), t("门限滞回:"),
         t("距离策略:"), t("距离门限（米）:"), t("等流量最长秒数:"),
         t("预热密文缓冲（MB）:"))
 
@@ -1142,21 +1139,6 @@ def build_settings_players(gui, body: ttk.Frame) -> None:
     mode_box.pack(side=tk.LEFT, padx=(8, 0))
     mode_box.bind("<<ComboboxSelected>>", lambda _e: save_players_setting(
         gui, "mode", next(k for k, label in modes if label == gui._players_mode_var.get())))
-
-    prewarms = _players_choices(_PLAYERS_PREWARM)
-    row = _players_row(body, t("预热:"), width=row_width)
-    gui._players_prewarm_var = tk.StringVar(value=dict(prewarms)[ps.prewarm])
-    prewarm_box = ttk.Combobox(row, textvariable=gui._players_prewarm_var, state="readonly",
-                               width=24, values=[label for _k, label in prewarms])
-    prewarm_box.pack(side=tk.LEFT, padx=(8, 0))
-    prewarm_box.bind("<<ComboboxSelected>>", lambda _e: save_players_setting(
-        gui, "prewarm",
-        next(k for k, label in prewarms if label == gui._players_prewarm_var.get())))
-    ttk.Label(body,
-              text=t("预热会在检测到 VRChat 进程时弹一次授权；未开始翻译时也会持续"
-                     "记录玩家名（不解码语音）。"),
-              style="Muted.TLabel", justify=tk.LEFT, wraplength=SETTINGS_WRAP
-              ).pack(anchor=tk.W, pady=(4, 6))
 
     # ---- 名额 + 音量 ----
     ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
@@ -1239,8 +1221,8 @@ def _players_status_line(gui) -> str:
     if phase == "recording":
         base = t("记录中：已识别 {n} 位玩家（{events} 条名字事件）",
                  n=status.get("players", 0), events=status.get("name_events", 0))
-    elif phase == "capturing":
-        base = t("已抓包，等待密钥…")
+    elif phase == "acquiring":
+        base = t("获取中：{detail}", detail=detail or t("正在获取密钥…"))
     elif phase == "waiting_game":
         base = t("等待 VRChat 进程…")
     elif phase == "unauthorized":

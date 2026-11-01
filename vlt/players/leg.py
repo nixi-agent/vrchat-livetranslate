@@ -20,6 +20,8 @@
 
 - 闸门（EAC v2）命中 → 立刻放弃并 `on_status("error", …)`，**不重试**；
 - 抓包/取钥失败 → 带退避重试（5/10/20s），并把原因报给界面；
+- **预热没就绪 → 只等待并 warn，绝不自己起提权助手**（开始翻译时的二次 pkexec 会
+  把正在进行的预热授权卡住）；
 - 会话建不起来（限流/断网）→ 只影响那个人，路由器自己按 LRU 回收，不拖垮整条腿。
 """
 from __future__ import annotations
@@ -31,9 +33,8 @@ import time
 from pathlib import Path
 
 from ..session.base import SessionConfig
-from . import capture_linux, gcm, guard, names, procfs, world
+from . import capture_linux, gcm, guard, names, world
 from .collector import VoiceCollector
-from .helper import HelperSession, KeyBlocked, scan_key_on
 from .pending import PreKeyBuffer
 from .positions import PositionTable, format_distance
 from .router import PlayerRouter
@@ -64,58 +65,12 @@ class _KeyUnavailable(RuntimeError):
         self.fatal = fatal
 
 
-class _HelperCapture:
-    """没有预热时的老路径：一次性助手（socket + 扫内存都在同一个会话里）。"""
-
-    def __init__(self, leg: "PlayerLeg", sess: HelperSession) -> None:
-        self._leg = leg
-        self._sess = sess
-        self._port = leg.port
-        self._local_ports: set[int] | None = None
-
-    def drain(self, timeout: float = 0.2):
-        return capture_linux.drain(self._sess.packet_socket, timeout=timeout)
-
-    def parse(self, raw):
-        """把一帧解析成数据报；`local_ports` 跟着端点刷新走。"""
-        return capture_linux.parse_frame(raw, port=self._port,
-                                        local_ports=self._local_ports)
-
-    def set_local_ports(self, ports) -> None:
-        self._local_ports = ports
-
-    def cached_key(self):
-        return None
-
-    def initial_names(self):
-        return None
-
-    def recent_cipher(self):
-        return None
-
-    def bind_status(self, _provider) -> None:
-        return None
-
-    def adopt_names(self, _table) -> None:
-        return None
-
-    def acquire_key(self, samples):
-        # needle 扫描只有一份实现（`helper.scan_key_on`）：预热、leg、探针共用
-        try:
-            hit = scan_key_on(self._sess, samples, on_status=self._leg._scan_status)
-        except KeyBlocked as exc:
-            raise _KeyUnavailable(str(exc), fatal=True) from exc
-        except Exception as exc:                         # noqa: BLE001 - 原样回给调用方
-            raise _KeyUnavailable(f"扫描失败：{exc}") from exc
-        if hit is None:
-            raise _KeyUnavailable("没找到能通过 GCM 认证的密钥")
-        return hit
-
-
 class _WarmupCapture:
-    """预热路径：socket / 密钥 / 名字表都借自 `PlayerWarmup`。"""
+    """预热路径：socket / 密钥 / 名字表都借自 `PlayerWarmup`。
 
-    FATAL_PHASES = ("unauthorized", "blocked")
+    ⚠️ 这里**绝不触发提权**：腿只在预热已经拿到密钥后才租借；万一密钥在这期间
+    失效，也只报"未就绪"让外层退避，取钥重扫一律由预热线程自己做。
+    """
 
     def __init__(self, lease) -> None:
         self._lease = lease
@@ -151,14 +106,11 @@ class _WarmupCapture:
         self._lease.adopt(table)
 
     def acquire_key(self, samples):
-        hit = self._lease.ensure_key(samples)
-        if hit is not None:
-            return hit
-        status = self._lease.status()
-        phase = str(status.get("phase") or "")
-        detail = str(status.get("detail") or "取钥失败")
-        fatal = phase in self.FATAL_PHASES or detail.startswith("读内存被拒绝")
-        raise _KeyUnavailable(f"预热取钥失败：{detail}", fatal=fatal)
+        hit = self._lease.key
+        if hit is None:
+            # 等预热自己重扫（腿不参与取钥，避免二次 pkexec）
+            raise _KeyUnavailable("预热还没有密钥（等待预热重试）")
+        return hit
 
 
 class PlayerLeg:
@@ -170,7 +122,7 @@ class PlayerLeg:
                  pre_seconds: float = 120.0, port: int = 27002,
                  log_dir: str | Path | None = None,
                  distance_mode: str = "off", max_distance_m: float = 0.0,
-                 warmup=None) -> None:
+                 warmup) -> None:
         self.cfg = cfg
         self.on_text = on_text or (lambda *_a: None)
         self.on_status = on_status or (lambda *_a: None)
@@ -187,7 +139,8 @@ class PlayerLeg:
         self.distance_mode = str(distance_mode or "off").lower()
         self.max_distance_m = max(0.0, float(max_distance_m or 0.0))
         self.positions = PositionTable()
-        # 预热器（可选）：有就借用它的 socket/密钥/名字表，跳过授权与 11 秒内存扫描。
+        # 预热器：**必填**。socket/密钥/名字表都借自它；没有预热就没有这条腿
+        # （开始翻译不再单独提权 —— 否则会和正在进行的预热授权互相卡住）。
         self.warmup = warmup
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -198,6 +151,9 @@ class PlayerLeg:
         self._warned_names = False
         self._warned_world = False
         self._warned_loading = False
+        # 等预热就绪时的状态去重（phase/detail 或 30s 一次）
+        self._warmup_note: tuple[str, str] = ("", "")
+        self._warmup_note_at = 0.0
 
     # ------------------------------------------------------------ 生命周期
 
@@ -296,6 +252,13 @@ class PlayerLeg:
                 if self._stop.wait(2.0):
                     return
                 continue
+            # 预热没就绪（还在授权/取钥）就只等 —— 绝不能在这里再起一次助手：
+            # 那会弹第二个 pkexec，把正在进行的授权卡住。
+            if not self._warmup_ready():
+                self._note_warmup_wait()
+                if self._stop.wait(2.0):
+                    return
+                continue
             try:
                 self._run_once(host, log_names)
                 return                      # 正常结束时整条腿收工
@@ -306,6 +269,36 @@ class PlayerLeg:
                                        f"，{wait:.0f}s 后重试")
                 if self._stop.wait(wait):
                     return
+
+    def _warmup_ready(self) -> bool:
+        """预热是否已经可以借（socket + 密钥都到位）。
+
+        只等到「有 socket」不够：bootstrap 的取钥有 1~20 秒延迟，这期间租借会让腿
+        亲自去扫内存（旧实现就是这样二次提权的）。所以必须等密钥也拿到。
+        """
+        try:
+            return self.warmup.available() and self.warmup.key is not None
+        except Exception:                                # noqa: BLE001 - 预热坏了就继续等
+            return False
+
+    def _note_warmup_wait(self) -> None:
+        """等预热就绪时按 phase/detail 变化或 30s 报一次（warn）。"""
+        try:
+            status = self.warmup.status()
+        except Exception:                                # noqa: BLE001
+            status = {}
+        phase = str(status.get("phase") or "")
+        detail = str(status.get("detail") or "")
+        now = time.monotonic()
+        if (phase, detail) == self._warmup_note and now - self._warmup_note_at < 30.0:
+            return
+        self._warmup_note = (phase, detail)
+        self._warmup_note_at = now
+        hint = detail or "预热尚未就绪"
+        self.on_status(
+            "warn",
+            f"分玩家等待预热：{hint}（不会单独弹授权；若一直停在这里，"
+            f"去「设置 → 分玩家」点「重新授权」）")
 
     def _wait_host(self, seconds: float) -> Proc.ProcInfo | None:
         deadline = time.monotonic() + seconds
@@ -321,36 +314,28 @@ class PlayerLeg:
     def _run_once(self, host: Proc.ProcInfo, log_names: dict[str, str]) -> None:
         """一次完整的「取钥 → 解码」流程（失败抛异常，由外层退避重试）。
 
-        有预热器就**借用**它的 socket/密钥/名字表（跳过 pkexec 与 11 秒内存扫描）；
-        没有就走原来的「一次性助手」路径。两条路共用 `_decode`，口径不会分裂。
+        socket/密钥/名字表**只从预热器借用**：开始翻译不再单独提权（否则会和正在
+        进行的预热授权抢 pkexec，把授权卡住）。
         """
         if os.name == "nt":                              # pragma: no cover - 平台分派
             # Windows 没有 pkexec、也没有助手进程：抓包本身不需要提权（npcap），
             # 只有「读裸盘上的 pagefile」那一步要一次性 UAC；而 key 是进程级的，
-            # 缓存命中后换世界/换房间都不再弹。
+            # 缓存命中后换世界/换房间都不再弹。key 由预热器先取好（`_capture_blocking`
+            # 会等到 warmup.key 就绪），`_WinCapture` 复用它的 session cache。
             from . import win_capture
             with win_capture._WinCapture(self, host) as cap:
                 self._decode(host, log_names, cap)
             return
-        lease = None
-        if self.warmup is not None:
-            try:
-                lease = self.warmup.lease()
-            except Exception as exc:                     # noqa: BLE001 - 预热坏了不能拖垮翻译
-                self.on_status("warn", f"预热不可用（{type(exc).__name__}: {exc}），改用常规取钥")
-                lease = None
-        if lease is not None:
-            self.on_status("info", "复用预热：跳过授权与内存扫描")
-            try:
-                self._decode(host, log_names, _WarmupCapture(lease))
-            finally:
-                lease.release()
-            return
-        with HelperSession(host, port=self.port) as sess:
-            sess.start_capture(filter_mode="strict")
-            if sess.packet_socket is None:
-                raise RuntimeError("没有拿到抓包 fd")
-            self._decode(host, log_names, _HelperCapture(self, sess))
+        # Linux：socket/密钥/名字表**只从预热器借用**，开始翻译不再单独提权
+        # （否则会和正在进行的预热授权抢 pkexec，把授权卡住）。
+        lease = self.warmup.lease()
+        if lease is None:
+            raise RuntimeError("预热器尚未就绪（等待授权/抓包）")
+        self.on_status("info", "复用预热：跳过授权与内存扫描")
+        try:
+            self._decode(host, log_names, _WarmupCapture(lease))
+        finally:
+            lease.release()
 
     def _decode(self, host: Proc.ProcInfo, log_names: dict[str, str], cap) -> None:
         report: dict = {}
@@ -498,6 +483,9 @@ class PlayerLeg:
                     next_stat = time.monotonic() + 10.0
                     stats = self.router.stats() if self.router is not None else {}
                     known = len(collector.names)
+                    evict_note = (
+                        f" / 按距离换人 {stats.get('distance_evictions', 0)}"
+                        if "order" in str(stats.get("distance_mode", "")) else "")
                     self.on_status(
                         "info",
                         f"解码：音频消息 {sum(collector.audio_hits.values())}，"
@@ -508,7 +496,8 @@ class PlayerLeg:
                         f" / 失败 {stats.get('create_failures', 0)}"
                         f" / 预算排队 {stats.get('budget_waits', 0)}"
                         f" / 排队 {stats.get('queued', 0)}"
-                        f" / 溢出丢弃 {stats.get('overflow_dropped', 0)}），"
+                        f" / 溢出丢弃 {stats.get('overflow_dropped', 0)}"
+                        f"{evict_note}），"
                         f"已发块 {stats.get('sent_chunks', 0)}，"
                         f"文本 {stats.get('text_events', 0)}，名字 {known}，"
                         f"换世界 {collector.world_changes}，"
@@ -529,11 +518,6 @@ class PlayerLeg:
         finally:
             # 停止翻译/异常退出：把名字表交还预热器，状态页才不会突然变成 0 人
             cap.adopt_names(collector.names)
-
-    def _scan_status(self, needle: str, reply: dict, candidates: int) -> None:
-        self.on_status("info", f"扫内存（needle={needle}）："
-                               f"{reply['scanned_bytes'] / 2**30:.1f} GiB，"
-                               f"候选 {candidates}")
 
     def _ingest(self, collector: VoiceCollector, dg, hit) -> None:
         """喂一个数据报给采集器；名字表变了才推给界面。

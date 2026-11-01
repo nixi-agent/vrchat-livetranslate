@@ -8,8 +8,9 @@
 3. 建会话失败按 5/10/15/30s 退避，半成品必须关掉；
 4. 会话被服务端掐掉后 tick 立刻发现，退避后重建；
 5. 所有会话共享**同一个** RPM 预算（条数 + 相邻最小间隔）；
-6. ★ 名额满且**都在说话**时：不踢人、新人的块丢弃并警告（`overflow_dropped`）；
+6. ★ 名额满且**都在说话**时：off 模式不踢人、新人的块丢弃并警告（`overflow_dropped`）；
 7. ★ 名额满但有人**空闲 >15s**：回收空闲者；距离模式优先回收更远的；
+   `order` 模式下全都在说话时，**更近**的新来者让最远者让位（距离未知不换）；
 8. ★ 排队期间的音频（最近 2s）在会话就绪后补发，句首不丢。
 
 跑法：xvfb-run -a .venv/bin/python tests/test_players_router.py（不需要显示，加 xvfb 只是沿用仓库口径）
@@ -169,7 +170,7 @@ async def _case_concurrent() -> None:
 
 
 async def _case_overflow() -> None:
-    """名额满 + 都在说话 = 不踢人；有人空闲 = 回收空闲者。"""
+    """名额满 + 都在说话（off 模式）= 不踢人；有人空闲 = 回收空闲者。"""
     created: list[FakeSession] = []
     original = _install(created)
     status: list[str] = []
@@ -213,7 +214,7 @@ async def _case_distance() -> None:
     created: list[FakeSession] = []
     original = _install(created)
     try:
-        print("[router] 距离门限 / 距离排序（只在空闲者里挑）")
+        print("[router] 距离门限 / 距离排序（空闲优先，全忙按距离让位）")
         dists = {1: 5.0, 2: 50.0, 3: 2.0, 4: 80.0}
         gate = _make(max_sessions=2, distance_mode="gate", max_distance_m=10.0,
                      distance_of=lambda a: dists.get(a),
@@ -255,6 +256,50 @@ async def _case_distance() -> None:
         check("更远的人不踢空闲的近距离者", len(order.sessions) == before
               and 4 not in order.sessions, str(list(order.sessions)))
         await order.close()
+
+        # 全都在说话：只有更近的新来者才让最远者让位（严格 <，无滞回）
+        status_hot: list[str] = []
+        hot = _make(max_sessions=2, distance_mode="order",
+                    distance_of=lambda a: dists.get(a),
+                    on_status=lambda lvl, msg: status_hot.append(msg),
+                    budget=ConnectionBudget(100))
+        await hot.start()
+        await hot.feed(1, LOUD)              # 5m
+        await _settle()
+        await hot.feed(2, LOUD)              # 50m
+        await _settle()
+        await hot.feed(3, LOUD)              # 2m：两人都在说话，仍应换掉 50m
+        await _settle()
+        check("全员在说话：更近的人让最远者让位",
+              2 not in hot.sessions and 3 in hot.sessions, str(list(hot.sessions)))
+        check("按距离换人计数", hot.stats()["distance_evictions"] == 1,
+              str(hot.stats()))
+        await hot.feed(4, LOUD)              # 80m：比在场的都远 → 不换
+        await _settle()
+        check("全员在说话：更远的人不换", 4 not in hot.sessions,
+              str(list(hot.sessions)))
+        dists[5] = None                       # 距离未知的新来者 → 不能凭猜踢人
+        await hot.feed(5, LOUD)
+        await _settle()
+        check("全员在说话：距离未知不换人", 5 not in hot.sessions,
+              str(list(hot.sessions)))
+        check("距离未知的警告有单独口径",
+              any("按距离排序" in m for m in status_hot), str(status_hot[:3]))
+        await hot.close()
+
+        # 全员距离未知：没有排序依据 → 不换人（也不退化成 LRU 踢正在说话的人）
+        blind = _make(max_sessions=1, distance_mode="order",
+                      distance_of=lambda a: None,
+                      budget=ConnectionBudget(100))
+        await blind.start()
+        await blind.feed(1, LOUD)
+        await _settle()
+        await blind.feed(2, LOUD)
+        await _settle()
+        check("全员距离未知：不按距离换人",
+              2 not in blind.sessions and 1 in blind.sessions,
+              str(list(blind.sessions)))
+        await blind.close()
     finally:
         router_mod.create_session = original
 

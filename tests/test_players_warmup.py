@@ -9,7 +9,7 @@
 3. 租借给翻译腿期间预热线程**不读 socket**；归还后恢复；
 4. 连续解不开的包达到阈值 → 判定密钥失效并重扫（名字表保留）；
 5. 游戏进程变了（pid/starttime）→ 重开 socket、清名字表；
-6. `prewarm: off` 时不起线程、不碰任何东西。
+6. 分玩家关闭（`mode: off`）时不起线程、不碰任何东西。
 
 跑法：.venv/bin/python tests/test_players_warmup.py
 """
@@ -155,7 +155,7 @@ class Harness:
         self.drains = 0
         self.sockets: list[_FakeSocket] = []
         self.warmup = warmup.PlayerWarmup(
-            PlayersSettings(prewarm="auto"),
+            PlayersSettings(mode="decrypt"),
             find_host=lambda: self.host,
             bootstrap=self._bootstrap,
             open_capture=self._open,
@@ -381,13 +381,13 @@ def test_host_change() -> None:
         gcm._aesgcm = real
 
 
-def test_off() -> None:
-    print("[warmup] prewarm=off 什么都不做")
+def test_mode_off() -> None:
+    print("[warmup] 分玩家关闭（mode=off）什么都不做")
     host = _host()
     calls = {"open": 0}
 
     w = warmup.PlayerWarmup(
-        PlayersSettings(prewarm="off"),
+        PlayersSettings(mode="off"),
         find_host=lambda: host,
         open_capture=lambda _h: calls.__setitem__("open", calls["open"] + 1),
         scan=lambda _h, _n: {"ok": True, "candidates": []},
@@ -401,6 +401,21 @@ def test_off() -> None:
     w.close()
 
 
+def test_acquiring_before_key() -> None:
+    """授权完成后、拿到密钥前要停在「获取中」，不能装成 waiting_game。"""
+    print("[warmup] 取钥窗口 → acquiring")
+    host = _host()
+    h = Harness(host=host)          # 假 bootstrap：只给 socket，不给密钥
+    try:
+        h.warmup.start()
+        phase = h.wait_phase(warmup.PHASE_ACQUIRING, timeout=2.0)
+        check("取钥期间是 acquiring", phase == warmup.PHASE_ACQUIRING, phase)
+        detail = str(h.warmup.status().get("detail") or "")
+        check("提示里说明在取密钥", "获取" in detail, detail)
+    finally:
+        h.warmup.close()
+
+
 def main() -> int:
     if _host() is None:
         print("SKIP 读不到 /proc/self")
@@ -412,7 +427,8 @@ def main() -> int:
     test_lease_pauses_reader()
     test_key_rotation_rescan()
     test_host_change()
-    test_off()
+    test_mode_off()
+    test_acquiring_before_key()
     print()
     if FAILS:
         print(f"FAILED: {len(FAILS)} 项 → {', '.join(FAILS)}")

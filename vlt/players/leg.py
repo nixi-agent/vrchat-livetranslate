@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from pathlib import Path
@@ -36,6 +37,15 @@ from .helper import HelperSession, KeyBlocked, scan_key_on
 from .pending import PreKeyBuffer
 from .positions import PositionTable, format_distance
 from .router import PlayerRouter
+
+# 平台分派：Windows 没有 AF_PACKET（抓包换 npcap，见 `dgram`），也没有
+# `process_vm_readv`（EAC 在句柄创建时就把 PROCESS_VM_READ 剥掉了，见 `key_win`），
+# 所以进程发现换 `procfs_win`、取钥换 `win_capture`（读裸盘上的 pagefile）。
+# 两条腿共用 `leg`/`collector`/`photon`，口径不分裂。
+if os.name == "nt":                                      # pragma: no cover - 平台分派
+    from . import procfs_win as Proc
+else:
+    from . import procfs as Proc
 
 RETRY_BACKOFF = (5.0, 10.0, 20.0)
 #: 验钥要几个样本（同一个 flow 至少 2 个才够判，40 个是给内存扫描留的余量）。
@@ -60,9 +70,19 @@ class _HelperCapture:
     def __init__(self, leg: "PlayerLeg", sess: HelperSession) -> None:
         self._leg = leg
         self._sess = sess
+        self._port = leg.port
+        self._local_ports: set[int] | None = None
 
     def drain(self, timeout: float = 0.2):
         return capture_linux.drain(self._sess.packet_socket, timeout=timeout)
+
+    def parse(self, raw):
+        """把一帧解析成数据报；`local_ports` 跟着端点刷新走。"""
+        return capture_linux.parse_frame(raw, port=self._port,
+                                        local_ports=self._local_ports)
+
+    def set_local_ports(self, ports) -> None:
+        self._local_ports = ports
 
     def cached_key(self):
         return None
@@ -99,9 +119,21 @@ class _WarmupCapture:
 
     def __init__(self, lease) -> None:
         self._lease = lease
+        # 端口/本端端点由 `_decode` 通过 `set_local_ports` 灌进来；预热器自己有
+        # 一份，但方向判定必须和这条腿用的是同一个值，否则两端都认不出来。
+        self._port = int(getattr(lease, "port", 27002))
+        self._local_ports: set[int] | None = None
 
     def drain(self, timeout: float = 0.2):
         return self._lease.drain(timeout)
+
+    def parse(self, raw):
+        """把一帧解析成数据报；`local_ports` 跟着端点刷新走。"""
+        return capture_linux.parse_frame(raw, port=self._port,
+                                        local_ports=self._local_ports)
+
+    def set_local_ports(self, ports) -> None:
+        self._local_ports = ports
 
     def cached_key(self):
         return self._lease.key
@@ -275,10 +307,10 @@ class PlayerLeg:
                 if self._stop.wait(wait):
                     return
 
-    def _wait_host(self, seconds: float) -> procfs.ProcInfo | None:
+    def _wait_host(self, seconds: float) -> Proc.ProcInfo | None:
         deadline = time.monotonic() + seconds
         while not self._stop.is_set():
-            host = procfs.pick_host(procfs.find_vrchat())
+            host = Proc.pick_host(Proc.find_vrchat())
             if host is not None:
                 return host
             if time.monotonic() >= deadline:
@@ -286,12 +318,20 @@ class PlayerLeg:
             time.sleep(2.0)
         return None
 
-    def _run_once(self, host: procfs.ProcInfo, log_names: dict[str, str]) -> None:
+    def _run_once(self, host: Proc.ProcInfo, log_names: dict[str, str]) -> None:
         """一次完整的「取钥 → 解码」流程（失败抛异常，由外层退避重试）。
 
         有预热器就**借用**它的 socket/密钥/名字表（跳过 pkexec 与 11 秒内存扫描）；
         没有就走原来的「一次性助手」路径。两条路共用 `_decode`，口径不会分裂。
         """
+        if os.name == "nt":                              # pragma: no cover - 平台分派
+            # Windows 没有 pkexec、也没有助手进程：抓包本身不需要提权（npcap），
+            # 只有「读裸盘上的 pagefile」那一步要一次性 UAC；而 key 是进程级的，
+            # 缓存命中后换世界/换房间都不再弹。
+            from . import win_capture
+            with win_capture._WinCapture(self, host) as cap:
+                self._decode(host, log_names, cap)
+            return
         lease = None
         if self.warmup is not None:
             try:
@@ -312,13 +352,14 @@ class PlayerLeg:
                 raise RuntimeError("没有拿到抓包 fd")
             self._decode(host, log_names, _HelperCapture(self, sess))
 
-    def _decode(self, host: procfs.ProcInfo, log_names: dict[str, str], cap) -> None:
+    def _decode(self, host: Proc.ProcInfo, log_names: dict[str, str], cap) -> None:
         report: dict = {}
         # 端点表：游戏自己绑了哪些本地 UDP 端口。它只用来**确认方向归属**
         # （别把同机别的进程、或者自己的上行包算成别人的声音），读不到就退回端口比较。
-        local_ports = procfs.udp_ports(host.pid) or None
+        local_ports = Proc.udp_ports(host.pid) or None
         if local_ports:
             self.on_status("info", f"游戏 UDP 端点：{sorted(local_ports)}")
+        cap.set_local_ports(local_ports)
         gate = world.WorldGate(self.log_dir) if self.log_dir is not None else None
 
         self.on_status("info", "等待游戏流量（先进世界）…")
@@ -332,8 +373,7 @@ class PlayerLeg:
             """把 socket 里的帧读干净：加密包进 samples（前 40 个）与 pre_key 缓冲。"""
             count = 0
             for _ts, raw in cap.drain(timeout):
-                dg = capture_linux.parse_frame(raw, port=self.port,
-                                               local_ports=local_ports)
+                dg = cap.parse(raw)
                 if dg is None or not dg.is_encrypted:
                     continue
                 count += 1
@@ -367,7 +407,7 @@ class PlayerLeg:
         if len(samples) < 2 and cap.cached_key() is None:
             # 把游戏当前连的远端端口带出来：如果它不是 27002，用户一眼就知道
             # 是「端口变了/走了代理」，而不是干看一句"没抓到流量"。
-            remotes = sorted({e.remote_port for e in procfs.udp_endpoints(host.pid)
+            remotes = sorted({e.remote_port for e in Proc.udp_endpoints(host.pid)
                               if e.remote_port})
             hint = f"（游戏当前 UDP 远端端口：{remotes}）" if remotes else ""
             raise RuntimeError("没抓到加密流量（游戏在跑吗？进世界了吗？）" + hint)
@@ -383,6 +423,10 @@ class PlayerLeg:
                 scan_box["fatal"] = exc.fatal
             except Exception as exc:                     # noqa: BLE001 - 原样回主线程
                 scan_box["error"] = f"取钥异常：{type(exc).__name__}: {exc}"
+                # Windows 的 win_capture 抛的是 KeyUnavailable(fatal=...) 而不是
+                # _KeyUnavailable：没管理员权限 / 内存压缩开着这两类重试一万次也一样，
+                # 必须靠这条被判成致命，否则外层只会无限退避重启。
+                scan_box["fatal"] = bool(getattr(exc, "fatal", False))
 
         scanner = threading.Thread(target=_scan, daemon=True, name="vlt-players-scan")
         scanner.start()
@@ -433,8 +477,7 @@ class PlayerLeg:
             next_ports = time.monotonic() + ENDPOINT_REFRESH_S
             while not self._stop.is_set():
                 for _ts, raw in cap.drain(0.2):
-                    dg = capture_linux.parse_frame(raw, port=self.port,
-                                                   local_ports=local_ports)
+                    dg = cap.parse(raw)
                     if dg is None:
                         continue
                     self._ingest(collector, dg, hit)
@@ -444,9 +487,10 @@ class PlayerLeg:
                 now = time.monotonic()
                 if now >= next_ports:
                     next_ports = now + ENDPOINT_REFRESH_S
-                    fresh = procfs.udp_ports(host.pid) or None
+                    fresh = Proc.udp_ports(host.pid) or None
                     if fresh and fresh != local_ports:
                         local_ports = fresh
+                        cap.set_local_ports(local_ports)
                         self.on_status("info", f"游戏 UDP 端点更新：{sorted(fresh)}")
                 # 每 10 秒报一次"到底有没有在解出语音/建会话" —— 这一条能直接区分
                 # 「没人说话」「门限挡住了」「会话没建起来」三种情况。
@@ -491,7 +535,7 @@ class PlayerLeg:
                                f"{reply['scanned_bytes'] / 2**30:.1f} GiB，"
                                f"候选 {candidates}")
 
-    def _ingest(self, collector: VoiceCollector, dg: capture_linux.Datagram, hit) -> None:
+    def _ingest(self, collector: VoiceCollector, dg, hit) -> None:
         """喂一个数据报给采集器；名字表变了才推给界面。
 
         用 `NameTable.version` 比整数，而不是每个包复制一份 dict —— 后者在人多时

@@ -33,6 +33,71 @@ MAX_FRAME_SAMPLES = 5760        # 120ms @ 48k；16k 下更小，留足余量
 _lib = None
 _load_error = ""
 
+# 上游追加的搜索目录（见 `add_search_dir`），优先级高于 `_LIB_NAMES`。
+_EXTRA_DIRS: list[Path] = []
+
+# 候选库名。顺序即优先级：
+# - Linux：`libopus.so.0` 是 `pacman -S opus` 装的那个，PipeWire 的依赖，必然存在；
+# - Windows：系统里通常没有 libopus，但 **VRChat 自带**一份（见 `_vrchat_opus_dirs`），
+#   而且它正好就是解码自己语音的同版本，优先用它比找系统库更稳。
+_LIB_NAMES = (
+    "libopus.so.0", "libopus.so",              # Linux
+    "opus.dll", "libopus-0.dll", "libopus.dll",  # Windows
+)
+
+
+def _vrchat_opus_dirs() -> list[Path]:
+    """可能藏着 VRChat 自带 opus.dll 的目录。
+
+    Windows 系统里通常没有 libopus，但 VRChat 自带一份，而且正好是解自己语音
+    的同版本 —— 优先用它比找系统库更稳。这里只做「尽力而为」的默认猜测：
+    Steam 装在默认位置时能直接命中；装在别的盘（本机就是 `E:\\SteamLibrary`）
+    时由上游用 `add_search_dir()` 注入真实路径。
+    """
+    import os
+    if os.name != "nt":
+        return []
+    roots: list[Path] = []
+    for key in ("ProgramFiles(x86)", "ProgramFiles", "ProgramW6432"):
+        base = os.environ.get(key)
+        if base:
+            roots.append(Path(base) / "Steam" / "steamapps" / "common" / "VRChat")
+    extra = os.environ.get("VLT_VRCHAT_DIR")
+    if extra:
+        roots.append(Path(extra))
+    roots.extend(_EXTRA_DIRS)
+    out: list[Path] = []
+    for root in roots:
+        out.append(root / "VRChat_Data" / "Plugins" / "x86_64")
+        out.append(root)
+    return [p for p in out if p.is_dir()]
+
+
+def add_search_dir(path: str | Path) -> None:
+    """把 VRChat 安装目录（或直接是含 opus.dll 的目录）加入搜索路径。
+
+    幂等；目录不存在就静默忽略。上游拿到 `procfs_win.image_path(vrchat_pid)`
+    之后调它，这样 Steam 装在非默认盘也能找到游戏自带的 opus.dll。
+    """
+    p = Path(path)
+    if p.name.lower() == "opus.dll":
+        p = p.parent
+    if not p.is_dir() or p in _EXTRA_DIRS:
+        return
+    _EXTRA_DIRS.append(p)
+    global _lib, _load_error
+    if _lib is None:
+        _load_error = ""   # 之前「找不到」的结论作废，下次重试
+
+
+def _candidates() -> list[str]:
+    """按优先级给出要试的库名/路径。"""
+    cands: list[str] = []
+    for d in _vrchat_opus_dirs():
+        cands.append(str(d / "opus.dll"))
+    cands.extend(_LIB_NAMES)
+    return cands
+
 
 def _library():
     """惰性加载：没装 opus 的机器只会在这里报一次清楚的错。"""
@@ -40,7 +105,7 @@ def _library():
     if _lib is not None:
         return _lib
     tried: list[str] = []
-    for name in ("libopus.so.0", "libopus.so"):
+    for name in _candidates():
         try:
             lib = ctypes.CDLL(name)
         except OSError as exc:
@@ -70,6 +135,11 @@ def available() -> bool:
         return True
     except RuntimeError:
         return False
+
+
+def load_error() -> str:
+    """上一次加载失败的原因（成功过就是空串）。给报错文案用，方便用户判断缺什么。"""
+    return _load_error
 
 
 def _buf(data: bytes):

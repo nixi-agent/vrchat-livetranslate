@@ -26,6 +26,14 @@ if sys.stdout is None or sys.stderr is None:
     if sys.stderr is None:
         sys.stderr = _fallback
 
+if "--vlt-keyd" in sys.argv[1:]:
+    # Windows 一次性提权取钥子进程：**同一个 exe** 用 `--vlt-keyd` 再启动一次，
+    # 由 UAC 提权后跑 `vlt.players.keyd.main`（见 `vlt/players/keyd.py`）。
+    # 必须在 `--verify-*` 之前拦：既不能进 GUI，也不能被验收脚本吃掉。
+    from vlt.players import keyd as _keyd  # noqa: E402
+
+    raise SystemExit(_keyd.main(sys.argv[sys.argv.index("--vlt-keyd") + 1:]))
+
 if any(a.startswith("--verify-") for a in sys.argv[1:]):
     from vlt.selfcheck import main as _verify_main  # noqa: E402
 

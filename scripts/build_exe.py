@@ -90,7 +90,13 @@ EXCLUDE_WIN = [
     "vlt.platform.x11",        # 原生 ARGB 桌面叠加窗（libX11）
     "vlt.output.openxr_overlay",
     "vlt.output.micproxy_linux",   # Linux 麦克风代理（pw-cat 管道 + 运行时声明虚拟麦）
-    "vlt.players",             # 分玩家语音：/proc 扫描 + process_vm_readv + AF_PACKET（仅 Linux）
+    # 分玩家语音：两个平台都支持，只有下面这两个「助手/内存扫描」实现是
+    # Linux 独占（都直接绑 libc：`process_vm_readv` / pkexec 助手）。
+    # 其余子模块必须收进 Windows 产物 —— `leg.py` 硬 import `helper`（→
+    # `capture_linux`），断掉这条链路会让整个分玩家腿起不来；Windows 侧是
+    # `dgram`(npcap) + `key_win`(裸盘 pagefile) 顶上原来的 AF_PACKET/读内存。
+    "vlt.players.key_linux",
+    "vlt.players.priv_helper",
     "xr",                      # pyopenxr
 ]
 

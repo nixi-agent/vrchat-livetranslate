@@ -30,12 +30,48 @@
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Callable
 
 from . import capture_linux, gcm, guard, names, pending, photon, procfs
 from ..players_settings import PREWARM_AUTO, PlayersSettings
+
+_WIN = os.name == "nt"
+
+if _WIN:                                             # pragma: no cover - 平台分派
+    from . import procfs_win, win_capture
+
+    def _pick_host() -> object | None:
+        """Windows：进程发现走 `procfs_win`（`procfs` 读的是 `/proc`）。"""
+        return procfs_win.pick_host(procfs_win.find_vrchat())
+
+    def _udp_ports(pid: int) -> set[int]:
+        from . import dgram
+
+        return dgram.local_udp_ports() or set()
+
+    def _assess() -> object:
+        """Windows 的闸门判断没有 Linux 那套内核证据可查。
+
+        EAC 在 Windows 上用 `ObRegisterCallbacks` 剥 `PROCESS_VM_READ`，但本实现
+        **不读游戏内存**（读裸盘上的 pagefile），所以这里恒判 legacy，不阻塞。
+        """
+        return guard.Verdict(
+            level="legacy",
+            reasons=("Windows：EAC 拦截的是读游戏内存，本实现只读 pagefile 的原始扇区",),
+            advice="只读、不 attach、不注入；换世界不重扫，只有游戏重启才再弹一次 UAC。",
+        )
+
+    def _default_drain(cap, *, timeout: float = 0.2):
+        return cap.drain(timeout=timeout)
+
+else:
+    _pick_host = lambda: procfs.pick_host(procfs.find_vrchat())   # noqa: E731
+    _udp_ports = procfs.udp_ports
+    _assess = lambda: guard.assess(guard.collect())              # noqa: E731
+    _default_drain = capture_linux.drain
 
 PHASE_OFF = "off"
 PHASE_WAITING = "waiting_game"          # 没有 VRChat 进程
@@ -51,6 +87,25 @@ VOICE_REPLAY_S = 5.0
 POLL_S = 2.0
 DRAIN_S = 0.25
 LOCAL_PORTS_REFRESH_S = 5.0
+WIN_SAMPLE_TIMEOUT = 20.0          # Windows：等第一批加密包当样本的上限
+
+
+class _WinBootstrap:
+    """Windows 版 bootstrap 的返回值（对位 `helper.Bootstrap`）。
+
+    `socket` 槽位放的是 `win_capture._WinCapture` —— 它自己就是「抓包句柄」，
+    `drain/close/acquire_key/set_local_ports` 都由它提供，所以预热器的其余代码
+    不需要知道 Linux 那边的裸 fd 概念。密钥这一步**不在这里做**：交给
+    `ensure_key()` 走统一路径（缓存命中/扫盘都在那儿）。
+    """
+
+    def __init__(self, cap, samples: list, packets: list) -> None:
+        self.socket = cap
+        self.samples = samples
+        self.packets = packets
+        self.key = None
+        self.blocked = False
+        self.detail = ""
 
 
 class WarmupLease:
@@ -109,13 +164,13 @@ class PlayerWarmup:
         self.settings = settings
         self._port = port
         self._on_status = on_status or (lambda *_a: None)
-        self._find_host = find_host or (lambda: procfs.pick_host(procfs.find_vrchat()))
+        self._find_host = find_host or _pick_host
         self._bootstrap = bootstrap or self._default_bootstrap
         # 下面两个只用于「密钥失效后的重扫」（那时 socket 已经在本进程里）
         self._open_capture = open_capture or self._default_open
         self._scan = scan or self._default_scan
-        self._guard = guard_check or (lambda: guard.assess(guard.collect()))
-        self._drain_fn = drain_fn or capture_linux.drain
+        self._guard = guard_check or _assess
+        self._drain_fn = drain_fn or _default_drain
         self._poll_s = max(0.02, float(poll_s))
 
         self._lock = threading.RLock()          # socket 读 + 租借状态
@@ -446,14 +501,23 @@ class PlayerWarmup:
             return
         self._ports_at = now
         try:
-            self._local_ports = procfs.udp_ports(host.pid) or None
+            self._local_ports = _udp_ports(host.pid) or None
         except OSError:
             self._local_ports = None
+        if _WIN and self._local_ports:
+            # Windows 的方向判定要喂给 cap（UU 下两端都不是 27002）
+            cap = self._socket
+            if cap is not None:
+                try:
+                    cap.set_local_ports(self._local_ports)
+                except Exception:                          # noqa: BLE001 - 端口刷新不该拖垮抓包
+                    pass
 
     def _process(self, frames: list[tuple[float, bytes]]) -> None:
         for ts, raw in frames:
-            dg = capture_linux.parse_frame(raw, port=self._port,
-                                           local_ports=self._local_ports)
+            # Windows 的 drain 已经拆好包（返回 Datagram），Linux 返回裸帧要自己解
+            dg = raw if _WIN else capture_linux.parse_frame(
+                raw, port=self._port, local_ports=self._local_ports)
             if dg is None or not dg.is_encrypted:
                 continue
             self.packets += 1
@@ -531,15 +595,65 @@ class PlayerWarmup:
             pass
 
     # ------------------------------------------------------------ 默认实现
+    #
+    # Linux：走 `helper` 助手（pkexec 提权 + process_vm_readv 扫内存）。
+    # Windows：抓包本身不要提权（npcap），只有「读裸盘上的 pagefile」那一步要一次性
+    # UAC；`win_capture._WinCapture` 把「抓包 + 采样 + 取钥」三件事包在同一个对象上，
+    # 所以这里三个入口都围绕它转，`self._socket` 槽位直接放这个 cap 对象。
+
+    def _win_capture(self, host: procfs.ProcInfo):
+        """Windows 的 cap 对象；`leg` 需要 `port` 与 `on_status` 两个属性当 leg 用。"""
+        return win_capture._WinCapture(self, host)
 
     def _default_bootstrap(self, host: procfs.ProcInfo):
-        from . import helper
-        return helper.bootstrap(host, port=self._port)
+        if not _WIN:
+            from . import helper
+            return helper.bootstrap(host, port=self._port)
+        cap = self._open_capture(host)
+        ports = _udp_ports(int(getattr(host, "pid", 0) or 0))
+        if ports:
+            cap.set_local_ports(ports)
+        # 先收一批加密包当样本（样本同时用于「取钥」和「验缓存」）。
+        samples: list[tuple[object, bytes]] = []
+        packets: list[object] = []
+        deadline = time.monotonic() + WIN_SAMPLE_TIMEOUT
+        while (self._samples_needed(samples, packets)
+               and time.monotonic() < deadline and not self._stop.is_set()):
+            for _ts, dg in self._drain_fn(cap, timeout=0.2) or ():
+                if not getattr(dg, "is_encrypted", False):
+                    continue
+                if len(packets) < 4096:
+                    packets.append(dg)
+                if len(samples) < SAMPLE_TARGET:
+                    samples.append((gcm.Flow.of(dg.src, dg.dst), dg.payload))
+            if len(samples) < 2:
+                time.sleep(0.05)
+        return _WinBootstrap(cap, samples, packets)
 
     def _default_open(self, host: procfs.ProcInfo):
-        from . import helper
-        return helper.open_capture_once(host, port=self._port)
+        if not _WIN:
+            from . import helper
+            return helper.open_capture_once(host, port=self._port)
+        return self._win_capture(host)
 
     def _default_scan(self, host: procfs.ProcInfo, needle: str) -> dict:
-        from . import helper
-        return helper.scan_once(host, needle=needle, port=self._port)
+        if not _WIN:
+            from . import helper
+            return helper.scan_once(host, needle=needle, port=self._port)
+        # Windows 没有 needle 之分（不读内存，扫的是 pagefile），一次就出结果。
+        cap = self._socket
+        if cap is None:
+            return {"ok": False, "error": "抓包还没起来"}
+        try:
+            hit = cap.acquire_key(list(self._samples))
+        except win_capture.KeyUnavailable as exc:
+            if getattr(exc, "fatal", False):
+                # 没管理员权限 / 内存压缩开着：重试一万次也一样，判成致命
+                self._auth_failed = True
+                return {"ok": False, "blocked": True, "error": str(exc)}
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "candidates": [hit.key.hex()]}
+
+    @staticmethod
+    def _samples_needed(samples: list, packets: list) -> bool:
+        return len(samples) < SAMPLE_TARGET or len(packets) < 2

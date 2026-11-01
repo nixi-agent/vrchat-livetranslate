@@ -25,6 +25,7 @@
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 HEADER_LEN = 19          # peerID(2) + 0x01(1) + challenge(4) + nonce(12)
@@ -82,11 +83,19 @@ def key_fingerprint(key: bytes) -> str:
 
 
 def _aesgcm(key: bytes):
-    """延迟导入：`cryptography` 是**可选依赖**（见 requirements-players.txt）。
+    """返回一个只有 `decrypt(nonce, data, aad)` 的 AEAD。
 
-    不在模块顶层导入的理由：现有用户装的是 requirements-linux.txt，不该因为一个
-    默认关闭的实验功能而多装一个带编译产物的包。
+    后端分派：Windows 用系统自带的 CNG（`bcrypt.dll`，零新依赖，见 `gcm_win.Aead`），
+    其它平台用 `cryptography`（**可选依赖**，见 requirements-players.txt）。
+
+    为什么都延迟导入：`cryptography` 带编译产物，现有 Linux 用户装的是
+    requirements-linux.txt，不该因为一个默认关闭的实验功能而多装它；而
+    `gcm_win` 里的 `WinDLL("bcrypt")` 在非 Windows 上会 OSError，也必须延迟。
     """
+    if os.name == "nt":                              # pragma: no cover - 平台分派
+        from . import gcm_win
+        if gcm_win.available():
+            return gcm_win.Aead(key)
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     except ImportError as exc:                       # pragma: no cover - 环境问题

@@ -648,10 +648,12 @@ def latest_output_log(directory: str | Path) -> Path | None:
     return max(logs, key=lambda p: p.stat().st_mtime) if logs else None
 
 
-#: VRChat 的日志目录候选（Steam AppID 438100）。前两个覆盖 Linux 原生与 Proton，
-#: 后面两个是 Steam 装在别处 / Flatpak 的情况。取**第一个存在的**，都不存在时
-#: 返回第一个候选（好让状态栏能说出「我去哪儿找过」）。
+#: VRChat 的日志目录候选（Steam AppID 438100）。第一条是 Windows 原生位置
+#: （`%USERPROFILE%\AppData\LocalLow\VRChat\VRChat`，Unity 写的后台日志就在这儿），
+#: 其后覆盖 Linux 原生与 Proton，最后是 Steam 装在别处 / Flatpak 的情况。取**第一
+#: 个存在的**，都不存在时返回第一个候选（好让状态栏能说出「我去哪儿找过」）。
 LOG_DIR_CANDIDATES = (
+    "~/AppData/LocalLow/VRChat/VRChat",
     "~/.local/share/VRChat/VRChat",
     "~/.steam/steam/steamapps/compatdata/438100/pfx/drive_c/users/steamuser"
     "/AppData/LocalLow/VRChat/VRChat",

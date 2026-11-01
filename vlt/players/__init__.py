@@ -1,4 +1,4 @@
-"""分玩家语音（**实验性**，Linux 专用，默认关闭）。
+"""分玩家语音（**实验性**，Linux / Windows 双平台，默认关闭）。
 
 ## 这个包要解决什么
 
@@ -13,8 +13,13 @@ VRChat 的应用流）拿到的是**混音**：既分不出是谁，也没法按
   `TracerPid` 变成非 0，那是 EAC 类模块明确会读的字段）。
 - 游戏内存的读取**只发生在** `process_vm_readv`，且由一个**用完即退**的提权助手
   执行；主程序全程普通用户，**永远拿不到原始内存**，只拿到几十个 32 字节候选。
+  Windows 上没有这条路径（EAC 在句柄创建时就剥掉 `PROCESS_VM_READ`，`SYSTEM` 令牌、
+  镜像名伪装、句柄竞速/窃取全试过都不行）：改成**只读裸盘上 pagefile 的那一小段**
+  （`pagefile.py` + `key_win.py`），只在开扫那一刻要一次管理员权限，key 是进程级的
+  （换世界/换房间不换），所以一次 UAC 之后整个游戏生命周期都不再弹；同样不 attach、
+  不注入、不写游戏进程。
 - 只读。代码里不存在任何写游戏内存的路径（`tests/test_players_safety.py` 用
-  AST 扫描钉住这一条）。
+  AST 扫描钉住这一条）；Windows 侧也**只** `ReadFile` 物理盘，不写。
 - 音频不落盘（`docs/分玩家语音.md` 写明唯一例外是人工确认用的一次性 dump）。
 
 ## 为什么默认关闭
@@ -41,9 +46,23 @@ VRChat 的应用流）拿到的是**混音**：既分不出是谁，也没法按
 | `positions.py` | 位置（Event 12）→ 距离；支持 `order`/`gate` 两种用法 |
 | `router.py` | 每玩家一条翻译会话（共享 RPM 预算、LRU/距离淘汰） |
 | `leg.py` | 分玩家腿：抓包→取钥→解码→路由器（GUI 用它） |
-| `helper.py` / `priv_helper.py` | 提权助手的两半：客户端会话 / 助手本体 |
+| `helper.py` / `priv_helper.py` | 提权助手的两半：客户端会话 / 助手本体（**Linux 独占**） |
 | `payload.py` | 把助手拼成自包含脚本，经 stdin 交给 `pkexec python3 -`（AppImage 用） |
-| `opus.py` | libopus ctypes：解码到 16 kHz 单声道、帧自校验、wav 落盘 |
+| `opus.py` | libopus ctypes：解码到 16 kHz 单声道、帧自校验、wav 落盘（Windows 用游戏自带的 `opus.dll`） |
+
+### Windows 侧新增（与上面逐项对位，接口同形）
+
+| 模块 | 职责 |
+|---|---|
+| `procfs_win.py` | Toolhelp32 + `GetExtendedUdpTable`：`find_vrchat`（**按 exe 名**，EAC 拒绝模块快照）/`pick_host`/`udp_ports`/`image_path` |
+| `dgram.py` | npcap（`wpcap.dll` via ctypes）：抓包 + 以太网/IP/UDP 解析 + pcap + **加速器头自适应剥离**（UU 下行 10 / 上行 12 字节，靠 GCM 认证兜底） |
+| `pagefile.py` | NTFS 只读：`\\.\PhysicalDrive0` 裸盘 + boot sector + MFT + `$ATTRIBUTE_LIST`，定位 `pagefile.sys` 的物理段 |
+| `gcm_win.py` | CNG（`bcrypt.dll`）AES-256-GCM：`GcmAuth` 批量验钥 + `Aead`（`gcm._aesgcm` 的后端） |
+| `key_win.py` | 驱逐脏页（`NtSetSystemInformation` flush + `EmptyWorkingSet`）→ 扫 pagefile 找 `byte[32]` → GCM 认证；`SessionCache` 按 `Identity(pid, created)` 缓存 |
+| `win_capture.py` | 把上面几件拼成 `_HelperCapture` 那九个方法（`drain`/`parse`/`acquire_key`…），`leg.py` 直接换腿 |
+
+⚠️ **Windows 必须关掉内存压缩**（`Disable-MMAgent -MemoryCompression` + 重启）：开着时
+压缩存储会把脏页回写成 XPRESS 压缩块，明文 key 不在 pagefile 里，实测 9,109 个候选全败。
 
 入口与工具：
 
@@ -51,13 +70,16 @@ VRChat 的应用流）拿到的是**混音**：既分不出是谁，也没法按
 |---|---|
 | `scripts/probe_player_audio.py` | `env`（零风险）/ `run`（P0-b：取钥 + 解码） |
 | `scripts/vlt_priv_helper.py` | 一次性提权助手（开包 socket + 扫候选，然后退出） |
-| `requirements-players.txt` | 只给这个功能的额外依赖（`cryptography`） |
+| `requirements-players.txt` | 只给这个功能的额外依赖（`cryptography`，**Linux 用**；Windows 走系统 CNG，零依赖） |
 
 安装（仓库统一用 uv，与 `setup.sh` 同口径）：
 
 ```
 uv pip install --python .venv/bin/python -r requirements-players.txt
 ```
+
+Windows 不需要额外依赖：`vlt/players/` 全链路只用 ctypes + stdlib（opus 用游戏自带
+的 `opus.dll`，GCM 用系统 `bcrypt.dll`，抓包用已装的 npcap）。
 """
 
 

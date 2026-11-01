@@ -29,7 +29,12 @@ class VoiceCollector:
         from vlt.players import opus  # 延迟导入
 
         if not opus.available():
-            raise RuntimeError("找不到 libopus（libopus.so.0）")
+            detail = opus.load_error()
+            raise RuntimeError(
+                "找不到 libopus（Linux 装 opus 包；Windows 用 VRChat 自带的 opus.dll，"
+                "路径会由 win_capture 自动加进搜索目录）"
+                + (f"：{detail}" if detail else "")
+            )
         self.opus = opus
         self.report = report
         self.decoder = opus.Decoder()

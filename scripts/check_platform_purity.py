@@ -70,7 +70,11 @@ FORBIDDEN: dict[str, dict[str, list[str]]] = {
             "vlt.platform.x11",            # 原生 ARGB 桌面叠加窗（libX11）
             "vlt.output.openxr_overlay",   # 自建 OpenXR 手腕屏（pyopenxr + EGL/Wayland）
             "vlt.output.micproxy_linux",   # Linux 麦克风代理（pw-cat 管道 + 运行时声明虚拟麦）
-            "vlt.players",                 # 分玩家语音（/proc + process_vm_readv + AF_PACKET，仅 Linux）
+            # 分玩家语音：两个平台都支持。只有这两个直接绑 libc 的
+            # （`process_vm_readv` / pkexec 助手）是 Linux 独占；`leg.py` 硬
+            # import `helper` → `capture_linux`，那两个必须留在 Windows 产物里。
+            "vlt.players.key_linux",
+            "vlt.players.priv_helper",
             "xr",                          # pyopenxr 本体
         ],
         "strings": [

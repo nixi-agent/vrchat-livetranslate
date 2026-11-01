@@ -80,12 +80,16 @@ session:
 #   Windows → WASAPI 设备的名字（如 "Steam Streaming Speakers (loopback)"）
 #   Linux   → PipeWire 输出节点的 description（如 "REDMI 电脑音箱 2 Pro 模拟立体声"）
 players:
-  # 分玩家语音（**实验性，仅 Linux，默认关**）：把每位玩家的语音单独解出来翻译，
+  # 分玩家语音（**实验性，Linux + Windows，默认关**）：把每位玩家的语音单独解出来翻译，
   # 字幕上能看出「谁说的 / 原文 / 译文」。
-  # ⚠️ 要读游戏进程内存（ToS 灰区、EOS/Steam 反作弊灰区），作者不保证账号安全；
+  # ⚠️ Linux 读游戏进程内存、Windows 读页面文件所在的原始磁盘扇区
+  #    （ToS 灰区、EOS/Steam 反作弊灰区），作者不保证账号安全；
   #    默认 off，建议先用小号验证。开启后它会**替换**「别人说」那条混音腿。
   # off      = 关（默认）
-  # decrypt  = 抓 Photon 解密 → 每人一条翻译会话（需要 pkexec 授权一次）
+  # decrypt  = 抓 Photon 解密 → 每人一条翻译会话
+  #            Linux：pkexec 授权一次（助手读 process_vm_readv）
+  #            Windows：UAC 一次（提权子进程读裸盘 pagefile；密钥是进程级的，
+  #                     换世界不重扫，只有游戏重启才再弹）
   mode: off
   # 预热：检测到 VRChat 进程就抓包 + 取一次密钥，之后**未开始翻译也持续记录玩家名**
   # （只解名字、不解码语音）。点开始翻译时直接复用 socket/密钥，省掉授权与 11 秒扫描；

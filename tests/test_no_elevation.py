@@ -29,6 +29,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+if os.name != "nt":
+    # `keyd` → `key_win` → `gcm_win` 在导入期就要 `ctypes.WinDLL("bcrypt")`，
+    # 在 Linux 上根本没有这个符号（`AttributeError`）。这条链路是 Windows 独占的，
+    # 非 Windows 直接跳过，别让 CI 的 Linux job 因导入崩掉。
+    print("SKIP test_no_elevation 仅 Windows（keyd/gcm_win 依赖 bcrypt）")
+    raise SystemExit(0)
+
 from vlt.players import keyd  # noqa: E402
 
 

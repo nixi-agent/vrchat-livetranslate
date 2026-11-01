@@ -11,6 +11,11 @@
 
 本文件钉住：控件级守卫接住滚轮后，值不变、配置文件一个字节都不变。
 
+⚠️ 滚轮要按**平台真实写法**派发才有判别力：Tk 9 的 X11 只派发 `<MouseWheel>` + delta，
+`<Button-4>/<Button-5>` 在这些 class 绑定上根本不会改值（Windows 也只有 `<MouseWheel>`）。
+早先只测 `<Button-5>` → 在未修复的 base 上同样全绿（假绿）。现在四种写法都派发，
+并留一条对照组证明「没守卫的裸 Combobox 确实会被滚轮改值」，防止用例空转。
+
 跑法：xvfb-run -a .venv/bin/python tests/test_settings_wheel.py
 """
 from __future__ import annotations
@@ -41,9 +46,28 @@ _level_probe.open_level_source = (  # type: ignore[assignment]
         RuntimeError("测试进程：不打开真实电平采集")))
 
 
-def _wheel(widget, seq: str = "<Button-5>") -> None:
+def _wheel(widget, seq: str = "<MouseWheel>", **kw) -> None:
     """同步派发一次滚轮事件（`when="now"`：不传的话 Tk 会排队，断言就跑在派发前）。"""
-    widget.event_generate(seq, x=6, y=6, when="now")
+    widget.event_generate(seq, x=6, y=6, when="now", **kw)
+
+
+#: 滚轮的四种写法。**只测 `<Button-5>` 等于什么都没测**：Tk 9 的 X11 只派发
+#: `<MouseWheel>` + delta，`<Button-4>/<Button-5>` 在这套 class 绑定上根本不改值
+#: （实测：未加守卫的裸 Combobox 收到 `<Button-5>` 值不变，收到 `<MouseWheel>`
+#: + delta 才改）。Windows 也只有 `<MouseWheel>`。故真实判别力来自 MouseWheel 两条。
+_WHEELS = (
+    ("<MouseWheel>", {"delta": -120}),      # 下滚（Windows / Tk 9 X11 的真实事件）
+    ("<MouseWheel>", {"delta": 120}),       # 上滚
+    ("<Button-4>", {}),                     # 老 X11 上滚
+    ("<Button-5>", {}),                     # 老 X11 下滚
+)
+
+
+def _wheel_all(widget) -> list[str]:
+    """把四种滚轮写法依次派发一遍，返回本次真正派发过的写法（给断言/日志用）。"""
+    for seq, kw in _WHEELS:
+        _wheel(widget, seq, **kw)
+    return [f"{seq}{kw or ''}" for seq, kw in _WHEELS]
 
 
 def _close(gui) -> None:  # noqa: ANN001
@@ -70,13 +94,13 @@ def test_settings_combo_wheel_does_not_change_value() -> bool:
         before_value = combo.get()
         before_cfg = CONFIG.read_bytes()
 
-        _wheel(combo)
+        sent = _wheel_all(combo)
         gui._root.update()
 
         assert combo.get() == before_value, (
-            f"滚轮改了下拉框的值：{before_value!r} → {combo.get()!r}")
+            f"滚轮改了下拉框的值：{before_value!r} → {combo.get()!r}（派发过 {sent}）")
         assert CONFIG.read_bytes() == before_cfg, "滚轮滑过下拉框竟然写了配置文件"
-        print(f"  ✓ 下拉框滚轮不改值/不落盘（保持 {before_value!r}）")
+        print(f"  ✓ 下拉框滚轮不改值/不落盘（保持 {before_value!r}；{len(sent)} 种滚轮写法）")
         return True
     finally:
         _close(gui)
@@ -95,22 +119,51 @@ def test_settings_spinbox_wheel_does_not_change_value() -> bool:
         before_value = var.get()
         before_cfg = CONFIG.read_bytes()
 
-        _wheel(spin)
+        sent = _wheel_all(spin)
         gui._root.update()
 
         assert var.get() == before_value, (
-            f"滚轮改了数字框的值：{before_value!r} → {var.get()!r}")
+            f"滚轮改了数字框的值：{before_value!r} → {var.get()!r}（派发过 {sent}）")
         assert CONFIG.read_bytes() == before_cfg, "滚轮滑过数字框竟然写了配置文件"
-        print(f"  ✓ 数字框滚轮不改值/不落盘（保持 {before_value!r}）")
+        print(f"  ✓ 数字框滚轮不改值/不落盘（保持 {before_value!r}；{len(sent)} 种滚轮写法）")
         return True
     finally:
         _close(gui)
+
+
+def test_unguarded_widget_would_change_so_the_guard_is_meaningful() -> bool:
+    """对照组：**不加守卫**的裸 `ttk.Combobox` 会被 `<MouseWheel>` 改值。
+
+    这条是前两条的「不是空转」证明：如果哪天 Tk 不再因滚轮改值，守卫用例会变成
+    永远绿的摆设，这里先把它照出来。平台确实不给 delta 时不判失败，只打印提示。
+    """
+    import tkinter as tk
+    from tkinter import ttk
+
+    root = tk.Tk()
+    try:
+        var = tk.StringVar(value="b")
+        cb = ttk.Combobox(root, textvariable=var, state="readonly",
+                          values=["a", "b", "c"])
+        cb.pack()
+        root.update()
+        _wheel(cb, "<MouseWheel>", delta=-120)
+        root.update()
+        if var.get() == "b":
+            print("  ⚠️ 本平台 <MouseWheel> 不改裸下拉框的值 → 守卫用例在此平台无判别力")
+            return True
+        assert var.get() == "c", f"对照组行为异常：b → {var.get()!r}"
+        print("  ✓ 对照组：裸下拉框会被 <MouseWheel> 改值（守卫用例有判别力）")
+        return True
+    finally:
+        root.destroy()
 
 
 def main() -> int:
     tests = [
         test_settings_combo_wheel_does_not_change_value,
         test_settings_spinbox_wheel_does_not_change_value,
+        test_unguarded_widget_would_change_so_the_guard_is_meaningful,
     ]
     print("test_settings_wheel:")
     failed = 0

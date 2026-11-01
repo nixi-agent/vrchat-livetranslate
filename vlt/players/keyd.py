@@ -54,6 +54,7 @@ import argparse
 import base64
 import ctypes
 import json
+import os
 import secrets
 import socket
 import sys
@@ -79,6 +80,11 @@ DEFAULT_LIFETIME = 240.0
 ACCEPT_TIMEOUT = 90.0
 # 子进程连回主程序的超时：提权进程从 ShellExecute 到解释器就绪一般 < 3 s。
 CONNECT_TIMEOUT = 15.0
+#: 无人值守开关：置 1 时绝不拉起提权子进程，直接报「需要管理员」。
+#: 自动化测试 / CI / 人不在电脑前时用它 —— 否则 `ShellExecuteW` 会弹 UAC，
+#: 没人点就把整条流水线吊到 `ACCEPT_TIMEOUT` 才失败。产品正常运行不设它。
+NO_ELEVATE_ENV = "VLT_NO_ELEVATE"
+_YES = ("1", "true", "yes", "on")
 
 FROZEN = bool(getattr(sys, "frozen", False))
 
@@ -101,6 +107,15 @@ def is_admin() -> bool:
         return bool(shl.IsUserAnAdmin())
     except OSError:
         return False
+
+
+def elevation_blocked() -> bool:
+    """环境是否要求「别提权」（`VLT_NO_ELEVATE=1`）。
+
+    只读环境变量，不碰系统状态：自动化路径靠它避开 UAC 弹窗，而正常使用不受影响。
+    """
+    raw = os.environ.get(NO_ELEVATE_ENV, "")
+    return raw.strip().lower() in _YES
 
 
 def _shell_execute(operation: str, file: str, params: str, cwd: str,
@@ -186,6 +201,12 @@ def run_scan(*, pid: int, created: int, samples, hint_mft: int = 0,
     返回值形如 `{"ok": True, "key": "<hex>", "flow_peer": …, "flow_chal": …, …}`
     或 `{"ok": False, "error": …, "fatal": True}`。
     """
+    # 唯一的提权出口：设了 `VLT_NO_ELEVATE` 就绝不调 `ShellExecuteW`。
+    # 抛 `KeyDenied`（而不是别的异常）好让 `win_capture` 走既有的优雅降级分支。
+    if not is_admin() and elevation_blocked():
+        raise KeyDenied(
+            f"已设置 {NO_ELEVATE_ENV}，跳过自动提权（读 pagefile 需要管理员）。"
+            " 需要取钥时去掉这个环境变量，或在管理员终端里直接跑。")
     token = secrets.token_hex(16)
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

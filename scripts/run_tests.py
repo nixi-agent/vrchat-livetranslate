@@ -106,6 +106,20 @@ def tkinter_available() -> bool:
     return True
 
 
+def child_env() -> dict[str, str]:
+    """给用例进程的环境：默认禁掉自动提权。
+
+    Windows 端取钥要读裸盘，正常路径会 `ShellExecuteW("runas", ...)` 弹 UAC。跑测试时
+    没人点那个弹窗（用户原话：「很多时候在测试的时候我是点不了的因为我不在电脑面前」），
+    一旦有用例走到取钥就会吊满 90 s 才失败。所以这里默认注入 `VLT_NO_ELEVATE=1`，
+    让 `vlt/players/keyd.py` 直接短路报「需要管理员」；真需要提权验证时由调用者显式
+    覆盖这个变量，本函数不覆盖已有的值。
+    """
+    env = dict(os.environ)
+    env.setdefault("VLT_NO_ELEVATE", "1")
+    return env
+
+
 def tk_gui_tests(exe: str | None = None) -> set[str]:
     """「传递依赖 tkinter」的用例名单（POSIX 相对路径），供无 tkinter 时跳过。
 
@@ -303,7 +317,8 @@ def main(argv: list[str] | None = None) -> int:
             ann.notice(f"{rel} 已跳过（当前解释器无 tkinter）")
             continue
         ann.group(rel)
-        proc = subprocess.run(build_cmd(test, args.coverage, use_xvfb, screen), cwd=ROOT)
+        proc = subprocess.run(build_cmd(test, args.coverage, use_xvfb, screen),
+                              cwd=ROOT, env=child_env())
         ann.endgroup()
         if proc.returncode == 0:
             n_pass += 1

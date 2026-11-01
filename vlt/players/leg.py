@@ -498,6 +498,9 @@ class PlayerLeg:
                     next_stat = time.monotonic() + 10.0
                     stats = self.router.stats() if self.router is not None else {}
                     known = len(collector.names)
+                    evict_note = (
+                        f" / 按距离换人 {stats.get('distance_evictions', 0)}"
+                        if stats.get("distance_mode", "off") != "off" else "")
                     self.on_status(
                         "info",
                         f"解码：音频消息 {sum(collector.audio_hits.values())}，"
@@ -508,7 +511,8 @@ class PlayerLeg:
                         f" / 失败 {stats.get('create_failures', 0)}"
                         f" / 预算排队 {stats.get('budget_waits', 0)}"
                         f" / 排队 {stats.get('queued', 0)}"
-                        f" / 溢出丢弃 {stats.get('overflow_dropped', 0)}），"
+                        f" / 溢出丢弃 {stats.get('overflow_dropped', 0)}"
+                        f"{evict_note}），"
                         f"已发块 {stats.get('sent_chunks', 0)}，"
                         f"文本 {stats.get('text_events', 0)}，名字 {known}，"
                         f"换世界 {collector.world_changes}，"

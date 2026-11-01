@@ -28,9 +28,9 @@
 现在：
 
 * 名额**只算真实会话**，排队中的建连不占名额；
-* 只有「有空位」或「存在 >15s 没音频的空闲会话」才建；全都还在说话就**不踢人**，
-  新人的音频丢弃并按 30s 频率警告（`overflow_dropped`）——宁可不翻译一个人，
-  也不要把正在说话的三个人一起打断；
+* 只有「有空位」「存在 >15s 没音频的空闲会话」或（`order` 模式）「新来者比正在
+  说话的最远者更近」才建；否则新人的音频丢弃并按 30s 频率警告（`overflow_dropped`）
+  ——宁可不翻译一个人，也不要把正在说话的三个人一起打断；
 * 愿望清单按最近说话时间排序，3s 没再说话自动作废；拿到预算后**二次确认**
   他还在说，否则放弃这次建连（不白烧一次连接）；
 * 排队期间保留最近 **2 秒**音频，会话一就绪立刻补发（句首不丢）。
@@ -213,6 +213,7 @@ class PlayerRouter:
         self.silence_chunks = 0
         self.text_events = 0
         self.distance_dropped = 0
+        self.distance_evictions = 0     # 全都在说话时，按距离让位换人的次数
         # 诊断：建连次数 / 失败次数 / 溢出丢弃块数（状态栏与 stats 用）
         self.sessions_created = 0
         self.create_failures = 0
@@ -412,8 +413,9 @@ class PlayerRouter:
             self._warn_distance(actor, now)
             self._drop_wish(actor)
             return
-        if not await self._ensure_room(actor, now):
-            self._warn_overflow(actor, now)
+        blocked = await self._ensure_room(actor, now)
+        if blocked:
+            self._warn_overflow(actor, now, blocked)
             return
 
         self._busy = True
@@ -471,25 +473,55 @@ class PlayerRouter:
         if pre:
             await self._send(actor, st, list(pre))
 
-    async def _ensure_room(self, actor: int, now: float) -> bool:
-        """判断/腾出一个名额。腾不了返回 False（调用方按"溢出"处理）。"""
+    async def _ensure_room(self, actor: int, now: float) -> str | None:
+        """判断/腾出一个名额。
+
+        返回 ``None`` 表示名额已腾出（或本来就有空位）；否则返回被挡下的原因
+        （``"busy"``：全都在说话且没有距离依据；``"distance"``：按距离轮不到他），
+        调用方据此给出不同的状态提示。
+
+        * `off`：只回收**空闲**（>15s 没音频）的人 —— 正在说话的人绝不打断；
+        * `order`：先回收空闲的人（省连接，与距离无关，新来者距离未知也照踢）；
+          **全都在说话**时才按距离排序，新来者严格更近才让最远的那条让位。
+          距离未知不猜：既不当作「更近」去踢人，也不当作「更远」被踢。
+        """
         if len(self.sessions) < self.max_sessions:
-            return True
+            return None
         idle = [a for a, st in self.sessions.items()
                 if now - max(st.last_audio, st.last_text or 0.0) > HOT_SILENCE_S]
-        if not idle:
-            return False                     # 全都在说话：不踢人，宁可暂时不翻
         if "order" in self.distance_mode:
-            victim = max(idle, key=lambda a: (self.distance_of(a) or 0.0,
-                                              -self.sessions[a].last_audio))
             new_d = self.distance_of(actor)
-            far_d = self.distance_of(victim) or 0.0
-            if new_d is not None and new_d + DISTANCE_HYSTERESIS_M >= far_d:
-                return False                 # 不比被踢的近，不值得换人
+            if idle:
+                # 空闲会话不产生价值（只在烧连接），回收它不需要距离理由。
+                victim = max(idle, key=lambda a: (self.distance_of(a) or 0.0,
+                                                  -self.sessions[a].last_audio))
+                far_d = self.distance_of(victim) or 0.0
+                if new_d is not None and new_d + DISTANCE_HYSTERESIS_M >= far_d:
+                    return "distance"            # 不比空闲者近，不值得换人
+                reason = f"名额已满，回收空闲的 {self.label_of(victim)}"
+            else:
+                # 全都在说话：只有「确实更近」才值得打断一个正在说话的人。
+                if new_d is None:
+                    return "distance"            # 距离未知：不能凭猜踢人
+                known = [(d, a) for a in self.sessions
+                         if (d := self.distance_of(a)) is not None]
+                if not known:
+                    return "distance"            # 全员距离未知：没有排序依据
+                far_d, victim = max(known, key=lambda t: (t[0],
+                                                          -self.sessions[t[1]].last_audio))
+                if new_d >= far_d:
+                    return "distance"            # 不比最远者近，不值得打断
+                self.distance_evictions += 1
+                reason = (f"名额已满，回收最远的 {self.label_of(victim)}"
+                          f"（{far_d:.1f}m）让位给 {self.label_of(actor)}"
+                          f"（{new_d:.1f}m）")
         else:
+            if not idle:
+                return "busy"                    # 全都在说话：不踢人，宁可暂时不翻
             victim = min(idle, key=lambda a: self.sessions[a].last_audio)
-        await self._drop(victim, reason=f"名额已满，回收空闲的 {self.label_of(victim)}")
-        return True
+            reason = f"名额已满，回收空闲的 {self.label_of(victim)}"
+        await self._drop(victim, reason=reason)
+        return None
 
     def _prune_wanted(self, now: float) -> None:
         for a in [a for a, t in self._wanted.items() if now - t > WANT_TTL_S]:
@@ -526,13 +558,20 @@ class PlayerRouter:
         self.on_status(
             "warn",
             f"{self.label_of(actor)} 超出距离门限（{self.max_distance_m:g}m），"
-            f"不建翻译会话（distance_mode=gate；想无损请改 order）")
+            f"不建翻译会话（distance_mode=gate；想尽量不丢人请改 order）")
 
-    def _warn_overflow(self, actor: int, now: float) -> None:
+    def _warn_overflow(self, actor: int, now: float, reason: str = "") -> None:
         last = self._overflow_warned.get(actor, 0.0)
         if now - last < OVERFLOW_WARN_S:
             return
         self._overflow_warned[actor] = now
+        if reason == "distance":
+            self.on_status(
+                "warn",
+                f"{self.label_of(actor)} 的语音暂不翻译：会话名额已满，按距离排序"
+                f"轮不到他（不比可回收的人更近，或距离未知；可调大 config 的"
+                f" players.max_sessions）")
+            return
         self.on_status(
             "warn",
             f"{self.label_of(actor)} 的语音暂不翻译：{self.max_sessions} 条会话都在被人"
@@ -644,6 +683,7 @@ class PlayerRouter:
             "gated_blocks": sum(g.dropped_chunks for g in self._gates.values()),
             "text_events": self.text_events,
             "distance_dropped": self.distance_dropped,
+            "distance_evictions": self.distance_evictions,
             "distance_mode": self.distance_mode,
             "max_distance_m": self.max_distance_m,
             "sessions_created": self.sessions_created,

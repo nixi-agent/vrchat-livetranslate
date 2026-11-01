@@ -37,6 +37,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -117,7 +118,10 @@ def ensure_pyinstaller() -> None:
     # 报 `No module named pip`。所以先试 uv（本项目一贯的装法），失败再退回 pip。
     attempts = [
         ["uv", "pip", "install", "--python", str(PY), "pyinstaller>=6.6"],
-        [str(PY), "-m", "pip", "install", "-q", "pyinstaller>=6.6"],
+        # ⚠️ `--no-cache-dir` 不能省：本机 pip 的 HTTP 缓存写入会**静默挂死**
+        # （卡在 `Caching due to etag` 之后，CPU 0.00s、无网络连接，等不到任何输出）。
+        [str(PY), "-m", "pip", "install", "-q", "--no-cache-dir",
+         "--disable-pip-version-check", "pyinstaller>=6.6"],
     ]
     errs: list[str] = []
     for cmd in attempts:
@@ -251,11 +255,32 @@ def frozen_app_dir(exe: Path) -> Path:
     return Path(appdata) / "vrchat-livetranslate"
 
 
+def _fallback_log_dir() -> Path:
+    """`vlt.crashlog` 在配置目录写不进去时的退路（临时目录）。
+
+    装了火绒 / Defender「受保护文件夹」的机器会拦**未签名**的 exe 写 `%APPDATA%`
+    （实测 `[Errno 13] Permission denied`），日志就落到这里 —— 自检得跟着去看，
+    否则会把「跑成功了」误判成「启动就挂了」。
+    """
+    return Path(tempfile.gettempdir()) / "vrchat-livetranslate" / "logs"
+
+
 def verify(exe: Path, timeout_s: int = 180) -> bool:
     """真跑一遍 exe，并从它自己写的日志里确认结果（无控制台，看不到 stdout）。"""
-    log_dir = frozen_app_dir(exe) / "logs"
-    for old in log_dir.glob("gui_*.log"):
-        old.unlink(missing_ok=True)
+    # 日志可能不在 exe 的配置目录里：装了火绒/Defender「受保护文件夹」的机器会拦
+    # 未签名 exe 写 %APPDATA%，那时 vlt.crashlog 会退到临时目录（同一次运行里
+    # 打一行「日志目录不可写」）。两处都看，否则自检会被误判成失败。
+    log_dirs = [frozen_app_dir(exe) / "logs", _fallback_log_dir()]
+    for log_dir in log_dirs:
+        for old in log_dir.glob("gui_*.log"):
+            # ⚠️ WinError 5 会在这里偶发（索引器/杀毒刚摸过文件，或上一个 exe 进程还没退干净）。
+            # 清旧日志只是为了让「日志里有没有本次的 GUI_SELFTEST_OK」这个判据干净，
+            # 删不掉不该让整个打包脚本崩在自检之前 —— 记一行、继续，后面的判据仍然成立
+            # （旧日志不含 OK，或者新日志更新的那份被 sorted()[-1] 取到）。
+            try:
+                old.unlink(missing_ok=True)
+            except OSError as exc:
+                print(f"   ⚠️ 删不掉旧日志（{exc}），跳过：{old.name}", flush=True)
     print(f"\n开始自检：{exe.name} --self-test（最多等 {timeout_s}s）", flush=True)
     t0 = time.time()
     proc = subprocess.run([str(exe), "--self-test"], cwd=str(exe.parent),
@@ -266,7 +291,8 @@ def verify(exe: Path, timeout_s: int = 180) -> bool:
     cost = time.time() - t0
     print(f"退出码 = {proc.returncode}（耗时 {cost:.1f}s）", flush=True)
 
-    logs = sorted(log_dir.glob("gui_*.log"))
+    logs = sorted((p for d in log_dirs for p in d.glob("gui_*.log")),
+                  key=lambda p: p.stat().st_mtime if p.exists() else 0)
     text = logs[-1].read_text(encoding="utf-8", errors="replace") if logs else ""
     if logs:
         print(f"日志：{logs[-1]}", flush=True)

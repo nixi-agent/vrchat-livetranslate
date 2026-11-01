@@ -324,25 +324,47 @@ class _Tee:
         raise OSError("no fileno")
 
 
+def _fallback_log_dir() -> Path:
+    """主日志目录不可写时的退路（系统临时目录）。
+
+    真实场景：装了火绒/Defender「受保护文件夹」的机器上，未签名的 exe 写
+    `%APPDATA%` 会被拒（EACCES），日志就一条都不剩 —— 用户报障时没有任何线索。
+    临时目录不在受保护范围内，退到这里至少还留得下。
+    """
+    import tempfile
+
+    return Path(tempfile.gettempdir()) / "vrchat-livetranslate" / "logs"
+
+
 def install(log_dir: Path, tag: str = "gui") -> Path:
     """装上崩溃钩子，返回日志文件路径。可重复调用（幂等）。"""
     global _LOG_PATH, _LOG_FILE, _ORIG_STDOUT, _ORIG_STDERR
     if _LOG_PATH is not None:
         return _LOG_PATH
 
-    log_dir = Path(log_dir)
-    try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
+    # 主目录可能**建得出文件却写不进去**（实测：火绒/Defender 的「受保护文件夹」会拦
+    # 未签名的 exe 写 %APPDATA%，而同一目录下用别的程序建文件是好的 —— 只看「日志文件
+    # 不存在」根本判不出是被谁拦的）。所以主目录失败就退到临时目录，并且把**实际**路径
+    # 打出来；两处都不行才降到「没有日志文件」的老行为（程序照常跑）。
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    _LOG_PATH = log_dir / f"{tag}_{stamp}.log"
-
-    try:
-        # line buffering：崩溃时最后几行必须已经在磁盘上（不能卡在缓冲区里）
-        _LOG_FILE = open(_LOG_PATH, "w", encoding="utf-8", buffering=1)
-    except Exception:
-        _LOG_FILE = None
+    name = f"{tag}_{stamp}.log"
+    _LOG_PATH = Path(log_dir) / name
+    for cand in (Path(log_dir), _fallback_log_dir()):
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            # line buffering：崩溃时最后几行必须已经在磁盘上（不能卡在缓冲区里）
+            _LOG_FILE = open(cand / name, "w", encoding="utf-8", buffering=1)
+        except Exception as exc:  # noqa: BLE001
+            _LOG_FILE = None
+            # 这行本身不能带打印不出来的字符（GBK 控制台会再抛一个
+            # UnicodeEncodeError，把「日志没写成」这件事本身也吞掉）。
+            print(f"[crashlog] 注意：日志目录不可写（{exc}）：{cand}", flush=True)
+            _LOG_PATH = cand / name
+            continue
+        _LOG_PATH = cand / name
+        log_dir = cand
+        break
+    else:
         return _LOG_PATH
 
     # 启动时先按总量滚动清理（新文件还没建，不会被误删）

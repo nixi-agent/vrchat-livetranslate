@@ -26,6 +26,16 @@ if sys.stdout is None or sys.stderr is None:
     if sys.stderr is None:
         sys.stderr = _fallback
 
+# 中文 Windows 的控制台是 GBK，而诊断里带 `⚠️` 这类字符：某行打不出来时抛的
+# UnicodeEncodeError 会把**真正要看的错误**顶掉（冻结产物更致命 —— CrashLog 的 Tee
+# 先写控制台再写日志，控制台一抛，日志那半行也丢了）。改成转义输出：控制台仍能看清
+# ASCII 部分，日志文件本身是 UTF-8，不受影响。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="backslashreplace")
+    except Exception:
+        pass
+
 if "--vlt-keyd" in sys.argv[1:]:
     # Windows 一次性提权取钥子进程：**同一个 exe** 用 `--vlt-keyd` 再启动一次，
     # 由 UAC 提权后跑 `vlt.players.keyd.main`（见 `vlt/players/keyd.py`）。

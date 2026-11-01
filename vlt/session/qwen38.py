@@ -667,9 +667,9 @@ class QwenLiveTranslateSession(LiveTranslateSession):
                            silence_s=self.cfg.final_silence_s,
                            fast_silence_s=self.cfg.fast_final_silence_s,
                            fast_user_quiet_s=self.cfg.fast_final_user_quiet_s):
-            before = self._last_final_text
-            self._emit(confirmed=cur, pending="", is_final=True)
-            if self._last_final_text != before:      # 真发出去了才推进边界
+            # 按 `_emit` 的返回值推进边界：真发出去了才推进。别用「文本变了没有」代理 ——
+            # 下一轮又说了同一句时文本不变，边界会停在 0，晚到增量就把已封口的旧句带回来。
+            if self._emit(confirmed=cur, pending="", is_final=True):
                 self._advance()
 
     def _map_text_event(self, etype: str, ev: dict) -> tuple[str, str, str | None] | None:
@@ -701,19 +701,25 @@ class QwenLiveTranslateSession(LiveTranslateSession):
                 return "", "", ev.get("transcript") or ev.get("text") or ""
         return None
 
-    def _emit(self, confirmed: str, pending: str, is_final: bool) -> None:
+    def _emit(self, confirmed: str, pending: str, is_final: bool) -> bool:
+        """把一条文本交给下游；返回**是否真的发出去了**。
+
+        返回值只给 `tick()` 用：它要据此决定是否推进已终结边界 `_emitted_chars`。
+        用「文本有没有变」代理「发没发出去」是不行的 —— 下一轮真的又说了同一句时
+        `_last_final_text` 不变，边界就停在 0，晚到的增量会把已封口的文本再带一遍。
+        """
         if self.on_text is None:
-            return
+            return False
         if is_final:
             # 终版去重集中在这里：静默兜底 / response.done / response.text.done 三条路径
             # 可能对同一段文本都触发终结，重复下发会让下游（chatbox / 字幕）白发一次。
             # 只对**同一轮**判重：不同回合里真的说了同一句（"はい"/"好的"）要照发。
             # 归一化后为空 = 只剩标点/空白（前缀剥离后常见）→ 不发，否则会多一条 "。"
             if not normalize_text(confirmed):
-                return
+                return False
             if (self._turn == self._last_final_turn
                     and normalize_text(confirmed) == normalize_text(self._last_final_text)):
-                return
+                return False
             self._last_final_text = confirmed
             self._last_final_turn = self._turn
         else:
@@ -725,3 +731,4 @@ class QwenLiveTranslateSession(LiveTranslateSession):
                 self.first_delta_ms = self._first_delta_ms
         self.on_text(TextDelta(confirmed=confirmed, pending=pending, is_final=is_final,
                                source="".join(self._src_buf)))
+        return True

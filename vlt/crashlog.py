@@ -68,6 +68,72 @@ def _prune_logs(log_dir: Path, keep: set[Path] | None = None,
     return removed
 
 
+def _redact_config(text: str) -> str:
+    """仅生成诊断副本：房间令牌没有固定前缀，必须按 YAML 字段处理。
+
+    修改共享节点而非 safe_load 后的字符串副本，才能同时遮住锚点、别名和重复键。
+    无法可靠解析的配置只导出说明；解析异常可能带原文，不能写进压缩包。
+    """
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+    import yaml
+    from yaml.nodes import MappingNode, ScalarNode, SequenceNode
+
+    def items(node, seen):
+        if not isinstance(node, MappingNode):
+            raise ValueError("配置映射结构无效")
+        if id(node) in seen:
+            return
+        seen.add(id(node))
+        for key, value in node.value:
+            if isinstance(key, ScalarNode) and key.tag == "tag:yaml.org,2002:merge":
+                parents = value.value if isinstance(value, SequenceNode) else [value]
+                for parent in parents:
+                    yield from items(parent, seen)
+            else:
+                yield key, value
+
+    def replace(node, value):
+        node.value = value
+        node.tag = "tag:yaml.org,2002:str"
+        node.style = None
+
+    try:
+        root = yaml.compose(text, Loader=yaml.SafeLoader)
+        if root is None:
+            return text
+        replacements = {}
+        for key, room in items(root, set()):
+            if not isinstance(key, ScalarNode) or key.value != "room":
+                continue
+            for field, value in items(room, set()):
+                if not isinstance(field, ScalarNode) or field.value not in ("token", "server_url"):
+                    continue
+                if not isinstance(value, ScalarNode):
+                    raise ValueError("房间认证字段结构无效")
+                if not value.value:
+                    continue
+                if field.value == "token":
+                    replacements[id(value)] = (value, "[REDACTED]")
+                    continue
+                parts = urlsplit(value.value)
+                query = parse_qsl(parts.query, keep_blank_values=True)
+                # 与 room.client 的旧 URL 认证参数一致；parse_qsl 同时解码参数名。
+                cleaned = [(name, "[REDACTED]" if name.lower() in ("k", "tok", "token")
+                            and token else token) for name, token in query]
+                if cleaned != query:
+                    replacements.setdefault(
+                        id(value), (value, urlunsplit(parts._replace(query=urlencode(cleaned)))))
+        if replacements:
+            # 别名也可能被用作后续字段名：先收集，再修改；整值令牌遮盖优先于 URL 清洗。
+            for node, replacement in replacements.values():
+                replace(node, replacement)
+            return yaml.serialize(root, Dumper=yaml.SafeDumper, allow_unicode=True)
+        return text
+    except (yaml.YAMLError, ValueError, RecursionError):
+        return "# 配置已省略：无法安全解析并脱敏。原文件未修改。\n"
+
+
 def export_logs(dest_zip: Path, log_dir: Path | None = None,
                 extra_files: list[Path] | None = None) -> tuple[Path, int, int, list[str]]:
     """把日志打包成 zip，方便用户直接发给排查者。
@@ -75,7 +141,8 @@ def export_logs(dest_zip: Path, log_dir: Path | None = None,
     返回 `(zip 路径, 打包文件数, 原始字节数, 脱敏条目说明)`。
 
     ⚠️ **打包前逐文件脱敏**：日志里本不该出现完整密钥（写日志的地方都做了打码），
-    但这个包是要通过聊天工具发出去的，多一道保险 —— 扫到 `sk-xxxx` 形状就替换掉。
+    但这个包是要通过聊天工具发出去的，多一道保险 —— 扫到 `sk-xxxx` 形状就替换掉；
+    配置中的房间令牌（含旧 URL 查询认证）另按字段遮住，损坏配置不导出原文。
     脱敏过的文件会在返回的说明里列出来，避免"默默改了内容"。
     """
     import zipfile
@@ -105,8 +172,11 @@ def export_logs(dest_zip: Path, log_dir: Path | None = None,
         added.add(arcname)
         n_bytes += len(raw)
         text = raw.decode("utf-8", errors="replace")
-        if redact_re.search(text):
-            text = redact_re.sub("sk-****（已脱敏）", text)
+        original = text
+        if path.name in ("config.yaml", "config.yaml.broken"):
+            text = _redact_config(text)
+        text = redact_re.sub("sk-****（已脱敏）", text)
+        if text != original:
             redacted.append(arcname)
         zf.writestr(arcname, text.encode("utf-8", errors="replace"))
         n_files += 1
@@ -115,7 +185,7 @@ def export_logs(dest_zip: Path, log_dir: Path | None = None,
         for p in sorted(log_dir.glob("*.log*")):
             if p.is_file():
                 _add(zf, p, f"logs/{p.name}")
-        # 配置也带上：设备名/语言偏好对排查"哪条腿没起来"经常是关键（不含 key）
+        # 配置诊断副本：保留设备/语言信息，房间认证字段由 _add 脱敏。
         for p in [*(extra_files or []), app_dir() / "config.yaml",
                   app_dir() / "config.yaml.broken"]:
             if p and Path(p).is_file():

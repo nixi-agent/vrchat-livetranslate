@@ -2,17 +2,20 @@
 
 为什么要合并：chatbox 有 5 条/5 秒的漏桶限流，且气泡内容是被**整体替换**的，
 所以推给它的应该是「当前最完整的译文快照」，而不是碎片增量。
+
+⚠️ 这里**不做**跨回合去重 / 前缀剥离（早先试过，又被撤掉）：Merger 这层拿不到轮次身份，
+10s 窗口内「下一轮真的又说了一遍同一句」（はい / そうですね 这类短应答）会被整条丢掉，
+以上一句开头的长句还会被裁掉首词。同一句重复 / 晚到增量由会话层的 `_emitted_chars`
+（已终结字符边界）负责，见 `vlt/session/qwen38.py`。
 """
 from __future__ import annotations
 
 import time
 from typing import Callable
 
-from ..session.base import TextDelta, normalize_text
+from ..session.base import TextDelta
 
 Sink = Callable[[str, bool], None]      # (text, is_final)
-#: 终版刚发出去后的这段时间里，后续快照若带着同一段前缀就剥掉（防「同一句反复显示」）
-FINAL_DEDUPE_WINDOW_S = 10.0
 
 
 class Merger:
@@ -24,64 +27,26 @@ class Merger:
         self.max_chars = max_chars
         self._last_sent: str = ""
         self._last_sent_at: float = 0.0
-        self._final_sent_for_current = False
         self._carry: str = ""            # 上一段最终译文（carry_over 时作为前缀）
-        # 上一段终版：用于「同一句又来了」的兜底（会话层已经修了，这里再挡一层）
-        self._last_final_raw = ""
-        self._last_final_norm = ""
-        self._last_final_at = 0.0
         # 埋点
         self.sent_count = 0
         self.skipped_identical = 0
-        self.deduped_finals = 0
-        self.trimmed_prefixes = 0
         self.first_sent_at: float | None = None
-
-    def start_utterance(self) -> None:
-        """新一段响应开始（response.created）。"""
-        self._final_sent_for_current = False
 
     def push(self, delta: TextDelta) -> None:
         text = delta.display                     # confirmed + pending（预测部分会被替换，不累加）
         if not text:
             return
         now = time.monotonic()
-        if not self.carry_over:
-            text = self._trim_previous_final(text, now=now)
-            if not text:
-                return
 
         if delta.is_final:
             self._carry = text
             self._emit(text, is_final=True, now=now)
-            self._final_sent_for_current = True
             return
 
         # 首个 delta 立即发；之后按 interval_s 节流
         if self._last_sent_at == 0.0 or (now - self._last_sent_at) >= self.interval_s:
             self._emit(text, is_final=False, now=now)
-
-    def _trim_previous_final(self, text: str, *, now: float) -> str:
-        """上一段刚终结过时，剥掉重复的前缀；整段重复返回空串。
-
-        会话层已经保证「晚到的增量只发新增部分」，这里再挡一层：某些服务端事件序列
-        （`x.done` 全文 + 静默兜底）仍可能把上一句带进来。只在 `carry_over=False` 时做 ——
-        `carry_over=True` 本来就要把上一句当上下文拼进去。
-        """
-        if not self._last_final_norm or now - self._last_final_at > FINAL_DEDUPE_WINDOW_S:
-            return text
-        if normalize_text(text) == self._last_final_norm:
-            self.deduped_finals += 1
-            return ""
-        raw = self._last_final_raw
-        if raw and text.startswith(raw):
-            stripped = text[len(raw):].lstrip(" 　")
-            if stripped:
-                self.trimmed_prefixes += 1
-                return stripped
-            self.deduped_finals += 1
-            return ""
-        return text
 
     def _emit(self, text: str, is_final: bool, now: float) -> None:
         payload = self._compose(text, is_final)
@@ -94,10 +59,6 @@ class Merger:
             self._last_sent_at = now       # 仍然重置窗口，避免下一拍重复判定
             return
         self.sink(payload, is_final)
-        if is_final:
-            self._last_final_raw = text
-            self._last_final_norm = normalize_text(text)
-            self._last_final_at = now
         self.sent_count += 1
         if self.first_sent_at is None:
             self.first_sent_at = time.perf_counter()
@@ -116,7 +77,4 @@ class Merger:
     def reset(self) -> None:
         self._last_sent = ""
         self._last_sent_at = 0.0
-        self._last_final_raw = ""
-        self._last_final_norm = ""
-        self._last_final_at = 0.0
-        self._final_sent_for_current = False
+        self._carry = ""

@@ -15,7 +15,9 @@
 3. 同时收到 `response.text.*` 与 `response.audio_transcript.*` 时只累加一族（不翻倍）；
 4. 空终版不发（不会凭空多一条空气泡）；
 5. `_src_buf`（原文）跨轮清空；
-6. `Merger` 兜底：终版后的「旧前缀 + 新增」只发新增；重复终版丢弃。
+6. 同一句在同一轮重复说、且中途被快封过（`_emitted_chars` 要靠 `_emit` 的返回值推进）；
+7. `Merger` **不**做跨回合去重 / 前缀剥离：短应答两轮重复照发、新句以上一句开头不被裁
+   （评审 R1：这层没有轮次身份，早先的兜底会误伤真发言）。
 
 跑法：.venv/bin/python tests/test_turn_boundary.py
 """
@@ -29,7 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vlt.output.merger import FINAL_DEDUPE_WINDOW_S, Merger  # noqa: E402
+from vlt.output.merger import Merger  # noqa: E402
 from vlt.session.base import SessionConfig, TextDelta, normalize_text  # noqa: E402
 from vlt.session.qwen38 import QwenLiveTranslateSession  # noqa: E402
 
@@ -160,26 +162,39 @@ def test_same_word_next_turn_allowed() -> None:
     check("两轮各发一次", sink.finals() == ["はい", "はい"], str(sink.finals()))
 
 
-def test_merger_dedupe() -> None:
-    print("[merger] 终版后的重复 / 旧前缀")
+def test_same_word_next_turn_then_late_delta() -> None:
+    print("[turn] 下一轮同文快封之后，晚到的增量只发新增")
+    session, sink = _session()
+    for _ in range(2):
+        _created(session)
+        _event(session, "response.text.delta", delta="はい")
+        session._last_text_at = time.perf_counter() - 5.0  # noqa: SLF001
+        session.tick()
+    # 第二轮 tick 已经封过「はい」——边界必须靠 _emit 的返回值推进（评审 R2）
+    _event(session, "response.text.delta", delta="そう")
+    _event(session, "response.text.done", text="はいそう")
+    finals = sink.finals()
+    check("两轮各发一次终版", finals[:2] == ["はい", "はい"], str(finals))
+    check("晚到增量终版只发新增", finals[-1] == "そう", str(finals))
+    check("已封口的「はい」没有被带回", "はいそう" not in sink.texts(), str(sink.texts()))
+
+
+def test_merger_cross_turn_passthrough() -> None:
+    print("[merger] 跨回合不去重、不剥前缀（评审 R1）")
     out: list[tuple[str, bool]] = []
     merger = Merger(lambda text, final: out.append((text, final)), interval_s=0.0)
-    merger.push(TextDelta(confirmed="それは正しいですか", is_final=False))
-    merger.push(TextDelta(confirmed="それは正しいですか", is_final=True))
-    before = len(out)
-    # 同一句重复终结（标点不同）→ 丢弃
-    merger.push(TextDelta(confirmed="それは正しいですか？", is_final=True))
-    check("重复终版被丢弃", len(out) == before and merger.deduped_finals == 1,
-          f"{out} dedup={merger.deduped_finals}")
-    # 「旧前缀 + 新增」的非终版快照 → 只发新增
-    merger.push(TextDelta(confirmed="それは正しいですか ちょっと", is_final=False))
-    check("剥掉旧前缀只发新增", out[-1][0] == "ちょっと", str(out[-1]))
-    check("或者整段等于旧终版时丢弃", merger.trimmed_prefixes == 1,
-          str(merger.trimmed_prefixes))
-    # 窗口外不再剥（10 秒后是真的新句子）
-    merger._last_final_at -= FINAL_DEDUPE_WINDOW_S + 1      # noqa: SLF001
-    merger.push(TextDelta(confirmed="それは正しいですか 新しい文", is_final=False))
-    check("窗口外不再误剥", out[-1][0] == "それは正しいですか 新しい文", str(out[-1]))
+    # ① 不同回合真的又说了同一句（はい 这类短应答 10s 内重复是常态）→ 两轮都要发
+    for _ in range(2):
+        merger.push(TextDelta(confirmed="はい", is_final=False))
+        merger.push(TextDelta(confirmed="はい", is_final=True))
+    check("两轮终版都在", [t for t, f in out if f] == ["はい", "はい"], str(out))
+
+    # ② 新句子以上一句终版开头 → 原样发出，不裁首词、不留孤立标点
+    out2: list[tuple[str, bool]] = []
+    merger2 = Merger(lambda text, final: out2.append((text, final)), interval_s=0.0)
+    merger2.push(TextDelta(confirmed="はい", is_final=True))
+    merger2.push(TextDelta(confirmed="はい、わかりました", is_final=True))
+    check("新句不被裁首词", out2[-1] == ("はい、わかりました", True), str(out2[-1]))
     check("normalize_text 去标点", normalize_text(" はい。 ") == "はい")
 
 
@@ -190,7 +205,8 @@ def main() -> int:
     test_dual_stream_not_doubled()
     test_source_resets_per_turn()
     test_same_word_next_turn_allowed()
-    test_merger_dedupe()
+    test_same_word_next_turn_then_late_delta()
+    test_merger_cross_turn_passthrough()
     print()
     if FAILS:
         print(f"FAILED: {len(FAILS)} 项 → {', '.join(FAILS)}")

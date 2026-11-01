@@ -66,10 +66,30 @@ HOT_SILENCE_S = 15.0
 #: 实测保留 180s 时，玩家静下来一分钟就会收到
 #: `Response stream timeout (timeout_seconds=60)`，等于白报一次错 + 白重建一次。
 IDLE_CLOSE_S = 45.0
-TICK_S = 0.3
+#: 例行检查周期（`_tick_once`）。补静音也挂在这上面，所以不能太粗：
+#: 0.1s → 「他说完」到「开始补静音」最多 0.1s。
+TICK_S = 0.1
 CLOSE_TIMEOUT_S = 5.0            # 关一条会话的上限（关不掉就放弃，别拖住 tick）
 #: 排队等建连时保留多少块音频（20ms/块 → 100 块 = 2s，句首不丢）
 PREROLL_BLOCKS = 100
+#: 「他说完多久之后开始主动补静音」。要略大于一个 tick，避免把正常抖动当成句末。
+FILL_SILENCE_AFTER_MS = 120.0
+#: 每 20ms 一块的 16k s16le 静音（与 Photon 解出来的块同长）
+FILL_BLOCK_S = 0.02
+FILL_BLOCK = b"\x00" * 640
+#: 一次静音期最多补多久（hold 0.5s + 关闸 tail 0.6s + 余量）。
+#: 补够这个长度后服务端 VAD 必然已经断句，再补只是白烧带宽。
+SILENCE_CAP_S = 1.8
+#: 断句慢的真正原因（两个叠加）：
+#: ① gate 的时间轴被 Photon 包的到达抖动续命 —— 已用**音频时钟**（`_clock()`）修掉：
+#:    hold/preroll/tail 全按「音频里真的过了多久」计量，抖多大都不影响判定。
+#: ② `LevelGate` 是**被动**的：只有 `feed()` 被调用时才检查 hold。玩家一停嘴，VRChat
+#:    就不再送这个 actor 的音频包 → `feed()` 不再被调用 → 门限永不闭闸、关闸那 600ms
+#:    静音永远补不出去 → 服务端 VAD 收不到连续静音 → 封句只能等客户端慢路径
+#:    （`text_quiet_s >= 3.0`）。体感就是「别人说完要好几秒才出字」，而麦克风腿没有
+#:    这个问题（麦克风一直在送，静音也是音频）。
+#: 所以 `_tick_once` 里要**主动**补静音（`_fill_silence()`），把「没有包」这段时间补成
+#: 数字静音，让门限正常闭闸、让服务端拿到连续静音。
 #: 愿望有效期：这么久没再说话就不再为他排队
 WANT_TTL_S = 3.0
 #: 同一玩家「名额满、暂不翻译」的警告间隔（不然每块 20ms 都要报一次）
@@ -116,6 +136,10 @@ class PlayerSession:
     last_source: str = ""
     started: bool = False
     failures: int = 0
+    #: 最后一块**真实**音频的时间（墙钟）。补静音不会刷新它 —— 否则就成了自己喂自己。
+    last_real: float = field(default_factory=time.monotonic)
+    #: 本轮「他说完之后的静音」已经补了多少秒（收到真实音频时归零）
+    silence_s: float = 0.0
     #: 开闸期间的电平样本（dBFS）：用来给人看「这个人是不是被门限切了」
     levels: deque = field(default_factory=lambda: deque(maxlen=LEVEL_SAMPLES))
 
@@ -142,6 +166,9 @@ class PlayerRouter:
         self.gate_hysteresis_db = max(0.0, float(gate_hysteresis_db))
         # 每位玩家一个门限实例（hold/preroll/滞回有自己的时间轴）
         self._gates: dict[int, LevelGate] = {}
+        # 每位玩家的**音频时钟**（秒，按喂进来的块时长累加）。给 `LevelGate.feed` 当 `now` 用，
+        # 这样 hold/preroll/tail 全部按音频时间计量，包到达抖成什么样都不影响门限判定。
+        self._clocks: dict[int, float] = {}
         self.on_text = on_text or (lambda *_a: None)
         self.on_status = on_status or (lambda *_a: None)
         self.label_of = label_of or (lambda actor: f"actor{actor}")
@@ -182,6 +209,8 @@ class PlayerRouter:
         self._closed = False
         self.dropped_chunks = 0
         self.sent_chunks = 0
+        #: 主动补进去的静音块数（「他说完之后」那段空白）
+        self.silence_chunks = 0
         self.text_events = 0
         self.distance_dropped = 0
         # 诊断：建连次数 / 失败次数 / 溢出丢弃块数（状态栏与 stats 用）
@@ -237,10 +266,16 @@ class PlayerRouter:
                 self._ring[actor] = ring
             ring.append(pcm)
         gate = self._gate_for(actor)
-        blocks = gate.feed(pcm, now=time.monotonic())
+        st = self.sessions.get(actor)
+        if st is not None:
+            # 有真实音频到达（哪怕随即被门限挡掉）：他还在说话，静音从零重算。
+            st.last_real = time.monotonic()
+            st.silence_s = 0.0
+        dur_s = len(pcm) / 2 / 16000.0
+        # `now` 用**音频时钟**而不是墙钟：包是抖动到达的，用墙钟判 hold 会让门限永不闭闸。
+        blocks = gate.feed(pcm, now=self._clock(actor, dur_s), dur_s=dur_s)
         if not blocks:
             return
-        st = self.sessions.get(actor)
         if st is not None and gate.is_open:
             st.levels.append(gate.level_db)
         if st is not None:
@@ -257,6 +292,18 @@ class PlayerRouter:
         self._wanted.move_to_end(actor)
         self._kick()
 
+    def _clock(self, actor: int, dur_s: float) -> float:
+        """该玩家的音频时钟（秒）：把喂进来的块时长累加起来，与真实墙钟无关。
+
+        为什么不能用 `time.monotonic()`：Photon 的语音包到本机是抖动的（VRChat 客户端自己
+        还有一层 jitter buffer，我们从密文解出来的 PCM 没有）。`LevelGate` 的 hold/preroll/tail
+        全是**时间差**判断，喂墙钟就会被抖动反复续命 —— 门限迟迟不关闸，服务端 VAD 便等不到
+        连续静音，只能等客户端慢路径的 3.0s。换成按音频时长走，抖多大都不影响判定。
+        """
+        clock = self._clocks.get(actor, 0.0) + max(0.0, float(dur_s))
+        self._clocks[actor] = clock
+        return clock
+
     def _gate_for(self, actor: int) -> LevelGate:
         gate = self._gates.get(actor)
         if gate is None:
@@ -266,8 +313,12 @@ class PlayerRouter:
             self._gates[actor] = gate
         return gate
 
-    async def _send(self, actor: int, st: PlayerSession, blocks) -> None:
-        st.last_audio = time.monotonic()
+    async def _send(self, actor: int, st: PlayerSession, blocks, *,
+                    real: bool = True) -> None:
+        # `real=False` 用于「主动补进去的静音」：那不是他还在说话，不能刷新 last_audio，
+        # 否则空闲回收/名额抢占就永远判不出「这个人已经安静很久了」。
+        if real:
+            st.last_audio = time.monotonic()
         note_voice = getattr(st.session, "note_voice", None)
         try:
             for block in blocks:
@@ -285,6 +336,42 @@ class PlayerRouter:
             if st.failures >= 3:
                 await self._drop(actor, reason="连续发送失败")
                 self._schedule_retry(actor, "连续发送失败")
+
+    async def _fill_silence(self, now: float) -> None:
+        """把「他说完之后的空白」补成数字静音。
+
+        `LevelGate` 只在 `feed()` 里检查 hold —— 玩家一停嘴，VRChat 就不再送这个 actor 的
+        音频包，`feed()` 也就不再被调用，门限永远开着、关闸那 600ms 静音永远补不出去。
+        服务端 VAD 因此收不到「连续静音」，封句只能等客户端慢路径的 3.0s（体感就是
+        「别人说完要好几秒才出字」）。这里按墙钟把这段空白补成 20ms 静音块喂回门限，
+        让闭闸与 tail 正常发生。
+        """
+        for actor, st in list(self.sessions.items()):
+            gate = self._gates.get(actor)
+            if gate is None or not gate.is_open:
+                continue
+            gap = now - st.last_real
+            if gap * 1000.0 < FILL_SILENCE_AFTER_MS:
+                continue
+            # 只补「真实静音已经过去」的那段；上一轮补过的减掉，避免重复堆积。
+            need = min(gap, SILENCE_CAP_S) - st.silence_s
+            if need < FILL_BLOCK_S:
+                continue
+            n = int(need / FILL_BLOCK_S + 0.5)
+            blocks: list[bytes] = []
+            for _ in range(n):
+                if gate.is_open:
+                    blocks.extend(gate.feed(FILL_BLOCK, dur_s=FILL_BLOCK_S,
+                                            now=self._clock(actor, FILL_BLOCK_S)))
+                else:
+                    # 门限刚关上：它只在关闸那一刻吐一次 tail，但服务端要的是**连续**
+                    # 静音，所以继续补满，别让 VAD 又等到超时。
+                    self._clock(actor, FILL_BLOCK_S)
+                    blocks.append(FILL_BLOCK)
+            st.silence_s = min(SILENCE_CAP_S, st.silence_s + n * FILL_BLOCK_S)
+            if blocks:
+                self.silence_chunks += len(blocks)
+                await self._send(actor, st, blocks, real=False)
 
     # ------------------------------------------------------------ 建连循环
 
@@ -507,8 +594,10 @@ class PlayerRouter:
             await self._tick_once()
 
     async def _tick_once(self) -> None:
-        """一次例行检查（拆出来是为了能离线测，不用等 0.3s）。"""
+        """一次例行检查（拆出来是为了能离线测，不用等 TICK_S）。"""
         now = time.monotonic()
+        # 「他说完之后」的空白要主动补成静音，否则门限永不闭闸、服务端 VAD 断不了句。
+        await self._fill_silence(now)
         for actor, st in list(self.sessions.items()):
             try:
                 st.session.tick()
@@ -550,6 +639,7 @@ class PlayerRouter:
             "queued": len(self._wanted),
             "actors": list(self.sessions),
             "sent_chunks": self.sent_chunks,
+            "silence_chunks": self.silence_chunks,
             "dropped_chunks": self.dropped_chunks,
             "gated_blocks": sum(g.dropped_chunks for g in self._gates.values()),
             "text_events": self.text_events,

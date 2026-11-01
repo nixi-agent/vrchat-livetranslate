@@ -21,8 +21,6 @@ from typing import Any, Callable
 
 MODE_OFF = "off"
 MODE_DECRYPT = "decrypt"
-PREWARM_OFF = "off"
-PREWARM_AUTO = "auto"
 DISTANCE_MODES = ("off", "order", "gate", "both")
 
 
@@ -37,8 +35,7 @@ class PlayersSettings:
     字段顺序即设置页里的显示顺序（基本 → 音量 → 距离 → 高级）。
     """
 
-    mode: str = MODE_OFF                 # off | decrypt
-    prewarm: str = PREWARM_OFF           # off | auto（检测到 VRChat 就授权预热）
+    mode: str = MODE_OFF                 # off | decrypt（开 decrypt 即自动预热，没有单独开关）
     max_sessions: int = 4                # 同时翻译几个人（1..8）
     gate_db: float = -55.0               # 每人流的静音门限（RMS dBFS，-70..-30）
     gate_hysteresis_db: float = 6.0      # 开闸后要再低这么多才关闸（0..12）
@@ -70,10 +67,9 @@ def parse_players(raw: object, *, log: Callable[[str], None] | None = None) -> P
         warn(f"players.mode={mode!r} 未知（off/decrypt）→ 按 off")
         mode = MODE_OFF
 
-    prewarm = str(raw.get("prewarm") or PREWARM_OFF).lower().strip()
-    if prewarm not in (PREWARM_OFF, PREWARM_AUTO):
-        warn(f"players.prewarm={prewarm!r} 未知（off/auto）→ 按 off")
-        prewarm = PREWARM_OFF
+    if "prewarm" in raw:
+        # 预热已经是分玩家的前提（开 decrypt 就自动预热），旧键忽略即可。
+        warn("players.prewarm 已废弃：分玩家必须预热 → 忽略该键")
 
     def number(key: str, default: float, low: float, high: float) -> float:
         value = raw.get(key, default)
@@ -116,7 +112,6 @@ def parse_players(raw: object, *, log: Callable[[str], None] | None = None) -> P
 
     return PlayersSettings(
         mode=mode,
-        prewarm=prewarm,
         max_sessions=integer("max_sessions", defaults.max_sessions, 1, 8),
         gate_db=number("gate_db", defaults.gate_db, -70.0, -30.0),
         gate_hysteresis_db=number("gate_hysteresis_db", defaults.gate_hysteresis_db, 0.0, 12.0),

@@ -396,8 +396,8 @@ def _players_status_text(phase: str, detail: str) -> tuple[str, str]:
     """预热器内部 phase → (状态栏级别, 人话)。"""
     if phase == "recording":
         return "info", "预热：正在记录玩家名（未开始翻译）"
-    if phase == "capturing":
-        return "info", "预热：已开始抓包，等待密钥/流量"
+    if phase == "acquiring":
+        return "info", f"预热：获取中（{detail or '正在获取密钥'}）"
     if phase in ("waiting_game",):
         return "info", "预热：等待 VRChat 进程"
     if phase in ("unauthorized", "blocked", "failed"):
@@ -406,16 +406,17 @@ def _players_status_text(phase: str, detail: str) -> tuple[str, str]:
 
 
 def ensure_players_warmup(ctx: EngineCtx) -> Any:
-    """按配置启动/复用预热器（App 级；没有预热需求时什么都不做）。
+    """按配置启动/复用预热器（App 级；分玩家关闭时什么都不做）。
 
-    检测到 VRChat 进程后由预热器自己弹一次 pkexec（开 socket）+ 扫一次内存取钥，
-    之后持续只解析玩家名；点开始翻译时翻译腿直接借用它的 socket/密钥/名字表。
+    预热是分玩家的前提：开了 `mode: decrypt` 就一定会跑。检测到 VRChat 进程后由
+    预热器自己弹一次 pkexec（开 socket + 取钥），之后持续只解析玩家名；点开始翻译
+    时翻译腿直接借用它的 socket/密钥/名字表，不会再次提权。
     """
-    from .players_settings import MODE_DECRYPT, PREWARM_AUTO, parse_players
+    from .players_settings import MODE_DECRYPT, parse_players
 
     ps = parse_players(getattr(ctx.cfg, "players", None) or {})
-    if ps.mode != MODE_DECRYPT or ps.prewarm != PREWARM_AUTO:
-        # 关掉预热：之前可能已经启动过（设置页刚改的），不能留着 socket 继续跑
+    if ps.mode != MODE_DECRYPT:
+        # 关掉分玩家：之前可能已经启动过（设置页刚改的），不能留着 socket 继续跑
         stop_players_warmup(ctx)
         return None
     warmup = getattr(ctx, "players_warmup", None)
@@ -469,6 +470,11 @@ def _start_players_leg(ctx: EngineCtx, players_cfg: dict) -> None:
     from .players_settings import parse_players
 
     ps = parse_players(players_cfg)
+    warmup = ensure_players_warmup(ctx)
+    if warmup is None:
+        on_engine_status(ctx.q, "error",
+                         "分玩家腿未启动：预热器没有创建（分玩家已关闭？）", "players")
+        return
 
     leg = PlayerLeg(
         scfg,
@@ -478,7 +484,7 @@ def _start_players_leg(ctx: EngineCtx, players_cfg: dict) -> None:
         on_names=lambda fresh: print(
             "[players] 名字：" + "、".join(f"actor{a}={n!r}" for a, _u, n in fresh),
             flush=True),
-        warmup=getattr(ctx, "players_warmup", None),
+        warmup=warmup,
         max_sessions=ps.max_sessions,
         gate_db=ps.gate_db,
         gate_hysteresis_db=ps.gate_hysteresis_db,

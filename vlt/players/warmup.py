@@ -12,8 +12,11 @@
 
 ## 权限与生命周期（与现有承诺一致）
 
-* 开 socket、扫内存各起一个**短命**提权助手（`helper.open_capture_once` /
-  `helper.scan_once`）：干完就退，主程序只拿到 fd / 候选，永远拿不到原始内存；
+* 预热是分玩家的**前提**（开 `mode: decrypt` 就自动预热，没有单独开关）；本模块也是
+  **唯一**的提权入口 —— 翻译腿只借用 socket/密钥，绝不自己起助手；
+* 一次授权把「开 socket + 采样 + 扫内存」放进同一个**短命**提权助手
+  （`helper.bootstrap`）：干完就退，主程序只拿到 fd / 候选，永远拿不到原始内存；
+  只有游戏重启/密钥失效后的重扫才会再起一次（`helper.scan_once`）；
 * socket 的 fd 留在主进程里，助手退出后照样继续收包；停止翻译也不关，
   所以「停止后继续记名字」不需要再授权；
 * 游戏重启（pid/starttime 变了）→ 旧密钥失效 → 自动重新采样 + 重扫。
@@ -36,7 +39,7 @@ import time
 from typing import Callable
 
 from . import capture_linux, gcm, guard, names, pending, photon, procfs
-from ..players_settings import PREWARM_AUTO, PlayersSettings
+from ..players_settings import MODE_DECRYPT, PlayersSettings
 
 _WIN = os.name == "nt"
 
@@ -77,7 +80,7 @@ PHASE_OFF = "off"
 PHASE_WAITING = "waiting_game"          # 没有 VRChat 进程
 PHASE_BLOCKED = "blocked"               # EAC 闸门拒绝
 PHASE_UNAUTHORIZED = "unauthorized"     # pkexec 被拒 / 助手起不来
-PHASE_CAPTURING = "capturing"           # 已开 socket，还没拿到密钥
+PHASE_ACQUIRING = "acquiring"           # 已授权、正在取密钥（还没拿到）
 PHASE_RECORDING = "recording"           # 有密钥，正在记名字
 PHASE_FAILED = "failed"                 # 取钥失败（重试也失败）
 
@@ -215,8 +218,8 @@ class PlayerWarmup:
     # ------------------------------------------------------------ 生命周期
 
     def start(self) -> None:
-        if self.settings.prewarm != PREWARM_AUTO:
-            self._set_phase(PHASE_OFF, "预热未启用")
+        if self.settings.mode != MODE_DECRYPT:
+            self._set_phase(PHASE_OFF, "分玩家已关闭")
             return
         if self._thread is not None and self._thread.is_alive():
             return
@@ -241,9 +244,9 @@ class PlayerWarmup:
 
     def reconfigure(self, settings: PlayersSettings) -> None:
         """配置变了（设置页保存）：按需启停，不必重启程序。"""
-        was_on = self.settings.prewarm == PREWARM_AUTO
+        was_on = self.settings.mode == MODE_DECRYPT
         self.settings = settings
-        if settings.prewarm != PREWARM_AUTO:
+        if settings.mode != MODE_DECRYPT:
             if was_on:
                 self.close()
             return
@@ -350,7 +353,7 @@ class PlayerWarmup:
                 usable = list(self._samples)
             if host is None or len(usable) < 2:
                 return None
-            self._set_phase(PHASE_CAPTURING, "正在取密钥（扫描游戏内存）…")
+            self._set_phase(PHASE_ACQUIRING, "正在获取密钥（扫描游戏内存，约 1~20 秒）…")
             for needle in ("q", "i"):
                 if self._stop.is_set():
                     return None
@@ -457,6 +460,7 @@ class PlayerWarmup:
             return
         # **一次授权**做完：开抓包 + 采样 + 扫内存（同一个短命助手）。
         # 以前是「开抓包一个助手 + 扫内存一个助手」→ 用户被连着要两次密码。
+        self._set_phase(PHASE_ACQUIRING, "正在请求授权（系统密码弹窗）…")
         try:
             result = self._bootstrap(host)
         except Exception as exc:                          # noqa: BLE001
@@ -482,8 +486,8 @@ class PlayerWarmup:
         elif getattr(result, "blocked", False):
             self._set_phase(PHASE_FAILED, result.detail or "读内存被拒绝")
         else:
-            self._set_phase(PHASE_CAPTURING,
-                            result.detail or "已开始抓包，等待加密流量…")
+            self._set_phase(PHASE_ACQUIRING,
+                            result.detail or "已授权，正在获取密钥（约 1~20 秒）…")
 
     def _drop_capture(self) -> None:
         with self._lock:
@@ -547,7 +551,7 @@ class PlayerWarmup:
                 self._samples.clear()
                 self._fail_streak = 0
                 self._next_scan = 0.0
-                self._set_phase(PHASE_CAPTURING, "密钥失效，重新取钥")
+                self._set_phase(PHASE_ACQUIRING, "密钥失效，正在重新获取…")
             return
         self._fail_streak = 0
         self.decrypted += 1

@@ -15,9 +15,12 @@
 下次读就被覆盖），**不是线程安全的**。多线程扫描时每个 worker 自己
 ``Disk.open()`` 一个句柄 —— 与 ``scripts/pf_key2.py`` 的做法一致。
 
-偏移语义：本模块所有 ``offset`` 都是**卷内字节偏移**（分区起点为 0），
-:class:`Disk` 内部加 ``base_offset`` 换成盘上偏移。分区起点用
-:func:`base_offset_for` 查（需要能打开卷设备，非提权进程打不开）。
+偏移语义：NTFS 解析路径的 ``offset`` 都是**卷内字节偏移**（分区起点为 0），
+:class:`Disk` 内部加 ``base_offset`` 换成盘上偏移；**开句柄一律走
+:func:`open_volume`**，它会把「这块盘是 `PhysicalDriveN`」一起带出来
+（只取偏移、写死 disk0 会在系统盘不是 0 号盘的机器上读到另一块盘）。
+pagefile 扫描路径则用 :class:`Layout` 把卷内区间翻成**盘上绝对偏移**，
+再 ``Disk.open(disk_no, 0)``。
 """
 
 from __future__ import annotations
@@ -30,16 +33,24 @@ from dataclasses import dataclass
 
 __all__ = [
     "Disk",
+    "DiskExtent",
     "Extent",
+    "Layout",
     "Pagefile",
     "PagefileError",
     "Volume",
     "base_offset_for",
     "find_pagefile",
+    "open_volume",
     "volume_extents",
 ]
 
-_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+# 非 Windows 上进不来（`ctypes` 没有 `WinDLL`）：本模块的 NTFS 解析是纯逻辑，
+# 让它在 Linux CI 上也能 import，卷→盘映射那部分才跑得了离线用例。
+try:
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+except (OSError, AttributeError):                    # pragma: no cover - 平台分派
+    _k32 = None
 
 GENERIC_READ = 0x80000000
 FILE_SHARE_READ = 0x00000001
@@ -123,7 +134,12 @@ def _disk_extents(h, path: str) -> list[DiskExtent]:
 
 
 def base_offset_for(drive: str = "C") -> int | None:
-    """分区在物理盘上的起始字节；查不到返回 None（调用方回退到配置值）。"""
+    """分区在物理盘上的起始字节；查不到返回 None（调用方回退到配置值）。
+
+    ⚠️ 只有「单段 + 你知道是哪块盘」时才够用：偏移本身没有盘号，拿它去开
+    `PhysicalDrive0` 在系统盘不是 0 号盘的机器上会读到**另一块盘**。
+    要开句柄请用 :func:`open_volume`（或 :class:`Layout`）。
+    """
     try:
         exts = volume_extents(drive)
     except PagefileError:
@@ -131,9 +147,110 @@ def base_offset_for(drive: str = "C") -> int | None:
     return exts[0].starting_offset if exts else None
 
 
+@dataclass(frozen=True)
+class Layout:
+    """卷内偏移 ↔ 物理盘偏移的分段映射（一个卷可能跨多块物理盘）。
+
+    `volume_extents()` 的每一段都带「盘号 + 盘上起点」，而本模块其余部分的
+    offset 都是**卷内**偏移。以前只取第一段的起点、把盘号丢掉、调用方一律
+    `Disk.open(0, …)`：在「系统盘不是 `PhysicalDrive0`」的机器上（实测：
+    NVMe 是 disk3、disk0 是挂着 F: 的数据盘）就会拿 C: 的分区起点去读 disk0，
+    读到的是 F: 里的文件数据 —— boot sector 判不出 NTFS，取钥恒失败。
+    """
+
+    extents: tuple[DiskExtent, ...]
+
+    def __post_init__(self) -> None:
+        if not self.extents:
+            raise PagefileError("Layout 没有任何 extent")
+        if any(int(e.length) <= 0 for e in self.extents):
+            raise PagefileError("Layout 里有长度为 0 的 extent")
+
+    @classmethod
+    def of(cls, drive: str = "C") -> "Layout":
+        """查 `drive` 在物理盘上的分布（非提权即可，只要卷设备能打开）。"""
+        exts = tuple(volume_extents(drive))
+        if not exts:
+            raise PagefileError(f"卷 {drive}: 没有任何 disk extent")
+        return cls(exts)
+
+    @property
+    def disk_no(self) -> int:
+        """卷起点所在物理盘（boot sector / $MFT 都从这里读）。"""
+        return self.extents[0].disk_number
+
+    @property
+    def base_offset(self) -> int:
+        """卷起点在这块盘上的字节偏移。"""
+        return self.extents[0].starting_offset
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(int(e.length) for e in self.extents)
+
+    def resolve(self, offset: int, size: int) -> list[tuple[int, int, int]]:
+        """卷内区间 → ``[(盘号, 盘上偏移, 长度), ...]``（跨段处切开）。
+
+        返回值是**盘上绝对偏移**，`Disk.open(disk_no, 0)` 之后可以直接
+        `read_view(偏移, 长度)`。区间落在所有段之外时返回空列表。
+        """
+        if size <= 0:
+            return []
+        start = int(offset)
+        end = start + int(size)
+        if start < 0:
+            raise ValueError(f"卷内偏移不能为负：{start}")
+        out: list[tuple[int, int, int]] = []
+        vol_at = 0
+        for e in self.extents:
+            ext_end = vol_at + int(e.length)
+            lo, hi = max(start, vol_at), min(end, ext_end)
+            if lo < hi:
+                out.append((int(e.disk_number),
+                            int(e.starting_offset) + (lo - vol_at),
+                            hi - lo))
+            vol_at = ext_end
+            if vol_at >= end:
+                break
+        return out
+
+
+def open_volume(drive: str = "C") -> tuple["Disk", Layout]:
+    """打开「卷起点所在的那块物理盘」，并把它的分段布局一起交回来。
+
+    各调用点（`keyd._scan_job` / `win_capture._scan_local`）都**必须**走这里，
+    不要再自己 `Disk.open(0, base_offset_for(...))` —— 那正是「系统盘不在
+    disk0 时取钥恒失败」的根因。
+
+    只支持**单段**卷：NTFS 解析（boot sector / $MFT / pagefile runlist）全程按
+    「卷内偏移 + 一个 base_offset」算，跨多块物理盘的 spanned volume 会在第二段
+    之后读错位置。这种情况明确抛 `PagefileError`，不猜、不静默读垃圾
+    （扫描侧 `Layout.resolve()` 虽然会按段切开，但盘上位置仍需要每个段各开一个
+    句柄，本实现没有做，所以宁可拒绝）。
+    """
+    lay = Layout.of(drive)
+    if len(lay.extents) > 1:
+        raise PagefileError(
+            f"卷 {drive}: 跨了 {len(lay.extents)} 块物理盘（spanned volume），"
+            "本实现只支持单段 —— 请把 pagefile 放到一段连续的分区上")
+    try:
+        return Disk.open(lay.disk_no, lay.base_offset), lay
+    except PagefileError as exc:
+        raise PagefileError(
+            f"{exc}；要读的是卷 {drive}: 的起点"
+            f"（PhysicalDrive{lay.disk_no} @ {lay.base_offset}）") from exc
+
+
 # ---------------------------------------------------------------- 裸盘读
 class Disk:
-    """物理盘只读句柄。所有 offset 都是卷内偏移。"""
+    """物理盘只读句柄。
+
+    两种 offset 口径并存，别混用：
+
+    * **卷内偏移**（默认，NTFS 解析路径用）：内部加 `base_offset` 换成盘上位置；
+    * **盘上绝对偏移**（pagefile 扫描路径用）：`Disk.open(disk_no, 0)` 之后由
+      `Layout.resolve()` 给出，直接 `read_view(abs_off, len)`。
+    """
 
     def __init__(self, handle, base_offset: int, *, disk_no: int) -> None:
         self._h = handle

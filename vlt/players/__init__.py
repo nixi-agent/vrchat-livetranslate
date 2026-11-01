@@ -56,7 +56,7 @@ VRChat 的应用流）拿到的是**混音**：既分不出是谁，也没法按
 |---|---|
 | `procfs_win.py` | Toolhelp32 + `GetExtendedUdpTable`：`find_vrchat`（**按 exe 名**，EAC 拒绝模块快照）/`pick_host`/`udp_ports`/`image_path` |
 | `dgram.py` | npcap（`wpcap.dll` via ctypes）：抓包 + 以太网/IP/UDP 解析 + pcap + **加速器头自适应剥离**（UU 下行 10 / 上行 12 字节，靠 GCM 认证兜底） |
-| `pagefile.py` | NTFS 只读：`\\.\PhysicalDrive0` 裸盘 + boot sector + MFT + `$ATTRIBUTE_LIST`，定位 `pagefile.sys` 的物理段 |
+| `pagefile.py` | NTFS 只读：`\\.\PhysicalDriveN` 裸盘 + boot sector + MFT + `$ATTRIBUTE_LIST`，定位 `pagefile.sys` 的物理段 |
 | `gcm_win.py` | CNG（`bcrypt.dll`）AES-256-GCM：`GcmAuth` 批量验钥 + `Aead`（`gcm._aesgcm` 的后端） |
 | `key_win.py` | 驱逐脏页（`NtSetSystemInformation` flush + `EmptyWorkingSet`）→ 扫 pagefile 找 `byte[32]` → GCM 认证；`SessionCache` 按 `Identity(pid, created)` 缓存 |
 | `win_capture.py` | 把上面几件拼成 `_HelperCapture` 那九个方法（`drain`/`parse`/`acquire_key`…），`leg.py` 直接换腿 |

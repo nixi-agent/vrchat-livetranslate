@@ -63,7 +63,7 @@ AAD_KINDS = ("hdr19", "hdr7", "challenge", "peeronce", "none")
 
 try:
     _bcrypt = ctypes.WinDLL("bcrypt", use_last_error=True)
-except OSError:                                     # 非 Windows 或系统缺 bcrypt
+except (OSError, AttributeError):            # 非 Windows 或系统缺 bcrypt
     _bcrypt = None                              # type: ignore[assignment]
 
 

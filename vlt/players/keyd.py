@@ -2,7 +2,7 @@
 
 ## 为什么必须有这个进程
 
-主程序是普通用户，做不了「读物理磁盘」这件事：`\\\\.\\PhysicalDrive0` 的
+主程序是普通用户，做不了「读物理磁盘」这件事：`\\\\.\\PhysicalDriveN` 的
 `GENERIC_READ` 只给管理员。而 `pagefile.sys` 本身被系统独占持有（文件级
 `CreateFile` 恒 `err=32`），所以只能绕过文件系统、直接读卷所在的那几段扇区。
 
@@ -379,17 +379,22 @@ def _scan_job(job: dict, *, pid: int, conn: socket.socket,
         last[0] = elapsed
         log(f"扫 pagefile：{done / 2**30:.1f} GiB / {elapsed:.1f}s")
 
-    base = pagefile.base_offset_for("C")
-    if base is None:
-        return {"ok": False, "fatal": True,
-                "error": "查不到系统盘所在的物理偏移（读分区表失败）"}
     try:
-        disk = pagefile.Disk.open(0, base)
+        disk, layout = pagefile.open_volume("C")
     except pagefile.PagefileError as exc:
-        return {"ok": False, "fatal": True, "error": f"打不开物理磁盘：{exc}"}
+        return {"ok": False, "fatal": True,
+                "error": f"打不开系统盘所在的物理盘：{exc}"}
+    segs = f"，{len(layout.extents)} 段" if len(layout.extents) > 1 else ""
+    log(f"系统盘在 PhysicalDrive{layout.disk_no}"
+        f"（盘上起点 {layout.base_offset / 2**30:.1f} GiB{segs}）")
 
     with disk:
-        volume = pagefile.read_boot(disk)
+        try:
+            volume = pagefile.read_boot(disk)
+        except pagefile.PagefileError as exc:
+            return {"ok": False, "fatal": True,
+                    "error": (f"PhysicalDrive{layout.disk_no} 的 "
+                              f"{layout.base_offset} 处读不到 NTFS 引导扇区：{exc}")}
         # 记录号缓存按卷序列号校验：换了系统盘/重装了系统时，同一个记录号会指向
         # 另一个完全不相干的文件，直取会拿到错的 extent 区间。序列号不符就丢掉 hint
         # 走一次全表扫描，并由主程序把新记录号写回缓存。
@@ -415,18 +420,23 @@ def _scan_job(job: dict, *, pid: int, conn: socket.socket,
                     "error": f"驱逐脏页失败（errno={stats['trim_err']}）"}
 
         _t = time.monotonic()
-        result = key_win.scan_key(pf, groups, base_offset=base, aad_kind="hdr19",
+        result = key_win.scan_key(pf, groups, layout=layout, aad_kind="hdr19",
                                  deadline_s=max(5.0, deadline - time.monotonic() - 10.0),
                                  on_progress=progress)
         log(f"scan_key 用时 {time.monotonic() - _t:.1f}s（stopped={result.stopped}）")
 
     if result.hit is None:
+        unread = ""
+        if result.unread_bytes:
+            unread = (f"；另有 {result.unread_bytes / 2**20:.1f} MiB 根本没读到"
+                      f"（PhysicalDrive{result.failed_disks} 打不开/读失败），"
+                      "先解决读盘再判断密钥")
         return {
             "ok": False,
             "error": (f"扫了 {result.scanned_bytes / 2**30:.1f} GiB"
                       f"（{result.chunks} 块）、候选 {len(result.candidates)} 个，"
                       "都不通过 GCM 认证。最可能的原因：内存压缩又开着了"
-                      "（Disable-MMAgent -MemoryCompression 后重启）"),
+                      f"（Disable-MMAgent -MemoryCompression 后重启）{unread}"),
         }
     peer, chal = result.hit.flow
     return {

@@ -353,7 +353,7 @@ class _WinCapture:
         """分派：已是管理员就在本进程内扫，否则拉起一次性提权子进程（`keyd`）。
 
         两条路做的事完全一样（定位 pagefile → 驱逐脏页 → 扫锚点 → GCM 认证），
-        区别只是权限来源：`\\\\.\\PhysicalDrive0` 只给管理员 `GENERIC_READ`。
+        区别只是权限来源：`\\.\PhysicalDriveN` 只给管理员 `GENERIC_READ`。
         提权只用于这**一次**读盘；密钥随即进 `SessionCache`，换房间不再弹 UAC。
         """
         if keyd.is_admin():
@@ -428,20 +428,24 @@ class _WinCapture:
     def _scan_local(self, ident: key_win.Identity, groups: dict,
                     flows: dict) -> gcm.KeyHit:
         """已是管理员：本进程直接读盘扫，省掉一次子进程往返。"""
-        base = pagefile.base_offset_for("C")
-        if base is None:
-            raise KeyUnavailable("查不到系统盘所在的物理偏移（需要管理员读分区表）", fatal=True)
         try:
-            disk = pagefile.Disk.open(0, base)
+            disk, layout = pagefile.open_volume("C")
         except pagefile.PagefileError as exc:
             raise KeyUnavailable(
-                f"打不开物理磁盘：{exc}\n"
+                f"打不开系统盘所在的物理盘：{exc}\n"
                 "取钥要读 pagefile.sys 的原始扇区，这一步必须管理员权限（会弹一次 UAC）",
                 fatal=True,
             ) from exc
+        self._status("info", f"系统盘在 PhysicalDrive{layout.disk_no}"
+                            f"（盘上起点 {layout.base_offset / 2**30:.1f} GiB）")
 
         with disk:
-            volume = pagefile.read_boot(disk)
+            try:
+                volume = pagefile.read_boot(disk)
+            except pagefile.PagefileError as exc:
+                raise KeyUnavailable(
+                    f"PhysicalDrive{layout.disk_no} 的 {layout.base_offset} 处"
+                    f"读不到 NTFS 引导扇区：{exc}", fatal=True) from exc
             hint = _hint_mft()
             want = _cached_serial()
             if hint and want and int(getattr(volume, "serial", 0)) != want:
@@ -471,14 +475,19 @@ class _WinCapture:
                 last[0] = elapsed
                 self._status("info", f"扫 pagefile：{done / 2**30:.1f} GiB / {elapsed:.1f}s")
 
-            result = key_win.scan_key(pf, groups, base_offset=base,
+            result = key_win.scan_key(pf, groups, layout=layout,
                                       aad_kind=AAD_KIND, on_progress=_progress)
 
         if result.hit is None:
+            unread = ""
+            if result.unread_bytes:
+                unread = (f"；另有 {result.unread_bytes / 2**20:.1f} MiB 根本没读到"
+                          f"（PhysicalDrive{result.failed_disks} 打不开/读失败）")
             raise KeyUnavailable(
                 f"扫了 {result.scanned_bytes / 2**30:.1f} GiB（{result.chunks} 块）、"
                 f"候选 {len(result.candidates)} 个，都不通过 GCM 认证。"
-                "最可能的原因：内存压缩又开着了（Disable-MMAgent -MemoryCompression 后重启）",
+                "最可能的原因：内存压缩又开着了（Disable-MMAgent -MemoryCompression 后重启）"
+                f"{unread}",
             )
         key = result.hit.key
         self._cache.store(ident, key)

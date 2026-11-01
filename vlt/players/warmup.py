@@ -120,8 +120,8 @@ class WarmupLease:
     def drain(self, timeout: float = 0.2) -> list[tuple[float, bytes]]:
         return self._warmup.drain(timeout)
 
-    def ensure_key(self, samples, *, deadline_s: float = 40.0):
-        return self._warmup.ensure_key(samples, deadline_s=deadline_s)
+    # ⚠️ 这里**故意不提供** `ensure_key()`：取钥/提权只能由预热线程自己做。
+    # 翻译腿只读 `key` 缓存，避免任何一次误用又弹出第二个 pkexec。
 
     @property
     def key(self):

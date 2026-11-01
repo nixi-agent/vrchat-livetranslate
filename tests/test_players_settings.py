@@ -76,8 +76,9 @@ def test_validation() -> None:
     check("等流量夹到 10", ps.pre_seconds == 10.0, str(ps.pre_seconds))
     check("缓冲夹到 4", ps.prewarm_buffer_mb == 4, str(ps.prewarm_buffer_mb))
     check("未知模式回落 off", ps.mode == "off", ps.mode)
-    check("废弃的 prewarm 键被忽略并留痕",
-          any("prewarm 已废弃" in line for line in logs), str(logs))
+    parse_players({"mode": "decrypt", "prewarm": "auto"}, log=logs.append)
+    check("废弃的 prewarm 键被忽略且只提示一次",
+          sum("prewarm 已废弃" in line for line in logs) == 1, str(logs))
     check("未知距离回落 off", ps.distance_mode == "off", ps.distance_mode)
     check("每处都留了痕", len(logs) >= 8, str(len(logs)))
 

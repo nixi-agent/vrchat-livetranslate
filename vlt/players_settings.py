@@ -23,6 +23,10 @@ MODE_OFF = "off"
 MODE_DECRYPT = "decrypt"
 DISTANCE_MODES = ("off", "order", "gate", "both")
 
+#: 只提示一次的废弃键（`parse_players` 会在启动、开设置页、开始翻译时各调一次，
+#: 每次重复刷同一句没有意义）。
+_WARNED_ONCE: set[str] = set()
+
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
@@ -67,8 +71,9 @@ def parse_players(raw: object, *, log: Callable[[str], None] | None = None) -> P
         warn(f"players.mode={mode!r} 未知（off/decrypt）→ 按 off")
         mode = MODE_OFF
 
-    if "prewarm" in raw:
+    if "prewarm" in raw and "prewarm" not in _WARNED_ONCE:
         # 预热已经是分玩家的前提（开 decrypt 就自动预热），旧键忽略即可。
+        _WARNED_ONCE.add("prewarm")
         warn("players.prewarm 已废弃：分玩家必须预热 → 忽略该键")
 
     def number(key: str, default: float, low: float, high: float) -> float:

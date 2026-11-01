@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 
 from ..session.base import SessionConfig
-from . import capture_linux, gcm, guard, names, procfs, world
+from . import capture_linux, gcm, guard, names, world
 from .collector import VoiceCollector
 from .pending import PreKeyBuffer
 from .positions import PositionTable, format_distance
@@ -485,7 +485,7 @@ class PlayerLeg:
                     known = len(collector.names)
                     evict_note = (
                         f" / 按距离换人 {stats.get('distance_evictions', 0)}"
-                        if stats.get("distance_mode", "off") != "off" else "")
+                        if "order" in str(stats.get("distance_mode", "")) else "")
                     self.on_status(
                         "info",
                         f"解码：音频消息 {sum(collector.audio_hits.values())}，"

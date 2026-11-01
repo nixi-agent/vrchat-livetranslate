@@ -481,7 +481,8 @@ class PlayerRouter:
         调用方据此给出不同的状态提示。
 
         * `off`：只回收**空闲**（>15s 没音频）的人 —— 正在说话的人绝不打断；
-        * `order`：先回收空闲的人（省连接，与距离无关，新来者距离未知也照踢）；
+        * `order`：先考虑空闲的人（省连接）；新来者距离未知也照踢，但已知距离时
+          仍保留 1m 滞回（不比空闲者近就不换，避免为远处的人白重建一条连接）；
           **全都在说话**时才按距离排序，新来者严格更近才让最远的那条让位。
           距离未知不猜：既不当作「更近」去踢人，也不当作「更远」被踢。
         """
@@ -492,7 +493,8 @@ class PlayerRouter:
         if "order" in self.distance_mode:
             new_d = self.distance_of(actor)
             if idle:
-                # 空闲会话不产生价值（只在烧连接），回收它不需要距离理由。
+                # 空闲会话只在烧连接，优先回收；但**不是无条件**：已知距离时仍按
+                # 原来的 1m 滞回判「值不值得换」（距离未知才直接踢）。
                 victim = max(idle, key=lambda a: (self.distance_of(a) or 0.0,
                                                   -self.sessions[a].last_audio))
                 far_d = self.distance_of(victim) or 0.0
@@ -510,6 +512,10 @@ class PlayerRouter:
                 far_d, victim = max(known, key=lambda t: (t[0],
                                                           -self.sessions[t[1]].last_audio))
                 if new_d >= far_d:
+                    # 产品选择：打断型换人**严格按距离**（不加 1m 滞回）——
+                    # 「更近的人优先」是这条模式的核心语义。抖动由建连预算兜底
+                    # （账号级 9 次/分钟 + 相邻 ≥6.1s），且每次换人都会打断一句
+                    # 正在说的话，代价本身已经很高。
                     return "distance"            # 不比最远者近，不值得打断
                 self.distance_evictions += 1
                 reason = (f"名额已满，回收最远的 {self.label_of(victim)}"

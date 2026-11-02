@@ -169,6 +169,8 @@ class PlayerLeg:
         self._loop: asyncio.AbstractEventLoop | None = None
         self.router: PlayerRouter | None = None
         self._collector: VoiceCollector | None = None
+        # 租借期间在用的抓包对象：`_ingest` 靠它把名字表回灌预热器（见 `_refresh_warmup`）。
+        self._cap: object | None = None
         self._known_names: dict[str, str] = {}
         self._warned_names = False
         self._warned_world = False
@@ -442,6 +444,8 @@ class PlayerLeg:
         if local_ports:
             self.on_status("info", f"游戏 UDP 端点：{sorted(local_ports)}")
         cap.set_local_ports(local_ports)
+        # 只在租借时才需要回灌（自己的抓包没有预热器可同步）。
+        self._cap = cap if isinstance(cap, _WarmupCapture) else None
         gate = world.WorldGate(self.log_dir) if self.log_dir is not None else None
 
         self.on_status("info", "等待游戏流量（先进世界）…")
@@ -617,6 +621,7 @@ class PlayerLeg:
         finally:
             # 停止翻译/异常退出：把名字表交还预热器，状态页才不会突然变成 0 人
             cap.adopt_names(collector.names)
+            self._cap = None
 
     def _ingest(self, collector: VoiceCollector, dg, hit) -> None:
         """喂一个数据报给采集器；名字表变了才推给界面。
@@ -628,6 +633,23 @@ class PlayerLeg:
         collector.handle(dg, hit.key, hit.layout)
         if collector.names.version != before:
             self._emit_names(collector.names.snapshot())
+            self._refresh_warmup(collector.names)
+
+    def _refresh_warmup(self, table) -> None:
+        """租借期间把名字表同步回预热器（右栏的数据源就是它）。
+
+        预热线程在租借期间不 drain（`warmup._run` 里 `if leased: wait; continue`），
+        它手里的名字表是一份**冻结副本**。不同步的后果是：点「开始翻译」之后右栏
+        再也不更新 —— 离开的人留在列表里还能被勾，新进来的人不出现；而 `finally`
+        里的 `adopt_names` 只兜住「停止翻译」那一次，兜不住整场。
+        """
+        cap = self._cap
+        if cap is None:
+            return
+        try:
+            cap.adopt_names(table)
+        except Exception:                                 # noqa: BLE001 - 同步失败不能拖垮解码
+            pass
 
     def _forward_pcm(self, actor: int, pcm: bytes) -> None:
         """在采集线程里被调用 → 投递到事件循环。"""

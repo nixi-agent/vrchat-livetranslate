@@ -178,7 +178,10 @@ def _sync(gui) -> None:
     chosen = set(ps.select_users)
     _set_text(gui._ppl_title, f"{t('房间玩家')} ({len(rows) - 1})")
     live = sum(1 for r in rows if r.get("translating"))
-    _set_text(gui._ppl_footer, t("已选 {n} / 同时翻译 {m}", n=len(chosen), m=live))
+    # 「已选」只数**当前在场**的人：名单是持久的（勾过的人离开再回来仍然勾着），
+    # 直接把 len(名单) 印出来会出现「已选 5 但列表里只有 2 个人」的错觉。
+    on_stage = sum(1 for r in rows if str(r.get("user_id") or "") in chosen)
+    _set_text(gui._ppl_footer, t("已选 {n} / 同时翻译 {m}", n=on_stage, m=live))
     label = dict(_mode_choices()).get(ps.select_mode)
     if label and gui._ppl_mode_var.get() != label:
         gui._ppl_mode_var.set(label)

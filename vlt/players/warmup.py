@@ -748,11 +748,14 @@ class PlayerWarmup:
         if msg.kind == photon.TYPE_OP_REQUEST and msg.code == photon.EVENT_JOIN_WORLD:
             world = photon.joined_world(payload)
             if world and world != self._world:
-                if self._world:
-                    with self._names_lock:
-                        self._names.clear()
-                    self._pos.clear_actors()
-                    self._frag = {"in": photon.Fragmenter(), "out": photon.Fragmenter()}
+                # **第一次**进世界也要清：预热往往是在「已经在房间里」之后才启动的，
+                # 此时 `self._world` 还是空串，若跳过清表，上一间房的人会一直留在
+                # 右栏、还能被勾选（实测就是这么复现的）。`clear()` 只清 `_by_actor`，
+                # output_log 兜底表（`_log_names`）不受影响，所以清一次没有副作用。
+                with self._names_lock:
+                    self._names.clear()
+                self._pos.clear_actors()
+                self._frag = {"in": photon.Fragmenter(), "out": photon.Fragmenter()}
                 self._world = world
 
     # ------------------------------------------------------------ 状态

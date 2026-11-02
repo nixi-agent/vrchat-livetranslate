@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import math
 import struct
+import threading
 import time
 from dataclasses import dataclass
 
@@ -103,13 +104,19 @@ def parse_position(payload: bytes, *, ts: float | None = None) -> Position | Non
 
 
 class PositionTable:
-    """actor → 最后已知位置，外加本机位置。过期数据按「未知」处理。"""
+    """actor → 最后已知位置，外加本机位置。过期数据按「未知」处理。
+
+    **线程安全**：预热器（写）和翻译腿的 collector（读写）、GUI 状态栏（读）
+    会从不同线程碰同一张表，所以内部所有读写都过一把 RLock。表很小、操作都是
+    O(1)，锁的开销可以忽略。
+    """
 
     def __init__(self, *, max_age_s: float = DEFAULT_MAX_AGE_S) -> None:
         self.max_age_s = max_age_s
         self._by_actor: dict[int, Position] = {}
         self._self: Position | None = None
         self.updates = 0
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------ 写入
 
@@ -124,11 +131,12 @@ class PositionTable:
     def _store(self, actor: int, coords, *, ts, is_self: bool) -> Position:
         position = Position(x=coords[0], y=coords[1], z=coords[2],
                             ts=ts if ts is not None else time.time())
-        self.updates += 1
-        if is_self:
-            self._self = position
-        else:
-            self._by_actor[actor] = position
+        with self._lock:
+            self.updates += 1
+            if is_self:
+                self._self = position
+            else:
+                self._by_actor[actor] = position
         return position
 
     def observe(self, actor: int, payload: bytes, *, ts: float | None = None,
@@ -136,24 +144,23 @@ class PositionTable:
         position = parse_position(payload, ts=ts)
         if position is None:
             return None
-        self.updates += 1
-        if is_self:
-            self._self = position
-        else:
-            self._by_actor[actor] = position
-        return position
+        return self._store(actor, (position.x, position.y, position.z),
+                           ts=position.ts, is_self=is_self)
 
     def forget(self, actor: int) -> None:
-        self._by_actor.pop(actor, None)
+        with self._lock:
+            self._by_actor.pop(actor, None)
 
     def clear_actors(self) -> None:
         """换世界时清掉所有**别人**的位置；自己的位置跟着会话走，保留。"""
-        self._by_actor.clear()
+        with self._lock:
+            self._by_actor.clear()
 
     # ------------------------------------------------------------ 查询
 
     def get(self, actor: int, *, now: float | None = None) -> Position | None:
-        position = self._by_actor.get(actor)
+        with self._lock:
+            position = self._by_actor.get(actor)
         if position is None:
             return None
         now = now if now is not None else time.time()
@@ -163,22 +170,26 @@ class PositionTable:
 
     @property
     def self_position(self) -> Position | None:
-        return self._self
+        with self._lock:
+            return self._self
 
     def distance(self, actor: int, *, now: float | None = None) -> float | None:
         """到本机的 3D 距离；要么没本机位置、要么该玩家位置过期 → None。"""
-        if self._self is None:
+        origin = self.self_position
+        if origin is None:
             return None
         position = self.get(actor, now=now)
         if position is None:
             return None
-        return self._self.distance_to(position)
+        return origin.distance_to(position)
 
     def snapshot(self) -> dict[int, Position]:
-        return dict(self._by_actor)
+        with self._lock:
+            return dict(self._by_actor)
 
     def __len__(self) -> int:
-        return len(self._by_actor)
+        with self._lock:
+            return len(self._by_actor)
 
 
 def format_distance(meters: float | None) -> str:

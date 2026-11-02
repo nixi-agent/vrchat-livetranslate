@@ -581,7 +581,7 @@ STRINGS: dict[str, str] = {
 
     # ---- 设置 → 分玩家 ----
     "分玩家": "Per-player",
-    "分玩家语音（实验性，仅 Linux）": "Per-player voice (experimental, Linux only)",
+    "分玩家语音（实验性）": "Per-player voice (experimental)",
     "⚠️ 需要读取游戏进程内存（VRChat ToS 灰区），建议先用小号验证。": "⚠️ Reads game process memory (a VRChat ToS grey area). Test with a throwaway account first.",
     "解密分玩家": "Decrypt per-player audio",
     "预热:": "Pre-warm:",
@@ -618,4 +618,16 @@ STRINGS: dict[str, str] = {
     "改动即时保存。": "Changes are saved immediately.",
     "已请求重新授权（注意看系统的密码弹窗）": "Re-authorization requested (watch for the system password prompt)",
     "预热未启用": "Pre-warm is not enabled",
+
+    # ---- 主窗 → 房间玩家 ----
+    "我": "Me",
+    "房间玩家": "Room players",
+    "已选 {n} / 同时翻译 {m}": "Selected {n} / translating {m}",
+    "名单已即时生效": "Selection applied immediately",
+    "当前是「全都翻译」，勾选不生效": "Currently 「Translate all」: the checkboxes have no effect",
+    "已切到「只翻勾选的」：其他人会立刻停止翻译": "Switched to 「Only selected」: everyone else stops translating right away",
+    "全不选": "None",
+    "全都翻译": "Translate everyone",
+    "只翻勾选的": "Only checked",
+    "除了勾选的": "All but checked",
 }

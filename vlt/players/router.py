@@ -157,7 +157,9 @@ class PlayerRouter:
                  gate_hysteresis_db: float = 6.0,
                  merger_interval_s: float = 2.0,
                  distance_of=None, distance_mode: str = "off",
-                 max_distance_m: float = 0.0) -> None:
+                 max_distance_m: float = 0.0,
+                 user_of=None, select_mode: str = "all",
+                 select_users=None) -> None:
         self.cfg = cfg
         self.max_sessions = max(1, int(max_sessions))
         self.gate_db = float(gate_db)
@@ -188,7 +190,26 @@ class PlayerRouter:
             self.on_status("warn", "距离门限模式但没有配 max_distance_m → 门限不生效")
             self.distance_mode = self.distance_mode.replace("gate", "").strip() or "off"
 
+        # 翻译名单（可选）：all = 全都翻；only = 只翻名单里的人；except = 除了名单都翻。
+        # 名单按 **user_id** 存 —— actor 号会在同一进程里被复用/重编号，名字也可能改。
+        # 判断 actor → user_id 的映射交给 `user_of`（腿里传 NameTable）。
+        self.user_of = user_of or (lambda _actor: None)
+        self.select_mode = str(select_mode or "all").lower()
+        if self.select_mode not in ("all", "only", "except"):
+            self.on_status("warn", f"未知名单模式 {self.select_mode!r} → 按 all 处理")
+            self.select_mode = "all"
+        self._select_users: set[str] = {str(u) for u in (select_users or ()) if u}
+        if self.select_mode != "all" and not self._select_users:
+            effect = "谁都不翻" if self.select_mode == "only" else "全都翻"
+            self.on_status("warn", f"名单模式 {self.select_mode} 但没有名单 → {effect}")
+
         self.sessions: "OrderedDict[int, PlayerSession]" = OrderedDict()
+        # 给 GUI 线程的只读快照：actor → 最后一块**真实**音频的时刻（monotonic）。
+        # `sessions` 只允许本事件循环线程增删；GUI 线程若直接
+        # `list(self.sessions.items())` 会撞 `RuntimeError: dictionary changed size
+        # during iteration`（概率很低，表现为「在说」字形偶尔少一拍）。这里每 tick
+        # 换一个新 dict，读的一方只拿引用、不遍历原表 —— 整体替换是原子的。
+        self.live_real: dict[int, float] = {}
         # 愿望清单：actor → 最近一次「有音频但还没有会话」的时刻（monotonic）。
         # 建连是串行的，所以「谁先建」由这个时间排序决定，而不是谁先抢到协程。
         self._wanted: "OrderedDict[int, float]" = OrderedDict()
@@ -214,6 +235,8 @@ class PlayerRouter:
         self.text_events = 0
         self.distance_dropped = 0
         self.distance_evictions = 0     # 全都在说话时，按距离让位换人的次数
+        #: 「不在翻译名单里」被丢掉的音频块数（名单模式提示用）
+        self.selected_dropped = 0
         # 诊断：建连次数 / 失败次数 / 溢出丢弃块数（状态栏与 stats 用）
         self.sessions_created = 0
         self.create_failures = 0
@@ -252,12 +275,17 @@ class PlayerRouter:
         self.sessions.clear()
         self._wanted.clear()
         self._ring.clear()
+        self.live_real = {}
 
     # ------------------------------------------------------------ 主入口
 
     async def feed(self, actor: int, pcm: bytes) -> None:
         """喂一个 20ms 的 16k 单声道块。门限以下直接丢（不建会话）。"""
         if self._closed or not pcm:
+            return
+        if not self._selectable(actor):
+            # 名单外的人：连环形缓冲都不留（否则换名单时会把旧音频补发出去）
+            self.selected_dropped += 1
             return
         # 先记原始音频（**在门限之前**）：句首比门限还轻的时候，它只存在于这里。
         if actor not in self.sessions:
@@ -542,6 +570,45 @@ class PlayerRouter:
         if counted and ring:
             self.overflow_dropped += len(ring)
 
+    def _selectable(self, actor: int) -> bool:
+        """这个 actor 在不在「要翻译的名单」里。
+
+        名单按 user_id 存，这里现查 `user_of(actor)`。还没学到 user_id 时（刚进房间、
+        名字事件还没来）只有 `except` 放行 —— `only` 宁可先不翻，也不要把音量预算
+        花在一个马上会被踢掉的人身上。
+        """
+        mode = self.select_mode
+        if mode == "all":
+            return True
+        if not self._select_users:
+            return mode != "only"             # only + 空名单 = 谁都不翻
+        uid = self.user_of(actor)
+        if not uid:
+            return mode == "except"
+        return (str(uid) in self._select_users) == (mode == "only")
+
+    def set_selection(self, select_mode: str = "", select_users=None) -> None:
+        """热更新翻译名单（GUI 勾选后调用）。
+
+        只改字段、不碰 asyncio —— 已经建好的会话由 `_tick_once` 下一拍统一收掉，
+        这里调不到 `_drop`（它是协程）。传空串/None 表示「这一项不变」。
+        """
+        changed = False
+        if select_mode:
+            mode = str(select_mode).lower()
+            if mode not in ("all", "only", "except"):
+                self.on_status("warn", f"未知名单模式 {mode!r} → 忽略")
+            elif mode != self.select_mode:
+                self.select_mode = mode
+                changed = True
+        if select_users is not None:
+            users = {str(u) for u in select_users if u}
+            if users != self._select_users:
+                self._select_users = users
+                changed = True
+        if changed:
+            self._kick()                      # 有人刚被放进来，让它尽快排上队
+
     def _within_distance_gate(self, actor: int) -> bool:
         """`gate` 模式：**只在建会话时**判一次距离。
 
@@ -656,6 +723,12 @@ class PlayerRouter:
             # 长时间没说话：回收，给下一位腾名额（也是**赶在服务端 60s 超时之前**）
             if now - max(st.last_audio, st.last_text or 0.0) > IDLE_CLOSE_S:
                 await self._drop(actor, reason=f"静默 {IDLE_CLOSE_S:.0f}s")
+        # 名单改过（或刚学到 user_id）之后：不该翻的会话立刻收掉，别继续烧 ASR 配额。
+        for actor in list(self.sessions):
+            if not self._selectable(actor):
+                await self._drop(actor, reason="不在翻译名单")
+        # 给 GUI 线程换一份新的只读快照（整体赋值是原子的，读方不遍历原表）。
+        self.live_real = {a: s.last_real for a, s in self.sessions.items()}
         self._prune_wanted(now)
         if self._wanted and not self._busy:
             self._kick()
@@ -692,6 +765,9 @@ class PlayerRouter:
             "distance_evictions": self.distance_evictions,
             "distance_mode": self.distance_mode,
             "max_distance_m": self.max_distance_m,
+            "select_mode": self.select_mode,
+            "select_users": len(self._select_users),
+            "selected_dropped": self.selected_dropped,
             "sessions_created": self.sessions_created,
             "create_failures": self.create_failures,
             "overflow_dropped": self.overflow_dropped,

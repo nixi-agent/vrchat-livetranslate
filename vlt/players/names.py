@@ -620,6 +620,26 @@ class NameTable:
 
 LOG_JOIN_RE = re.compile(r"OnPlayerJoined\s+(.+?)\s+\((usr_[0-9a-fA-F-]{36})\)")
 
+#: 本机账号登录那一行：`Preforming post login checks for 名字 (usr_…)`。
+#: 这是我们唯一能离线拿到「我是谁」的地方 —— Photon 的出向 RaiseEvent 里
+#: **不带**发送者 actor，出向 Event 12 的 body 前 4 字节是服务器时间而不是 actor。
+LOG_SELF_RE = re.compile(r"post login checks for\s+(.+?)\s+\((usr_[0-9a-fA-F-]{36})\)")
+
+
+def parse_self_user_id(path: str | Path) -> str:
+    """从 `output_log_*.txt` 取**本机账号**的 `usr_…`（取最后一次登录那条）。
+
+    取不到就返回空串（调用方据此跳过「剔掉自己」这一步，不影响其它功能）。
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    found = ""
+    for match in LOG_SELF_RE.finditer(text):
+        found = match.group(2).lower()
+    return found
+
 
 def parse_output_log(path: str | Path) -> dict[str, str]:
     """从 VRChat 的 `output_log_*.txt` 里解析 `usr_ → displayName`（兜底用）。

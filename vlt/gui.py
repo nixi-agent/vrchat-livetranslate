@@ -39,7 +39,7 @@ from .gui_bindings import _DELEGATE_MAP
 from .gui_proxy import ProxyMethods, _is_test_process as _is_test_process
 from .gui_sinks import overlay_error_text as overlay_error_text
 from . import gui_room, gui_voice, gui_audio, gui_update, gui_settings
-from . import gui_desktop, gui_chat, gui_engine, gui_layout
+from . import gui_desktop, gui_chat, gui_engine, gui_layout, gui_players_panel
 from .gui_room import RoomCtx; from .gui_voice import VoiceCtx
 from .gui_audio import AudioCtx; from .gui_desktop import DesktopCtx
 from .gui_chat import ChatCtx; from .gui_engine import EngineCtx
@@ -318,8 +318,11 @@ class TranslationGUI(ProxyMethods):
     def _schedule_overlay_save(self): gui_desktop.schedule_overlay_save(self._desktop_ctx, root=self._root, overlay_fn=self._ov_fn)
     def _save_overlay_cfg(self): gui_desktop.save_overlay_cfg(self._desktop_ctx, cfg=self._cfg, overlay_fn=self._ov_fn)
     # ── 聊天 / 输入 / 状态 ──
+    def _build_players_panel(self):
+        """右栏「房间玩家」。必须在 `_build_chat()` 之前调：pack 先到先得右侧条带。"""
+        gui_players_panel.build_panel(self)
     def _build_chat(self):
-        ctx = self._chat_ctx; gui_chat.build_chat(self._root, ctx, self._on_mousewheel)
+        ctx = self._chat_ctx; self._chat_frame = gui_chat.build_chat(self._root, ctx, self._on_mousewheel)
         self._canvas = ctx.canvas; self._vsb = ctx.vsb
     def _build_input_row(self):
         ctx = self._chat_ctx; gui_chat.build_input_row(self._root, ctx, self._cfg, self._attach_edit_menu)

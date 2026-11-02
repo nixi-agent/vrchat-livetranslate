@@ -26,6 +26,7 @@ import os
 import threading
 import time
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
 
 from . import dgram, gcm, gcm_win, key_win, keyd, names, opus, pagefile, procfs, procfs_win
@@ -287,6 +288,9 @@ class _WinCapture:
             stripped = self._stripper.feed(dg)
             if stripped is None:
                 continue
+            # `parse_frame` 只认载荷、把 ts 留成 0.0；这里必须补上 pcap 给的墙钟，
+            # 否则位置表的 ts 全是 0，`PositionTable.get()` 一律判过期 → 右栏距离全 None。
+            stripped = replace(stripped, ts=ts)
             self._frames += 1
             if stripped.is_encrypted:
                 self._replay.append((now, stripped))

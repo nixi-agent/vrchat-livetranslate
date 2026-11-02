@@ -38,7 +38,7 @@ from _cfgbox import sandbox_config  # noqa: E402
 
 CONFIG = sandbox_config(reset=True)
 
-from vlt.players import leg, warmup  # noqa: E402
+from vlt.players import leg, positions, warmup  # noqa: E402
 from vlt.players_settings import MODE_DECRYPT, parse_players  # noqa: E402
 
 FAILS: list[str] = []
@@ -205,6 +205,9 @@ def _leg_with(fake) -> tuple[leg.PlayerLeg, dict]:
     obj.warmup = fake
     obj.port = 27002
     obj.on_status = lambda *a: seen.setdefault("status", []).append(a)
+    # `__new__` 绕过了 `__init__`：位置表那两个属性得手工补齐（`_run_once` 会用）
+    obj._own_positions = positions.PositionTable()
+    obj.positions = obj._own_positions
 
     def _decode(host, log_names, cap) -> None:
         seen["cap"] = cap

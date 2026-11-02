@@ -26,6 +26,7 @@ from __future__ import annotations
 import datetime as _dt
 import faulthandler
 import logging
+import os
 import re
 import sys
 import threading
@@ -324,16 +325,44 @@ class _Tee:
         raise OSError("no fileno")
 
 
-def _fallback_log_dir() -> Path:
-    """主日志目录不可写时的退路（系统临时目录）。
+def _fallback_log_dirs() -> list[Path]:
+    """主日志目录不可写时的退路（系统临时目录），**按顺序**给若干个候选。
 
     真实场景：装了火绒/Defender「受保护文件夹」的机器上，未签名的 exe 写
     `%APPDATA%` 会被拒（EACCES），日志就一条都不剩 —— 用户报障时没有任何线索。
-    临时目录不在受保护范围内，退到这里至少还留得下。
-    """
-    import tempfile
 
-    return Path(tempfile.gettempdir()) / "vrchat-livetranslate" / "logs"
+    ⚠️ 这里**绝对不能抛异常**：火绒 HIPS 会把未签名 exe 的 `%TEMP%` 写入整个拦掉，
+    此时 `tempfile.gettempdir()` 自己就会抛
+    `[Errno 2] No usable temporary directory found in [...]`。原来那版在
+    `for cand in (Path(log_dir), _fallback_log_dir())` 里**先求值**，于是主目录
+    还没试就崩了 —— 冻结版启动直接弹「Failed to execute script 'run_gui'」
+    （实测踩过，2026-11-02）。所以：先看环境变量，再看 tempfile，最后退回工作目录，
+    每一步都单独兜住。
+    """
+    out: list[Path] = []
+    for key in ("TEMP", "TMP", "TMPDIR"):
+        raw = os.environ.get(key)
+        if raw:
+            out.append(Path(raw))
+    try:
+        import tempfile
+
+        out.append(Path(tempfile.gettempdir()))
+    except Exception:  # noqa: BLE001 - 「一个临时目录都没有」是合法状态
+        pass
+    for extra in (Path.cwd(), Path.home()):
+        try:
+            out.append(extra)
+        except Exception:  # noqa: BLE001
+            pass
+    seen: set[Path] = set()
+    uniq: list[Path] = []
+    for base in out:
+        if base in seen:
+            continue
+        seen.add(base)
+        uniq.append(base / "vrchat-livetranslate" / "logs")
+    return uniq
 
 
 def install(log_dir: Path, tag: str = "gui") -> Path:
@@ -349,7 +378,7 @@ def install(log_dir: Path, tag: str = "gui") -> Path:
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     name = f"{tag}_{stamp}.log"
     _LOG_PATH = Path(log_dir) / name
-    for cand in (Path(log_dir), _fallback_log_dir()):
+    for cand in (Path(log_dir), *_fallback_log_dirs()):
         try:
             cand.mkdir(parents=True, exist_ok=True)
             # line buffering：崩溃时最后几行必须已经在磁盘上（不能卡在缓冲区里）

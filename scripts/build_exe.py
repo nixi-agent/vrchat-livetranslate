@@ -150,12 +150,19 @@ def gen_buildinfo() -> Path:
     return out
 
 
-def build() -> Path:
+def build(onedir: bool = False) -> Path:
+    """打包。`onedir=True` 出「目录版」（绿色版 zip），否则出单文件。
+
+    ⚠️ 为什么要留目录版：单文件 exe 启动时必须在 `%TEMP%` 下建 `_MEIxxxxxx` 解包目录，
+    而装了火绒 HIPS 的机器会**拦未签名 exe 在用户配置目录建目录**（实测 `WinError 5`，
+    表现为弹框 `Could not create temporary directory!` 后立即退出）。目录版不解包，
+    配合 `portable.txt`（配置/日志都写在 exe 旁边）就能完全绕开这个拦截。
+    """
     for d in (DIST, BUILD):
         shutil.rmtree(d, ignore_errors=True)
     buildinfo = gen_buildinfo()
     cmd = [str(PY), "-m", "PyInstaller", "--noconfirm", "--clean",
-           "--onefile",            # 单文件
+           "--onedir" if onedir else "--onefile",
            "--noconsole",          # 无控制台窗口（GUI 程序）
            "--name", APP_NAME,
            "--paths", str(REPO),
@@ -177,9 +184,15 @@ def build() -> Path:
     res = run(cmd, text=True)
     if res.returncode != 0:
         raise SystemExit("打包失败，见上面 PyInstaller 的输出")
-    exe = DIST / f"{APP_NAME}.exe"
+    exe = (DIST / APP_NAME / f"{APP_NAME}.exe") if onedir else (DIST / f"{APP_NAME}.exe")
     if not exe.exists():
         raise SystemExit(f"打包结束但没找到产物：{exe}")
+    if onedir:
+        # 绿色版标记：`vlt/paths.app_dir()` 与 `frozen_app_dir()` 都会改用 exe 所在目录，
+        # 从而不碰被火绒保护的 %APPDATA%（见 build() 的 docstring）。
+        (exe.parent / "portable.txt").write_text(
+            "这个文件让程序把 config.yaml / 日志写在 exe 旁边（绿色版）。\n"
+            "删掉它就回到 %APPDATA%\\vrchat-livetranslate。\n", encoding="utf-8")
     return exe
 
 
@@ -293,17 +306,21 @@ def verify(exe: Path, timeout_s: int = 180) -> bool:
 
     logs = sorted((p for d in log_dirs for p in d.glob("gui_*.log")),
                   key=lambda p: p.stat().st_mtime if p.exists() else 0)
-    text = logs[-1].read_text(encoding="utf-8", errors="replace") if logs else ""
-    if logs:
-        print(f"日志：{logs[-1]}", flush=True)
+    # ⚠️ 只认**本次运行之后**写出来的日志：删不掉的旧日志（WinError 5）如果被 sorted()[-1]
+    #    取到，里面当然没有 GUI_SELFTEST_OK，自检就会被误判成失败（实测踩过）。
+    fresh = [p for p in logs if p.stat().st_mtime >= t0 - 1.0]
+    use = fresh[-1] if fresh else None
+    text = use.read_text(encoding="utf-8", errors="replace") if use else ""
+    if use is not None:
+        print(f"日志：{use}", flush=True)
         for line in text.splitlines():
             if any(k in line for k in ("GUI_SELFTEST", "会话已建立", "chatbox", "API key", "❌", "Traceback")):
                 print("   ", line.strip(), flush=True)
     ok = proc.returncode == 0 and "GUI_SELFTEST_OK" in text
     print(("✅ 自检通过" if ok else "❌ 自检未通过") + "（判定依据：退出码 + 日志里的 GUI_SELFTEST_OK）",
           flush=True)
-    if not ok and not logs:
-        print("   ⚠️ 可写目录的 logs/ 里没有日志 —— 说明连崩溃日志都没写出来，"
+    if not ok and use is None:
+        print("   ⚠️ 本次运行没有写任何日志 —— 说明连崩溃日志都没写出来，"
               "多半是启动阶段就挂了", flush=True)
     return ok
 
@@ -311,6 +328,9 @@ def verify(exe: Path, timeout_s: int = 180) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description="打包 VRChat 实时同传为单文件 exe（无控制台）")
     ap.add_argument("--no-verify", action="store_true", help="只打包，不跑 --self-test 自检")
+    ap.add_argument("--onedir", action="store_true",
+                    help="出目录版（绿色版，配 portable.txt）：不解包到 %%TEMP%%，"
+                         "绕开火绒 HIPS 拦「未签名 exe 建临时目录」")
     args = ap.parse_args()
 
     if not PY.exists():
@@ -318,9 +338,10 @@ def main() -> int:
     if not _VENV_PY.exists():
         print(f"[i] 没找到项目 venv（{_VENV_PY}）→ 用当前解释器打包：{PY}", flush=True)
     ensure_pyinstaller()
-    exe = build()
+    exe = build(onedir=args.onedir)
     size_mb = exe.stat().st_size / 1024 / 1024
-    print(f"\n✅ 产物：{exe}\n   大小：{size_mb:.1f} MB（单文件、无控制台）", flush=True)
+    kind = "目录版（绿色版）" if args.onedir else "单文件"
+    print(f"\n✅ 产物：{exe}\n   大小：{size_mb:.1f} MB（{kind}、无控制台）", flush=True)
     print(f"   配置与日志写在：{frozen_app_dir(exe)}"
           "（exe 放在只读目录也能跑；想改成绿色版——配置跟 exe 走——"
           "在 exe 旁边放一个 portable.txt 即可）", flush=True)

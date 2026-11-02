@@ -18,6 +18,9 @@ htmlcov/
 dist/
 build/
 *.spec
+# 调试打包用的临时目录（scripts/build_exe.py 手工加 --workpath/--distpath 时生成）
+dist_dbg/
+build_dbg/
 
 # 用户自己的配置（设备名、语言偏好等因机器而异，不入库）
 # 入库的是 config.example.yaml 模板；首次运行会自动复制生成 config.yaml

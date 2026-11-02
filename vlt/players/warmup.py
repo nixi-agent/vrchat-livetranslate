@@ -148,6 +148,10 @@ class WarmupLease:
         """停止翻译时把腿的名字表交还预热器（否则状态页会显示成 0 人）。"""
         self._warmup.adopt_names(table)
 
+    def set_local_ports(self, ports) -> None:
+        """把游戏端口集合转给底层抓包对象（Windows 判方向要用它）。"""
+        self._warmup.set_local_ports(ports)
+
     def release(self) -> None:
         self._warmup.release()
 
@@ -333,6 +337,22 @@ class PlayerWarmup:
                 return self._drain_fn(sock, timeout=timeout)
             except OSError:
                 return []
+
+    def set_local_ports(self, ports) -> None:
+        """把游戏端口集合转给底层抓包对象。
+
+        只有 Windows 的 `_WinCapture` 有这个口子（UU 下两端都不是 27002，方向
+        判定要靠「本端端口在不在这个集合里」）；POSIX 的助手会话没有，直接跳过。
+        """
+        with self._lock:
+            sock = self._socket
+        forward = getattr(sock, "set_local_ports", None)
+        if forward is None:
+            return
+        try:
+            forward(ports)
+        except Exception:                               # noqa: BLE001 - 端口表查不到不影响抓包
+            pass
 
     def recent_cipher(self, seconds: float = VOICE_REPLAY_S) -> list[capture_linux.Datagram]:
         """最近几秒的密文（给翻译腿回放语音；名字早已解析进表）。"""

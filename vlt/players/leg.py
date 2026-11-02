@@ -83,12 +83,24 @@ class _WarmupCapture:
         return self._lease.drain(timeout)
 
     def parse(self, raw):
-        """把一帧解析成数据报；`local_ports` 跟着端点刷新走。"""
+        """把一帧解析成数据报；`local_ports` 跟着端点刷新走。
+
+        Windows 上 lease 后面坐的是 `_WinCapture`，它 `drain()` 交出来的已经是
+        `Datagram`（剥加速器头必须基于已认出的 UDP 载荷），所以这里恒等 ——
+        和 `warmup._process` 的平台分派同一个口径。
+        """
+        if os.name == "nt":
+            return raw
         return capture_linux.parse_frame(raw, port=self._port,
                                         local_ports=self._local_ports)
 
     def set_local_ports(self, ports) -> None:
         self._local_ports = ports
+        # Windows 的方向判定活在底下的 `_WinCapture` 上，端口一变就转给它，
+        # 不必等预热线程下一轮 5 秒刷新。
+        forward = getattr(self._lease, "set_local_ports", None)
+        if forward is not None:
+            forward(ports)
 
     def cached_key(self):
         return self._lease.key
@@ -316,7 +328,26 @@ class PlayerLeg:
 
         socket/密钥/名字表**只从预热器借用**：开始翻译不再单独提权（否则会和正在
         进行的预热授权抢 pkexec，把授权卡住）。
+
+        租借是**首选**路径，Windows 也走它：预热器一直握着抓包句柄和名字表，租
+        下来既不用重开抓包，`_decode` 收尾的 `adopt_names` 还会把表交还预热器 ——
+        这正是「停止翻译之后名字表不丢」的关键；只有租不到（预热还没起来）时才
+        退回本平台的一次性抓包。
         """
+        lease = None
+        if self.warmup is not None:
+            try:
+                lease = self.warmup.lease()
+            except Exception as exc:                     # noqa: BLE001 - 预热坏了不能拖垮翻译
+                self.on_status("warn", f"预热不可用（{type(exc).__name__}: {exc}），改用常规取钥")
+                lease = None
+        if lease is not None:
+            self.on_status("info", "复用预热：跳过授权与内存扫描")
+            try:
+                self._decode(host, log_names, _WarmupCapture(lease))
+            finally:
+                lease.release()
+            return
         if os.name == "nt":                              # pragma: no cover - 平台分派
             # Windows 没有 pkexec、也没有助手进程：抓包本身不需要提权（npcap），
             # 只有「读裸盘上的 pagefile」那一步要一次性 UAC；而 key 是进程级的，
@@ -328,14 +359,7 @@ class PlayerLeg:
             return
         # Linux：socket/密钥/名字表**只从预热器借用**，开始翻译不再单独提权
         # （否则会和正在进行的预热授权抢 pkexec，把授权卡住）。
-        lease = self.warmup.lease()
-        if lease is None:
-            raise RuntimeError("预热器尚未就绪（等待授权/抓包）")
-        self.on_status("info", "复用预热：跳过授权与内存扫描")
-        try:
-            self._decode(host, log_names, _WarmupCapture(lease))
-        finally:
-            lease.release()
+        raise RuntimeError("预热器尚未就绪（等待授权/抓包）")
 
     def _decode(self, host: Proc.ProcInfo, log_names: dict[str, str], cap) -> None:
         report: dict = {}

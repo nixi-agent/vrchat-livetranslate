@@ -38,7 +38,7 @@ import threading
 import time
 from typing import Callable
 
-from . import capture_linux, gcm, guard, names, pending, photon, procfs
+from . import capture_linux, gcm, guard, names, pending, photon, positions, procfs
 from ..players_settings import MODE_DECRYPT, PlayersSettings
 
 _WIN = os.name == "nt"
@@ -134,6 +134,14 @@ class WarmupLease:
     def names_copy(self) -> names.NameTable:
         return self._warmup.names_copy()
 
+    def user_of(self, actor: int) -> str | None:
+        return self._warmup.user_of(actor)
+
+    @property
+    def positions(self) -> positions.PositionTable:
+        """位置表（**活对象**）：腿直接用这张表算距离，不必自己再喂一份。"""
+        return self._warmup.positions
+
     def status(self) -> dict:
         return self._warmup.status()
 
@@ -203,6 +211,15 @@ class PlayerWarmup:
         self._retry_pending = False
 
         self._names = names.NameTable()
+        # 位置表也归预热器：没开始翻译时右栏要按距离排序，就靠它在后台一直喂。
+        # 翻译腿通过租约借**同一个对象**（不是副本）—— 那边只读，写还是这里和
+        # 腿自己的 collector（表内部有锁）。
+        self._pos = positions.PositionTable()
+        # 本机账号的 usr_…（从 VRChat 的 output_log 读一次）。名字表里也有自己，
+        # 不剔就会出现两行「我」（一行硬编码、一行来自事件表）。
+        # 注意：Photon 出向 RaiseEvent **不带**发送者 actor，出向 Event 12 的
+        # body 前 4 字节是服务器时间而不是 actor，所以只能走 user id。
+        self._log_scan: tuple[dict[str, str], str] | None = None
         self._frag: dict[str, photon.Fragmenter] = {
             "in": photon.Fragmenter(), "out": photon.Fragmenter()}
         self._world = ""
@@ -227,6 +244,13 @@ class PlayerWarmup:
             return
         if self._thread is not None and self._thread.is_alive():
             return
+        # 预热阶段先灌一次 output_log 的名字兜底表：名字事件要等别人进房/说话才来，
+        # 而右栏希望「一进来就先按名字排好」。空表才灌，别覆盖已经收到的事件表。
+        log_table, _self_uid = self._scan_vrchat_log()
+        if log_table:
+            with self._names_lock:
+                if not self._names:
+                    self._names = names.NameTable(log_table)
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="vlt-players-warmup")
@@ -280,6 +304,86 @@ class PlayerWarmup:
         with self._names_lock:
             return self._names.copy()
 
+    @property
+    def positions(self) -> positions.PositionTable:
+        """位置表（**活对象**，不是副本）。未开始翻译时也在喂。"""
+        return self._pos
+
+    def user_of(self, actor: int) -> str | None:
+        """actor → user_id（活查）。翻译名单按 user_id 存，路由每块音频都要问一次。
+
+        表里只有**当前世界**的玩家（换世界就 `clear()`），所以拿不到就是"还不知道"，
+        调用方按自己的保守策略处理（`only` 先不翻、`except` 照翻）。
+        """
+        with self._names_lock:
+            record = self._names.get(actor)
+        return record.user_id if record is not None and record.user_id else None
+
+    def _scan_vrchat_log(self) -> tuple[dict[str, str], str]:
+        """读一次 VRChat 的 `output_log`：`usr_ → 名字` 兜底表 + 本机账号 id。
+
+        只读一次（结果缓存）：GUI 每秒都会问一次右栏数据，不能每次去读几 MB 的文件。
+        """
+        if self._log_scan is None:
+            table: dict[str, str] = {}
+            self_uid = ""
+            try:
+                latest = names.latest_output_log(names.default_log_dir())
+                if latest is not None:
+                    table = names.parse_output_log(latest)
+                    self_uid = names.parse_self_user_id(latest)
+            except Exception:                       # noqa: BLE001 - 读不到日志不算故障
+                table, self_uid = {}, ""
+            self._log_scan = (table, self_uid)
+        return self._log_scan
+
+    def _self_user_id(self) -> str:
+        """本机账号的 `usr_…`（认不出就是空串）。
+
+        为什么不用 actor 号：Photon **出向** RaiseEvent 不带发送者 actor，出向
+        Event 12 的 body 前 4 字节是服务器时间而不是 actor（见 `positions.py`
+        开头的实测布局），所以从协议里认不出「我是哪个 actor」。VRChat 自己的
+        日志里有 `Preforming post login checks for 名字 (usr_…)`，那是唯一稳定的
+        自我标识；名字事件表里自己的 `user_id` 与它一致，据此剔掉重复行。
+        """
+        return self._scan_vrchat_log()[1]
+
+    def player_rows(self) -> list[dict]:
+        """房间玩家（名字表 + 位置表拼出来），给 GUI 右栏用。
+
+        键名不叫 `players`：那个键是**人数**（旧状态页在用），改成列表会破坏它。
+        借出期间用翻译腿的实时状态覆盖 `speaking`/`translating`（只有它知道
+        谁真的在说话、谁已经有 ASR 会话）。
+        """
+        with self._names_lock:
+            snapshot = self._names.snapshot()
+        self_uid = self._self_user_id()
+        rows: list[dict] = []
+        for actor, record in snapshot.items():
+            if self_uid and (record.user_id or "").lower() == self_uid:
+                continue                            # 自己由右栏硬编码那一行代表
+            rows.append({
+                "actor": actor,
+                "user_id": record.user_id or "",
+                "name": record.display_name or "",
+                "distance": self._pos.distance(actor),
+                "self": False,
+                "speaking": False,
+                "translating": False,
+            })
+        live = self._leased_status
+        if live is not None:
+            try:
+                detail = (live() or {}).get("rows") or {}
+            except Exception:                       # noqa: BLE001 - 状态查询不该影响抓包
+                detail = {}
+            for row in rows:
+                patch = detail.get(row["actor"])
+                if patch:
+                    row["speaking"] = bool(patch.get("speaking"))
+                    row["translating"] = bool(patch.get("translating"))
+        return rows
+
     def status(self) -> dict:
         players = len(self._names)
         name_events = self.name_events
@@ -304,6 +408,7 @@ class PlayerWarmup:
             "rescans": self.rescans,
             "key": self._key.fingerprint if self._key else "",
             "host_pid": self._host.pid if self._host else 0,
+            "player_rows": self.player_rows(),
         }
 
     # ------------------------------------------------------------ 租借（给翻译腿）
@@ -457,9 +562,13 @@ class PlayerWarmup:
         host = host or self._find_host()
         if host is None:
             return
+        had_host = self._host is not None
         self._drop_capture()
         self._host = host
-        self._names.clear()
+        if had_host:
+            # 第一次绑定时不能清：那里面是 start() 从 output_log 灌进来的名字兜底表。
+            self._names.clear()
+        self._pos.clear_actors()
         self._key = None
         self._opener = None
         self._samples.clear()
@@ -582,12 +691,27 @@ class PlayerWarmup:
         fragmenter = self._frag[dg.direction]
         for cmd in commands:
             for payload in fragmenter.feed(cmd):
-                self._on_message(payload)
+                self._on_message(payload, ts=dg.ts)
 
-    def _on_message(self, payload: bytes) -> None:
+    def _on_message(self, payload: bytes, *, ts: float | None = None) -> None:
         msg, _skip = photon.parse_message_at(payload)
         if msg is None:
             return
+        # 位置：Event 12（移动/IK）。入向的是别人的；**出向的是自己的**，
+        # 包在 RaiseEvent op 253 里（param 244=事件码, 245=数据）。
+        # 预热阶段就喂，右栏才能「没开始翻译也按距离排序」。
+        if msg.kind == photon.TYPE_EVENT and msg.code == 12:
+            actor = photon.scan_actor(msg.payload)
+            if actor:
+                self._pos.observe(actor, msg.payload, ts=ts)
+        elif msg.kind == photon.TYPE_OP_REQUEST and msg.code == 253:
+            ev = msg.param(244)
+            data = msg.param(245)
+            if (ev is not None and isinstance(ev.value, int) and ev.value == 12
+                    and data is not None
+                    and isinstance(data.value, (bytes, bytearray))):
+                body = bytes(data.value)
+                self._pos.observe_body(0, body, ts=ts, is_self=True)
         if msg.kind == photon.TYPE_EVENT and (
                 msg.code in names.NAME_EVENT_CODES or msg.code == names.LEAVE_EVENT):
             parsed, _diag = ([], {})
@@ -603,10 +727,22 @@ class PlayerWarmup:
                 if self._world:
                     with self._names_lock:
                         self._names.clear()
+                    self._pos.clear_actors()
                     self._frag = {"in": photon.Fragmenter(), "out": photon.Fragmenter()}
                 self._world = world
 
     # ------------------------------------------------------------ 状态
+
+    def on_status(self, level: str, message: str) -> None:
+        """给抓包腿用的公开状态出口。
+
+        `_WinCapture` 会通过 `leg.on_status(...)` 报告取钥进度；预热这边原来只有
+        私有的 `_on_status`，于是那些文案全被 `except` 吞掉、界面上什么都看不到。
+        """
+        try:
+            self._on_status(level, message)
+        except Exception:                                 # noqa: BLE001 - 状态回调不该影响抓包
+            pass
 
     def _set_phase(self, phase: str, detail: str) -> None:
         if phase == self._phase and detail == self._detail:

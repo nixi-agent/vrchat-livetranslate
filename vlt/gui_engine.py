@@ -491,6 +491,8 @@ def _start_players_leg(ctx: EngineCtx, players_cfg: dict) -> None:
         pre_seconds=ps.pre_seconds,
         distance_mode=ps.distance_mode,
         max_distance_m=ps.max_distance_m,
+        select_mode=ps.select_mode,
+        select_users=ps.select_users,
     )
     ctx.players_leg = leg
     leg.start()

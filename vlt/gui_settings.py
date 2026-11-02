@@ -1123,7 +1123,7 @@ def build_settings_players(gui, body: ttk.Frame) -> None:
         t("距离策略:"), t("距离门限（米）:"), t("等流量最长秒数:"),
         t("预热密文缓冲（MB）:"))
 
-    ttk.Label(body, text=t("分玩家语音（实验性，仅 Linux）"),
+    ttk.Label(body, text=t("分玩家语音（实验性）"),
               style="Section.TLabel").pack(anchor=tk.W)
     ttk.Label(body,
               text=t("⚠️ 需要读取游戏进程内存（VRChat ToS 灰区），建议先用小号验证。"),

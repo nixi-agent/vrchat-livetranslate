@@ -55,6 +55,8 @@ SAMPLE_TARGET = 40
 WORLD_WAIT_S = 25.0
 #: 游戏 UDP 端点表的刷新间隔（VRChat 重连会换本地端口）。
 ENDPOINT_REFRESH_S = 2.0
+#: 右栏「正在说话」字形的持续时间：最后一个真实音频块之后这么久还算在说。
+SPEAKING_WINDOW_S = 2.0
 
 
 class _KeyUnavailable(RuntimeError):
@@ -134,6 +136,7 @@ class PlayerLeg:
                  pre_seconds: float = 120.0, port: int = 27002,
                  log_dir: str | Path | None = None,
                  distance_mode: str = "off", max_distance_m: float = 0.0,
+                 select_mode: str = "all", select_users=(),
                  warmup) -> None:
         self.cfg = cfg
         self.on_text = on_text or (lambda *_a: None)
@@ -150,7 +153,14 @@ class PlayerLeg:
         # 距离：off | order | gate | both（位置来自 Event 12 的根节点坐标）
         self.distance_mode = str(distance_mode or "off").lower()
         self.max_distance_m = max(0.0, float(max_distance_m or 0.0))
-        self.positions = PositionTable()
+        # 翻译名单（可选）：all = 全翻；only = 只翻名单里的；except = 除了名单都翻。
+        # 名单按 user_id 存（actor 号会在同一进程里复用），运行时用 `_user_of` 映射。
+        self.select_mode = str(select_mode or "all").lower()
+        self.select_users = tuple(str(u) for u in (select_users or ()) if u)
+        # 位置表优先借预热器的（未开始翻译时它也在喂，右栏排序靠它）；
+        # 租不到时才用自己这份，collector 会把位置写进 `self.positions` 指向的表。
+        self._own_positions = PositionTable()
+        self.positions = self._own_positions
         # 预热器：**必填**。socket/密钥/名字表都借自它；没有预热就没有这条腿
         # （开始翻译不再单独提权 —— 否则会和正在进行的预热授权互相卡住）。
         self.warmup = warmup
@@ -186,6 +196,23 @@ class PlayerLeg:
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def set_selection(self, select_mode: str = "", select_users=None) -> None:
+        """换翻译名单（GUI 线程调）。
+
+        名单存在 config 里、每次启动都会读，所以这里**只影响正在跑的这一轮**：
+        运行中改勾选要立刻生效，才需要把新名单塞进事件循环里的路由。
+        `PlayerRouter.set_selection` 会顺带 `_kick()` 唤醒 `_tick_once` 去收掉
+        不在名单里的会话 —— 它跑在腿的事件循环里，所以只能 `call_soon_threadsafe`。
+        """
+        loop = self._loop
+        router = self.router
+        if loop is None or router is None:
+            return
+        try:
+            loop.call_soon_threadsafe(router.set_selection, select_mode, select_users)
+        except RuntimeError:                              # 循环已关（正在收尾）
+            pass
 
     # ------------------------------------------------------------ 线程内
 
@@ -232,12 +259,50 @@ class PlayerLeg:
             distance_of=lambda actor: self.positions.distance(actor),
             distance_mode=self.distance_mode,
             max_distance_m=self.max_distance_m,
+            user_of=self._user_of,
+            select_mode=self.select_mode,
+            select_users=self.select_users,
         )
         await self.router.start()
         try:
             await asyncio.to_thread(self._capture_blocking, log_names)
         finally:
             await self.router.close()
+
+    def _user_of(self, actor: int) -> str | None:
+        """actor → user_id，给路由的白名单判据用。
+
+        先问 collector（翻译中它手上的表最新：Event 253/255 一到就有），
+        退到预热器的表（没开始翻译、或刚建连还没收到名字事件时）。
+        """
+        collector = self._collector
+        if collector is not None:
+            record = collector.names.get(actor)
+            if record is not None and record.user_id:
+                return record.user_id
+        ask = getattr(self.warmup, "user_of", None)
+        if ask is None:
+            return None
+        try:
+            return ask(actor)
+        except Exception:                                 # noqa: BLE001
+            return None
+
+    def _live_rows(self) -> dict[int, dict]:
+        """actor → {speaking, translating}，给预热器的状态页覆盖用。
+
+        `speaking` 看**真实**音频（`last_real`）：主动补的静音不算说话。
+        没有会话的人不出现 —— 状态页据此把字形显示成静音。
+        """
+        router = self.router
+        if router is None:
+            return {}
+        now = time.monotonic()
+        rows: dict[int, dict] = {}
+        for actor, st in list(router.sessions.items()):
+            rows[actor] = {"speaking": (now - st.last_real) < SPEAKING_WINDOW_S,
+                           "translating": True}
+        return rows
 
     def _label(self, actor: int) -> str:
         collector = self._collector
@@ -341,6 +406,10 @@ class PlayerLeg:
             except Exception as exc:                     # noqa: BLE001 - 预热坏了不能拖垮翻译
                 self.on_status("warn", f"预热不可用（{type(exc).__name__}: {exc}），改用常规取钥")
                 lease = None
+        # 位置表跟着租约走：借到就用预热器那张（它一直在喂），借不到用自己那份。
+        # router 的 distance_of 是运行时读 self.positions，重新赋值即生效。
+        self.positions = (getattr(lease, "positions", None) if lease is not None
+                          else None) or self._own_positions
         if lease is not None:
             self.on_status("info", "复用预热：跳过授权与内存扫描")
             try:
@@ -462,10 +531,12 @@ class PlayerLeg:
                                    positions=self.positions,
                                    initial_names=cap.initial_names())
         self._collector = collector
-        # 翻译期间预热线程暂停读包 → 它的计数会冻结；状态页改看这条腿的实时计数
+        # 翻译期间预热线程暂停读包 → 它的计数会冻结；状态页改看这条腿的实时计数。
+        # `rows` 只有这条腿知道（谁真的在说话、谁已经有 ASR 会话）。
         cap.bind_status(lambda: {"players": len(collector.names),
                                  "name_events": collector.name_events,
-                                 "decrypted": collector.decrypted})
+                                 "decrypted": collector.decrypted,
+                                 "rows": self._live_rows()})
         # ① 回放：预热期间的名字早已在表里；语音只补最近几秒（避免一次灌十几分钟）。
         #    取钥期间自己攒的包（pre_key）按时间序补一遍。
         buffered = pre_key.summary()

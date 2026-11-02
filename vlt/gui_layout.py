@@ -136,6 +136,7 @@ def build_ui(gui) -> None:
     build_output_row(gui)
     gui._build_room_row()
     _divider(gui)
+    gui._build_players_panel()      # 右栏先 pack：先到先得右侧条带，聊天区只吃剩下的宽
     gui._build_chat()
     _divider(gui)
     gui._build_input_row()

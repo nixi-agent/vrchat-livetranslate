@@ -244,13 +244,9 @@ class PlayerWarmup:
             return
         if self._thread is not None and self._thread.is_alive():
             return
-        # 预热阶段先灌一次 output_log 的名字兜底表：名字事件要等别人进房/说话才来，
-        # 而右栏希望「一进来就先按名字排好」。空表才灌，别覆盖已经收到的事件表。
-        log_table, _self_uid = self._scan_vrchat_log()
-        if log_table:
-            with self._names_lock:
-                if not self._names:
-                    self._names = names.NameTable(log_table)
+        # 名字兜底表**不能在这里灌**：`_scan_vrchat_log()` 要整份读 output_log
+        # （可达数 MB + 全文件正则），而 `start()` 是在 GUI 线程里（保存设置 / 点开始
+        # 翻译）同步跑的 —— 放这儿会卡界面。改到 `_run()` 的首轮做（见那里）。
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="vlt-players-warmup")
@@ -337,6 +333,23 @@ class PlayerWarmup:
             self._log_scan = (table, self_uid)
         return self._log_scan
 
+    def _load_log_names(self) -> None:
+        """把 `output_log` 的名字兜底表灌进名字表（只灌空表）。
+
+        谁该看这张表：**事件里没名字**的记录（名字事件偶尔只给 `user_id`）。它**不会**
+        多出行 —— `NameTable(log_names)` 只填 `_log_names`，`snapshot()` 只看
+        `_by_actor`，所以右栏不会「一进来就列出整间房」，那要有进房整表事件（255）
+        或每人各自的进房事件 253 才行。
+
+        在预热线程首轮调用（不是 `start()`）：读日志是几 MB 的同步 IO，放 GUI 线程会卡。
+        """
+        log_table, _self_uid = self._scan_vrchat_log()
+        if not log_table:
+            return
+        with self._names_lock:
+            if not self._names:
+                self._names = names.NameTable(log_table)
+
     def _self_user_id(self) -> str:
         """本机账号的 `usr_…`（认不出就是空串）。
 
@@ -345,8 +358,13 @@ class PlayerWarmup:
         开头的实测布局），所以从协议里认不出「我是哪个 actor」。VRChat 自己的
         日志里有 `Preforming post login checks for 名字 (usr_…)`，那是唯一稳定的
         自我标识；名字事件表里自己的 `user_id` 与它一致，据此剔掉重复行。
+
+        **只读缓存**：真正的读取在预热线程首轮（`_load_log_names`）。这里若也去读，
+        GUI 每秒调一次 `player_rows()` 就会反复卡在文件 IO 上；缓存还没填好时返回
+        空串，右栏那一秒会多出一行自己，下一秒就正常。
         """
-        return self._scan_vrchat_log()[1]
+        cached = self._log_scan
+        return "" if cached is None else cached[1]
 
     def player_rows(self) -> list[dict]:
         """房间玩家（名字表 + 位置表拼出来），给 GUI 右栏用。
@@ -385,7 +403,8 @@ class PlayerWarmup:
         return rows
 
     def status(self) -> dict:
-        players = len(self._names)
+        with self._names_lock:
+            players = len(self._names)
         name_events = self.name_events
         decrypted = self.decrypted
         # 借出期间：用翻译腿的实时计数（否则状态页会停在「借用前的数字」）
@@ -423,6 +442,9 @@ class PlayerWarmup:
     def release(self) -> None:
         with self._lock:
             self._leased = False
+        # 腿已经停了，它的回调读数会永远冻在最后一帧；解绑掉，状态页才会回到
+        # 预热器自己的计数（否则「停止翻译」之后数字不动，看着像卡死）。
+        self._leased_status = None
 
     def bind_leased_status(self, provider) -> None:
         self._leased_status = provider
@@ -522,6 +544,7 @@ class PlayerWarmup:
     # ------------------------------------------------------------ 线程主体
 
     def _run(self) -> None:
+        self._load_log_names()
         while not self._stop.is_set():
             host = self._find_host()
             if host is None:
@@ -566,8 +589,9 @@ class PlayerWarmup:
         self._drop_capture()
         self._host = host
         if had_host:
-            # 第一次绑定时不能清：那里面是 start() 从 output_log 灌进来的名字兜底表。
-            self._names.clear()
+            # 第一次绑定时不能清：那里面是预热线程首轮从 output_log 灌进来的名字兜底表。
+            with self._names_lock:
+                self._names.clear()
         self._pos.clear_actors()
         self._key = None
         self._opener = None

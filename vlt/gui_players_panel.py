@@ -20,7 +20,7 @@ from tkinter import ttk
 from . import ui_tk
 from .i18n import t
 from .players_settings import MODE_DECRYPT, parse_players
-from .ui_theme import ACCENT, BORDER, PANEL, SURFACE, TEXT, TEXT_DIM, TEXT_MUTED
+from .ui_theme import ACCENT, PANEL, SURFACE, TEXT, TEXT_DIM, TEXT_MUTED
 
 #: 栏宽（未按 DPI 缩放的基准像素）
 PANEL_W = 226
@@ -146,11 +146,19 @@ def _mode_choices() -> list[tuple[str, str]]:
 
 
 def _row_key(row: dict) -> str:
-    """行的稳定标识：自己恒为同一行，别人按 user_id；还没学到 id 时退回落 actor。"""
+    """行的稳定标识：自己恒为同一行，别人按 `user_id + actor`。
+
+    为什么不只用 `user_id`：漏收 Leave 事件时同一个账号会在表里留两条（新旧 actor），
+    只用 id 做键会互相顶掉，`_ppl_order` 还会出现重复项。带上 actor 就各占一行，
+    等预热器把过期 actor 清掉后自然消失。
+    """
     if row.get("self"):
         return "\x00self"
     user_id = str(row.get("user_id") or "")
-    return user_id or f"\x00actor{row.get('actor')}"
+    actor = row.get("actor")
+    if not user_id:
+        return f"\x00actor{actor}"           # 还没学到 id：只能按 actor 认
+    return f"{user_id}#{actor}"
 
 
 def _set_text(label, text: str) -> None:
@@ -197,12 +205,27 @@ def _render(gui, rows: list[dict], chosen: set[str]) -> None:
         else:
             _update_row(gui, entry, row, chosen)
     if keys != gui._ppl_order:
-        # 只调整次序（距离排序会换位），控件本身不销毁
-        for key in keys:
-            cache[key]["frame"].pack_forget()
-        for key in keys:
-            cache[key]["frame"].pack(fill=tk.X, pady=1)
+        _reorder(gui, cache, keys)
         gui._ppl_order = keys
+
+
+def _reorder(gui, cache: dict[str, dict], keys: list[str]) -> None:
+    """按 `keys` 重排**已有的**行控件：只调 `pack(before=…)`，绝不 `pack_forget()`。
+
+    距离排序会让人换位，但换位不代表要重建控件。以前用
+    「全部 `pack_forget()` → 再逐个 `pack()`」实现重排：那一瞬间所有行都被 unmap
+    再 map 回来，整栏白闪 —— 人多时换位频繁，看起来就像一直在闪。
+    `pack(before=…)` 是原地插队，控件始终保持 mapped。
+    """
+    inner = gui._ppl_inner
+    want = [cache[key]["frame"] for key in keys]
+    if list(inner.pack_slaves()) == want:
+        return                               # 次序本来就对，一个 pack 调用都不发
+    for index in range(len(want) - 2, -1, -1):
+        try:
+            want[index].pack_configure(before=want[index + 1])
+        except Exception:                    # noqa: BLE001 - 重排失败不该中断刷新
+            pass
 
 
 def _render_row(gui, parent, row: dict, chosen: set[str]) -> dict:
@@ -253,6 +276,9 @@ def _render_row(gui, parent, row: dict, chosen: set[str]) -> dict:
     bg_widgets.append(name_label)
     for widget in (line, name_label):
         widget.bind("<MouseWheel>", lambda e: _on_wheel(gui._ppl_canvas, e))
+        # Linux 的 X11/Wayland 不发 <MouseWheel>，滚轮是 Button-4/5（#128 踩过）
+        widget.bind("<Button-4>", lambda e: _on_wheel(gui._ppl_canvas, e))
+        widget.bind("<Button-5>", lambda e: _on_wheel(gui._ppl_canvas, e))
     return {"frame": line, "bar": bar, "bg": bg, "bg_widgets": bg_widgets,
             "var": var, "check": check, "glyph": glyph_label,
             "glyph_text": glyph, "glyph_color": color,
@@ -316,8 +342,13 @@ def _glyph(row: dict) -> tuple[str, str]:
 
 
 def _on_wheel(canvas, event) -> None:
+    """滚轮：Windows/macOS 看 `delta`，Linux 看 `num`（4 上 / 5 下）。"""
     try:
-        canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            step = -1
+        else:
+            step = 1
+        canvas.yview_scroll(step, "units")
     except Exception:                        # noqa: BLE001
         pass
 
@@ -355,17 +386,28 @@ def _on_toggle(gui, user_id: str, var) -> None:
             users.append(user_id)
     else:
         users = [u for u in users if u != user_id]
-    _save(gui, "select_users", users)
     if ps.select_mode == "all":
-        # `all` 下勾人等于「我要只翻这几个」，顺手切到 only，否则勾了没反应
-        _save(gui, "select_mode", "only")
+        # `all` 下勾人等于「我要只翻这几个」，顺手切到 only，否则勾了没反应。
+        # 但这会让**其他人立刻停翻**，所以状态栏要明说，不能静默。
+        _save(gui, "select_users", users,
+              note=t("已切到「只翻勾选的」：其他人会立刻停止翻译"))
+        _save(gui, "select_mode", "only",
+              note=t("已切到「只翻勾选的」：其他人会立刻停止翻译"))
+        return
+    _save(gui, "select_users", users)
 
 
 def _select_all(gui) -> None:
+    ps = _settings(gui)
+    if ps.select_mode == "all":
+        # 「全都翻译」下名单根本不参与判断：写进去只会让配置自相矛盾
+        # （`select_mode=all` + 非空名单 → 每秒警告「名单不生效」）。
+        gui._set_status("info", t("当前是「全都翻译」，勾选不生效"))
+        return
     users = [str(r.get("user_id")) for r in _rows(gui)
              if r.get("user_id") and not r.get("self")]
     _save(gui, "select_users", users)
-    if _settings(gui).select_mode == "except":
+    if ps.select_mode == "except":
         _save(gui, "select_mode", "only")
 
 
@@ -376,8 +418,13 @@ def _select_none(gui) -> None:
         _save(gui, "select_mode", "all")
 
 
-def _save(gui, key: str, value) -> None:
-    """写 config + 通知运行中的腿（写盘复用设置页那套，含状态提示）。"""
+def _save(gui, key: str, value, *, note: str = "") -> None:
+    """写 config + 通知运行中的腿（写盘复用设置页那套）。
+
+    `note`：设置页保存后固定提示「停止并重新开始翻译后生效」，但名单是
+    `_push()` **即时**推给运行中的腿的（`PlayerLeg.set_selection`），那句文案
+    在这里是错的，所以成功后就地覆盖掉。
+    """
     from .gui_settings import save_players_setting
     try:
         save_players_setting(gui, key, value)
@@ -385,6 +432,7 @@ def _save(gui, key: str, value) -> None:
         gui._set_status("error", t("❌ 没保存：{msg}", msg=exc))
         return
     _push(gui)
+    gui._set_status("info", note or t("名单已即时生效"))
 
 
 def _push(gui) -> None:

@@ -204,6 +204,12 @@ class PlayerRouter:
             self.on_status("warn", f"名单模式 {self.select_mode} 但没有名单 → {effect}")
 
         self.sessions: "OrderedDict[int, PlayerSession]" = OrderedDict()
+        # 给 GUI 线程的只读快照：actor → 最后一块**真实**音频的时刻（monotonic）。
+        # `sessions` 只允许本事件循环线程增删；GUI 线程若直接
+        # `list(self.sessions.items())` 会撞 `RuntimeError: dictionary changed size
+        # during iteration`（概率很低，表现为「在说」字形偶尔少一拍）。这里每 tick
+        # 换一个新 dict，读的一方只拿引用、不遍历原表 —— 整体替换是原子的。
+        self.live_real: dict[int, float] = {}
         # 愿望清单：actor → 最近一次「有音频但还没有会话」的时刻（monotonic）。
         # 建连是串行的，所以「谁先建」由这个时间排序决定，而不是谁先抢到协程。
         self._wanted: "OrderedDict[int, float]" = OrderedDict()
@@ -269,6 +275,7 @@ class PlayerRouter:
         self.sessions.clear()
         self._wanted.clear()
         self._ring.clear()
+        self.live_real = {}
 
     # ------------------------------------------------------------ 主入口
 
@@ -720,6 +727,8 @@ class PlayerRouter:
         for actor in list(self.sessions):
             if not self._selectable(actor):
                 await self._drop(actor, reason="不在翻译名单")
+        # 给 GUI 线程换一份新的只读快照（整体赋值是原子的，读方不遍历原表）。
+        self.live_real = {a: s.last_real for a, s in self.sessions.items()}
         self._prune_wanted(now)
         if self._wanted and not self._busy:
             self._kick()

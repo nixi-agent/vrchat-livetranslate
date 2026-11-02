@@ -293,16 +293,20 @@ class PlayerLeg:
 
         `speaking` 看**真实**音频（`last_real`）：主动补的静音不算说话。
         没有会话的人不出现 —— 状态页据此把字形显示成静音。
+
+        读的是 `router.live_real` 这份**快照**（由腿线程每 tick 整体换新），
+        不是 `router.sessions` 本体：后者由事件循环线程增删，GUI 线程直接遍历
+        小概率撞 `RuntimeError: dictionary changed size during iteration`（被
+        `player_rows` 的 except 吞掉，表现为「在说」字形偶尔少一拍）。
         """
         router = self.router
         if router is None:
             return {}
         now = time.monotonic()
-        rows: dict[int, dict] = {}
-        for actor, st in list(router.sessions.items()):
-            rows[actor] = {"speaking": (now - st.last_real) < SPEAKING_WINDOW_S,
-                           "translating": True}
-        return rows
+        snapshot = router.live_real
+        return {actor: {"speaking": (now - real) < SPEAKING_WINDOW_S,
+                        "translating": True}
+                for actor, real in snapshot.items()}
 
     def _label(self, actor: int) -> str:
         collector = self._collector

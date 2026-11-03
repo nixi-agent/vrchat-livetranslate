@@ -563,9 +563,9 @@ class PlayerWarmup:
                 self._drop_capture()
                 if self._host is not None:
                     self._host = None
-                    self._set_phase(PHASE_WAITING, "等待 VRChat 进程…")
+                    self._set_phase(PHASE_WAITING, self._wait_detail())
                 elif self._phase == PHASE_OFF:
-                    self._set_phase(PHASE_WAITING, "等待 VRChat 进程…")
+                    self._set_phase(PHASE_WAITING, self._wait_detail())
                 self._stop.wait(self._poll_s)
                 continue
             if self._retry_pending:
@@ -812,6 +812,19 @@ class PlayerWarmup:
             self._on_status(level, message)
         except Exception:                                 # noqa: BLE001 - 状态回调不该影响抓包
             pass
+
+    def _wait_detail(self) -> str:
+        """「等待 VRChat」那句的细则：带上当前可见进程数。
+
+        打包成 exe 后 `CreateToolhelp32Snapshot` 曾被拦成空表，界面只有一句
+        「等待 VRChat 进程…」，看不出是「枚举被拦」还是「游戏真没开」。带上
+        这个数字（外加 `procfs_win` 里那条一次性警告）就能一眼分辨。
+        """
+        try:
+            count = len(procfs.iter_processes())
+        except Exception:                                 # noqa: BLE001 - 诊断不该抛
+            count = -1
+        return f"等待 VRChat 进程…（可见进程 {count} 个）"
 
     def _set_phase(self, phase: str, detail: str) -> None:
         if phase == self._phase and detail == self._detail:

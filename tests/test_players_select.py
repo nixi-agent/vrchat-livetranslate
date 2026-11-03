@@ -198,13 +198,18 @@ def _case_stats() -> None:
 
 
 class _FakePositions:
-    """只实现 warmup.player_rows 用到的那一个方法。"""
+    """只实现 warmup.player_rows 用到的那两个方法。"""
 
     def __init__(self, distances: dict[int, float | None]) -> None:
         self._distances = distances
 
     def distance(self, actor: int) -> float | None:
         return self._distances.get(actor)
+
+    def distance_detail(self, actor: int, *, now: float | None = None
+                        ) -> tuple[float | None, float | None, bool]:
+        """玩家行现在走这个：`(米数, 位置多久没更新, 有没有自己位置)`。"""
+        return self._distances.get(actor), 0.0, True
 
 
 def _case_player_rows() -> None:

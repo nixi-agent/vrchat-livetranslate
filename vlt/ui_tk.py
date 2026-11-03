@@ -41,6 +41,9 @@ FONT_STATUS = ("Microsoft YaHei UI", 8)    # 状态栏
 FONT_BOLD_SM = ("Microsoft YaHei UI", 8, "bold")    # 分区小标题
 FONT_BOLD_MD = ("Microsoft YaHei UI", 12, "bold")   # 弹窗小标题
 FONT_BOLD_LG = ("Microsoft YaHei UI", 13, "bold")   # 弹窗大标题（赞助）
+# 房间玩家那一行：VR 里用激光笔点名字，8/9 号太小点不中，单独给一档 11。
+FONT_ROW = ("Microsoft YaHei UI", 11)
+FONT_ROW_BOLD = ("Microsoft YaHei UI", 11, "bold")
 
 # 解析出的字体族缓存（resolve_ui_family 首次调用后钉住；None = 还没解析过）。
 _ui_family: str | None = None
@@ -74,6 +77,7 @@ def apply_ui_font(root) -> None:
     """按当前平台重绑界面字体常量（在建 Tk root 之后、建任何控件之前调用）。"""
     global FONT, FONT_SMALL, FONT_META, FONT_UI, FONT_STATUS
     global FONT_BOLD_SM, FONT_BOLD_MD, FONT_BOLD_LG
+    global FONT_ROW, FONT_ROW_BOLD
     fam = resolve_ui_family(root)
     FONT = (fam, 11)
     FONT_SMALL = (fam, 9)
@@ -83,6 +87,8 @@ def apply_ui_font(root) -> None:
     FONT_BOLD_SM = (fam, 8, "bold")
     FONT_BOLD_MD = (fam, 12, "bold")
     FONT_BOLD_LG = (fam, 13, "bold")
+    FONT_ROW = (fam, 11)
+    FONT_ROW_BOLD = (fam, 11, "bold")
 
 
 _char_width_cache: dict[tuple, int] = {}

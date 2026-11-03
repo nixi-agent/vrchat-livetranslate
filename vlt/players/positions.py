@@ -156,6 +156,18 @@ class PositionTable:
         with self._lock:
             self._by_actor.clear()
 
+    def reset(self) -> None:
+        """换世界/换进程时**连自己的位置一起清**。
+
+        为什么必须清自己：位置是**世界坐标系**里的绝对坐标，换一个世界，原点就换了 ——
+        留着上个世界的自己，就会拿旧原点去减新世界的别人，算出来的距离是纯噪声
+        （实测表现为「距离时对时错、别人动了也不刷新」）。清掉之后右栏显示 `?`，
+        等自己（或别人）动一下发出下一条 Event 12 就恢复。
+        """
+        with self._lock:
+            self._by_actor.clear()
+            self._self = None
+
     # ------------------------------------------------------------ 查询
 
     def get(self, actor: int, *, now: float | None = None) -> Position | None:
@@ -182,6 +194,26 @@ class PositionTable:
         if position is None:
             return None
         return origin.distance_to(position)
+
+    def distance_detail(self, actor: int, *, now: float | None = None
+                        ) -> tuple[float | None, float | None, bool]:
+        """`(米数, 该玩家位置多久没更新(秒), 有没有自己的位置)` —— **不过期也照样给**。
+
+        右栏要的是「能看到多少」，不是「严格算得出」。位置是按需下发的：静坐的玩家
+        只有约 2% 的消息带位置，30 秒不刷新很常见 —— 过期就当未知（`distance()`）
+        会让那一格直接空白，用户看到的就是「时有时无」。所以这里拿最后已知位置算，
+        并把「多久没更新」一起交出去，由界面决定加不加 `~` 前缀。
+        """
+        now = now if now is not None else time.time()
+        with self._lock:
+            origin = self._self
+            position = self._by_actor.get(actor)
+        if position is None:
+            return None, None, origin is not None
+        age = max(0.0, now - position.ts)
+        if origin is None:
+            return None, age, False
+        return origin.distance_to(position), age, True
 
     def snapshot(self) -> dict[int, Position]:
         with self._lock:

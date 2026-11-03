@@ -414,8 +414,13 @@ class PlayerLeg:
                 lease = None
         # 位置表跟着租约走：借到就用预热器那张（它一直在喂），借不到用自己那份。
         # router 的 distance_of 是运行时读 self.positions，重新赋值即生效。
-        self.positions = (getattr(lease, "positions", None) if lease is not None
-                          else None) or self._own_positions
+        # 借不到租约时也要优先用**预热器**那张：预热线程在跑、一直在喂它，而右栏读的
+        # 是同一张表 —— 若这里退回 `_own_positions`，采集器喂的表和右栏读的表就不是
+        # 同一张，右栏距离会整场冻结（实测现象：翻译正常、距离「时有时无」）。
+        warm_positions = (getattr(self.warmup, "positions", None)
+                          if self.warmup is not None else None)
+        self.positions = ((getattr(lease, "positions", None) if lease is not None else None)
+                          or warm_positions or self._own_positions)
         if lease is not None:
             self.on_status("info", "复用预热：跳过授权与内存扫描")
             try:

@@ -176,42 +176,70 @@ def test_leave_destroys_only_own_row() -> bool:
         gui.close()
 
 
-def test_self_and_idless_rows_have_no_checkbox() -> bool:
-    """自己和「还没学到 user_id」的人不能勾：名单按 user_id 存，没 id 无从持久化。"""
+def test_self_and_idless_rows_not_clickable() -> bool:
+    """自己和「还没学到 user_id」的人不能点：名单按 user_id 存，没 id 无从持久化。"""
     rows = [_row(1, "usr_a", "阿诺", 3.4), _row(3, "", "还没 id", 8.0)]
     gui, panel = _panel(rows)
     try:
         panel._sync(gui)
-        assert gui._ppl_rows["\x00self"]["check"] is None, "自己那行出现了勾选框"
-        assert gui._ppl_rows["\x00actor3"]["check"] is None, "没 id 的行出现了勾选框"
-        assert gui._ppl_rows["usr_a#1"]["check"] is not None, "有 id 的行没有勾选框"
-        print("  ✓ 自己 / 无 user_id 的行没有勾选框，有 id 的有")
+        assert not gui._ppl_rows["\x00self"]["clickable"], "自己那行可以点"
+        assert not gui._ppl_rows["\x00actor3"]["clickable"], "没 id 的行可以点"
+        assert gui._ppl_rows["usr_a#1"]["clickable"], "有 id 的行不能点"
+        # 不可点的行不该绑 <Button-1>：否则误点一下就把自己写进名单
+        assert not gui._ppl_rows["\x00self"]["name"].bind("<Button-1>"), "自己那行绑了点击"
+        assert gui._ppl_rows["usr_a#1"]["name"].bind("<Button-1>"), "可点的行没绑点击"
+        # 勾选框已去掉：整行点击取代它，缓存里不该再有 check/var
+        assert "check" not in gui._ppl_rows["usr_a#1"], "还留着勾选框字段"
+        print("  ✓ 自己 / 无 user_id 的行不可点，有 id 的整行可点（无勾选框）")
         return True
     finally:
         gui.close()
 
 
-def test_checkbox_mirrors_selection() -> bool:
-    """名单里的 user_id 必须让勾选框与底色同步（勾选状态来自配置，不是控件自己记）。"""
+def test_selection_mirrors_config() -> bool:
+    """名单里的 user_id 必须让选中底色与名字字体同步（状态来自配置，不是控件自己记）。"""
     rows = [_row(1, "usr_a", "阿诺", 3.4), _row(2, "usr_b", "小明", 1.2)]
     gui, panel = _panel(rows, {"mode": "decrypt", "select_mode": "only",
                                "select_users": ["usr_a"]})
     try:
         panel._sync(gui)
-        assert bool(gui._ppl_rows["usr_a#1"]["var"].get()) is True, "名单里的人没勾上"
-        assert bool(gui._ppl_rows["usr_b#2"]["var"].get()) is False, "名单外的人被勾了"
+        assert gui._ppl_rows["usr_a#1"]["bg"] == panel.ROW_BG_SEL, "名单里的人没高亮"
+        assert gui._ppl_rows["usr_b#2"]["bg"] == panel.PANEL, "名单外的人被高亮了"
+        normal_font = gui._ppl_rows["usr_b#2"]["name"].cget("font")
+        assert normal_font, "名字字体是空的"
 
         # 改名单后必须跟着变（同一批控件，只改状态）
         entry = gui._ppl_rows["usr_b#2"]
         gui.players(select_users=["usr_b"])
         panel._sync(gui)
         assert gui._ppl_rows["usr_b#2"] is entry, "改名单把控件重建了"
-        assert bool(entry["var"].get()) is True, "新进名单的人没勾上"
-        assert bool(gui._ppl_rows["usr_a#1"]["var"].get()) is False, "被移出名单还勾着"
-        print("  ✓ 勾选状态跟随 select_users，且不重建控件")
+        assert entry["bg"] == panel.ROW_BG_SEL, "新进名单的人没高亮"
+        assert gui._ppl_rows["usr_a#1"]["bg"] == panel.PANEL, "被移出名单还高亮着"
+        print("  ✓ 选中状态跟随 select_users，且不重建控件")
         return True
     finally:
         gui.close()
+
+
+def test_distance_text_marks_stale_and_missing_self() -> bool:
+    """距离文本三种态：新鲜 `8.3m`、过期 `~8.3m`、缺自己坐标 `?`。"""
+    from vlt.players.positions import DEFAULT_MAX_AGE_S
+
+    import vlt.gui_players_panel as panel
+
+    fresh = panel._distance_text(_row(1, "usr_a", "阿诺", 8.3, distance_age=0.4,
+                                      self_ok=True))
+    stale = panel._distance_text(_row(1, "usr_a", "阿诺", 8.3,
+                                      distance_age=DEFAULT_MAX_AGE_S + 5,
+                                      self_ok=True))
+    no_self = panel._distance_text(_row(1, "usr_a", "阿诺", None, self_ok=False))
+    unknown = panel._distance_text(_row(1, "usr_a", "阿诺", None))
+    assert fresh == "8.3m", fresh
+    assert stale == "~8.3m", stale
+    assert no_self == "?", no_self
+    assert unknown == "", unknown
+    print(f"  ✓ 距离文本：新鲜 {fresh!r} / 过期 {stale!r} / 缺自己 {no_self!r} / 未知 {unknown!r}")
+    return True
 
 
 def test_set_visible_follows_mode() -> bool:
@@ -275,9 +303,7 @@ def test_toggle_under_all_switches_to_only() -> bool:
     panel._save = _fake_save
     try:
         panel._sync(gui)
-        var = gui._ppl_rows["usr_a#1"]["var"]
-        var.set(True)
-        panel._on_toggle(gui, "usr_a", var)
+        panel._on_toggle(gui, "usr_a")
         assert [s[0] for s in saved] == ["select_users", "select_mode"], saved
         assert saved[0][1] == ["usr_a"], saved
         assert saved[1][1] == "only", saved
@@ -322,8 +348,9 @@ def main() -> int:
     tests = (
         test_reuse_controls_and_update_text,
         test_leave_destroys_only_own_row,
-        test_self_and_idless_rows_have_no_checkbox,
-        test_checkbox_mirrors_selection,
+        test_self_and_idless_rows_not_clickable,
+        test_selection_mirrors_config,
+        test_distance_text_marks_stale_and_missing_self,
         test_set_visible_follows_mode,
         test_select_all_is_noop_under_all_mode,
         test_toggle_under_all_switches_to_only,

@@ -252,7 +252,8 @@ class VoiceCollector:
         self.fragmenters.clear()
         self._last_index.clear()
         if self.positions is not None:
-            self.positions.clear_actors()
+            # 连自己的位置也清：世界坐标系换了，留着上个世界的原点算距离全是噪声。
+            self.positions.reset()
         print(f"[players] 换世界 → {world}（清掉 {dropped} 个旧 actor 名与"
               f"未完成分片）", flush=True)
 

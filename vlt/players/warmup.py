@@ -235,6 +235,12 @@ class PlayerWarmup:
         self.packets = 0
         self.decrypted = 0
         self.rescans = 0
+        # 位置诊断：右栏距离「时有时无」时，光看日志分不清是「没收到位置消息」、
+        # 「收到了但没解出本机位置」还是「表里过期了」。这三个数 + 下面那行日记
+        # 能把三种情况分开。
+        self.pos_msgs = 0          # 收到的 Event 12（别人的位置）
+        self.pos_self_msgs = 0     # 解出的本机位置（出向 Event 12 且 body 解析成功）
+        self._pos_diag_at = 0.0
 
     # ------------------------------------------------------------ 生命周期
 
@@ -376,15 +382,21 @@ class PlayerWarmup:
         with self._names_lock:
             snapshot = self._names.snapshot()
         self_uid = self._self_user_id()
+        now = time.time()
         rows: list[dict] = []
         for actor, record in snapshot.items():
             if self_uid and (record.user_id or "").lower() == self_uid:
                 continue                            # 自己由右栏硬编码那一行代表
+            meters, age_s, self_ok = self._pos.distance_detail(actor, now=now)
             rows.append({
                 "actor": actor,
                 "user_id": record.user_id or "",
                 "name": record.display_name or "",
-                "distance": self._pos.distance(actor),
+                # `distance` 可能是**旧值**（位置按需下发，静坐者很久才有一条）：
+                # 配合 `distance_age` 让界面标成 `~8.3m`，比直接留空好得多。
+                "distance": meters,
+                "distance_age": age_s,
+                "self_ok": self_ok,
                 "self": False,
                 "speaking": False,
                 "translating": False,
@@ -592,7 +604,8 @@ class PlayerWarmup:
             # 第一次绑定时不能清：那里面是预热线程首轮从 output_log 灌进来的名字兜底表。
             with self._names_lock:
                 self._names.clear()
-        self._pos.clear_actors()
+        # 换进程（游戏重启）＝换会话：自己那份位置也作废，否则右栏会拿旧坐标算距离。
+        self._pos.reset()
         self._key = None
         self._opener = None
         self._samples.clear()
@@ -686,6 +699,7 @@ class PlayerWarmup:
                     self._pre_key.append(dg)
                 continue
             self._decrypt_into(dg)
+        self._log_pos_diag()
 
     def _decrypt_into(self, dg: capture_linux.Datagram, *, count_failure: bool = True) -> None:
         opener = self._opener
@@ -728,6 +742,7 @@ class PlayerWarmup:
             actor = photon.scan_actor(msg.payload)
             if actor:
                 self._pos.observe(actor, msg.payload, ts=ts)
+                self.pos_msgs += 1
         elif msg.kind == photon.TYPE_OP_REQUEST and msg.code == 253:
             ev = msg.param(244)
             data = msg.param(245)
@@ -735,7 +750,8 @@ class PlayerWarmup:
                     and data is not None
                     and isinstance(data.value, (bytes, bytearray))):
                 body = bytes(data.value)
-                self._pos.observe_body(0, body, ts=ts, is_self=True)
+                if self._pos.observe_body(0, body, ts=ts, is_self=True) is not None:
+                    self.pos_self_msgs += 1
         if msg.kind == photon.TYPE_EVENT and (
                 msg.code in names.NAME_EVENT_CODES or msg.code == names.LEAVE_EVENT):
             parsed, _diag = ([], {})
@@ -754,9 +770,35 @@ class PlayerWarmup:
                 # output_log 兜底表（`_log_names`）不受影响，所以清一次没有副作用。
                 with self._names_lock:
                     self._names.clear()
-                self._pos.clear_actors()
+                # 位置必须连**自己**一起清（`reset`）：世界坐标系换了，留着上个世界的
+                # 自己算出来的距离全是噪声。
+                self._pos.reset()
                 self._frag = {"in": photon.Fragmenter(), "out": photon.Fragmenter()}
                 self._world = world
+                self._log_pos_diag(force=True)
+
+    def _log_pos_diag(self, *, force: bool = False) -> None:
+        """每 ~10s 一行位置诊断（右栏距离「时有时无」时靠它定位）。
+
+        要分开的三种情况：①一条位置消息都没收到（抓包/解密问题）；
+        ②收到了但解不出**本机**位置（出向 Event 12 的 body 没带位置块 → 所有距离都是
+        None）；③都正常，只是对方静坐太久没刷新（位置表过期 → 界面上标 `~`）。
+        """
+        now = time.monotonic()
+        if not force and now - self._pos_diag_at < 10.0:
+            return
+        self._pos_diag_at = now
+        self_ok = "有" if self._pos.self_position is not None else "缺"
+        track = len(self._pos)
+        stale = 0
+        wall = time.time()
+        for actor in self._pos.snapshot():
+            _meters, age_s, _ok = self._pos.distance_detail(actor, now=wall)
+            if age_s is not None and age_s > self._pos.max_age_s:
+                stale += 1
+        print(f"[pos][diag] 位置消息 {self.pos_msgs}（自己 {self.pos_self_msgs}），"
+              f"跟踪 {track} 人（过期 {stale}），自己位置={self_ok}", flush=True)
+
 
     # ------------------------------------------------------------ 状态
 

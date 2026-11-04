@@ -29,6 +29,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from vlt.players import names as names_mod  # noqa: E402
+from vlt.players import roster as roster_mod  # noqa: E402
 from vlt.players import router as router_mod  # noqa: E402
 from vlt.players import warmup as warmup_mod  # noqa: E402
 from vlt.session.base import SessionConfig  # noqa: E402
@@ -198,13 +199,18 @@ def _case_stats() -> None:
 
 
 class _FakePositions:
-    """只实现 warmup.player_rows 用到的那一个方法。"""
+    """只实现 warmup.player_rows 用到的那两个方法。"""
 
     def __init__(self, distances: dict[int, float | None]) -> None:
         self._distances = distances
 
     def distance(self, actor: int) -> float | None:
         return self._distances.get(actor)
+
+    def distance_detail(self, actor: int, *, now: float | None = None
+                        ) -> tuple[float | None, float | None, bool]:
+        """玩家行现在走这个：`(米数, 位置多久没更新, 有没有自己位置)`。"""
+        return self._distances.get(actor), 0.0, True
 
 
 def _case_player_rows() -> None:
@@ -220,6 +226,9 @@ def _case_player_rows() -> None:
     fake._pos = _FakePositions({1: 2.5, 2: None})
     fake._log_scan = ({}, "")              # 认不出本机账号 → 谁都不当自己
     fake._leased_status = lambda: {"rows": {1: {"speaking": True, "translating": True}}}
+    # 名单为空 → `player_rows()` 走「还没有日志」的兜底分支（下面单独测名单分支）
+    fake._roster = roster_mod.Roster()
+    fake._roster_lock = threading.Lock()
 
     rows = warmup_mod.PlayerWarmup.player_rows(fake)
     by_actor = {r["actor"]: r for r in rows}
@@ -249,6 +258,27 @@ def _case_player_rows() -> None:
     by_actor4 = {r["actor"]: r for r in rows4}
     check("本机账号不再出现在可勾选列表里", sorted(by_actor4) == [1], str(sorted(by_actor4)))
     fake._log_scan = ({}, "")
+
+    # 名单分支：output_log 才是行的权威来源（换房间清空、抓包晚于进房也能出行）
+    print("[select] 右栏数据：名单（output_log）为准")
+    fake._roster.synced = True                  # 模拟「日志已经读过」
+    fake._roster.add("小明", "usr_aaa")        # 名字事件里有 → 直接算距离
+    fake._roster.add("路人", "usr_ccc")        # 名字事件里没有 → 也要出行，只是没距离
+    rows5 = warmup_mod.PlayerWarmup.player_rows(fake)
+    by_name5 = {r["name"]: r for r in rows5}
+    check("名单里的人都在", sorted(by_name5) == ["小明", "路人"], str(sorted(by_name5)))
+    check("名字事件里有的人能算出距离", by_name5["小明"]["actor"] == 1
+          and by_name5["小明"]["distance"] == 2.5, str(by_name5["小明"]))
+    check("名字事件还没到的人也出行（actor 空、距离空）",
+          by_name5["路人"]["actor"] is None and by_name5["路人"]["distance"] is None,
+          str(by_name5["路人"]))
+    check("名单之外的人不出现（名字表里的 actor2 被挡掉）",
+          all(r["actor"] != 2 for r in rows5), str([r["actor"] for r in rows5]))
+
+    fake._roster.set_world("新房间")            # 换房间：旧人立刻消失
+    rows6 = warmup_mod.PlayerWarmup.player_rows(fake)
+    check("换房间后右栏不再残留上一间房的人", rows6 == [], str(rows6))
+    fake._roster.add("路人", "usr_ccc")
 
 
 def main() -> int:

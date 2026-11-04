@@ -20,7 +20,7 @@ from tkinter import ttk
 from . import ui_tk
 from .i18n import t
 from .players_settings import MODE_DECRYPT, parse_players
-from .ui_theme import ACCENT, PANEL, SURFACE, TEXT, TEXT_DIM, TEXT_MUTED
+from .ui_theme import ACCENT, PANEL, TEXT, TEXT_DIM, TEXT_MUTED
 
 #: 栏宽（未按 DPI 缩放的基准像素）
 PANEL_W = 226
@@ -46,7 +46,6 @@ def build_panel(gui) -> None:
     frame.pack_propagate(False)
     gui._players_panel = frame
     gui._ppl_packed = False
-    gui._ppl_vars: dict[str, tk.BooleanVar] = {}
     # 行控件缓存：key → 行控件包。距离每秒都在变，只能改文本不能重建控件，
     # 否则整栏会一直闪（Tk 销毁重建的每一帧都是可见的重绘）。
     gui._ppl_rows: dict[str, dict] = {}
@@ -157,7 +156,15 @@ def _row_key(row: dict) -> str:
     user_id = str(row.get("user_id") or "")
     actor = row.get("actor")
     if not user_id:
-        return f"\x00actor{actor}"           # 还没学到 id：只能按 actor 认
+        # 没有 id（老日志 / 名字事件还没到）只能按名字认。这一支**允许**
+        # `actor is None` —— 名单里的人在名字事件到达前就是没有 actor 的；若还
+        # 拿 actor 当键，所有这类行的键都会变成 `\x00actorNone`，`_render()` 的
+        # 缓存互相覆盖、`_reorder()` 拿到的是同一个控件。有 actor 时再带上它，
+        # 这样两个同名的人在名字事件到了之后能各占一行。
+        name = str(row.get("name") or "").casefold()
+        if actor is None:
+            return f"\x00name:{name}"
+        return f"\x00actor{actor}|{name}"
     return f"{user_id}#{actor}"
 
 
@@ -200,7 +207,6 @@ def _render(gui, rows: list[dict], chosen: set[str]) -> None:
     cache: dict[str, dict] = gui._ppl_rows
     for key in [k for k in cache if k not in keys]:
         cache.pop(key)["frame"].destroy()
-        gui._ppl_vars.pop(key, None)
     for row, key in zip(ordered, keys):
         entry = cache.get(key)
         if entry is None:
@@ -233,57 +239,48 @@ def _reorder(gui, cache: dict[str, dict], keys: list[str]) -> None:
 
 def _render_row(gui, parent, row: dict, chosen: set[str]) -> dict:
     user_id = str(row.get("user_id") or "")
-    selected = bool(user_id) and user_id in chosen
+    is_self = bool(row.get("self"))
+    # 自己和还没学到 user_id 的人不能点（名单按 user_id 存，没 id 无从持久化）
+    clickable = bool(user_id) and not is_self
+    selected = clickable and user_id in chosen
     bg = ROW_BG_SEL if selected else PANEL
+    # pady=2：VR 里是拿激光笔点「这一条」，行太扁点不中
     line = tk.Frame(parent, bg=bg)
-    line.pack(fill=tk.X, pady=1)
-    # 左侧 2px 竖条：只有选中行才亮（暗色下比整行浅底更克制）
+    line.pack(fill=tk.X, pady=2)
+    # 左侧 2px 竖条：只有选中行才亮（暗色下比整行浅底更克制，也是唯一的选择指示）
     bar = tk.Frame(line, bg=ACCENT if selected else bg, width=2)
     bar.pack(side=tk.LEFT, fill=tk.Y)
-    bg_widgets = [line, bar]
-
-    is_self = bool(row.get("self"))
-    var = tk.BooleanVar(value=selected)
-    check = None
-    if is_self or not user_id:
-        # 自己和还没学到 user_id 的人都不能勾（名单按 user_id 存，没 id 无从持久化）
-        pad = tk.Label(line, text="  ", bg=bg, width=2)
-        pad.pack(side=tk.LEFT)
-        bg_widgets.append(pad)
-    else:
-        check = tk.Checkbutton(line, variable=var, bg=bg, activebackground=bg,
-                               selectcolor=SURFACE, highlightthickness=0, bd=0,
-                               takefocus=0, width=2, padx=0,
-                               command=lambda: _on_toggle(gui, user_id, var))
-        check.pack(side=tk.LEFT)
-        gui._ppl_vars[user_id] = var
-        bg_widgets.append(check)
 
     glyph, color = _glyph(row)
-    glyph_label = tk.Label(line, text=glyph, bg=bg, fg=color, font=ui_tk.FONT_SMALL,
+    glyph_label = tk.Label(line, text=glyph, bg=bg, fg=color, font=ui_tk.FONT_ROW,
                            width=2)
     glyph_label.pack(side=tk.RIGHT)
     dist_text = _distance_text(row)
+    # width=6：`~1500m` 是 6 个字符，宽度 5 会把单位裁掉（过期距离带 `~`）。
     dist_label = tk.Label(line, text=dist_text, bg=bg, fg=TEXT_MUTED,
-                          font=ui_tk.FONT_META, width=5, anchor="e")
+                          font=ui_tk.FONT_SMALL, width=6, anchor="e")
     dist_label.pack(side=tk.RIGHT)
-    bg_widgets.extend((glyph_label, dist_label))
 
     name = row.get("name") or (t("我") if is_self else "")
     name_text = _clip(str(name))
     name_label = tk.Label(line, text=name_text, bg=bg,
-                          fg=TEXT if selected else TEXT_DIM,
-                          font=ui_tk.FONT_BOLD_SM if selected else ui_tk.FONT_SMALL,
+                          fg=TEXT if selected else (TEXT_MUTED if is_self else TEXT_DIM),
+                          font=ui_tk.FONT_ROW_BOLD if selected else ui_tk.FONT_ROW,
                           anchor="w")
     name_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-    bg_widgets.append(name_label)
-    for widget in (line, name_label):
+    widgets = [line, bar, glyph_label, dist_label, name_label]
+    for widget in widgets:
         widget.bind("<MouseWheel>", lambda e: _on_wheel(gui._ppl_canvas, e))
         # Linux 的 X11/Wayland 不发 <MouseWheel>，滚轮是 Button-4/5（#128 踩过）
         widget.bind("<Button-4>", lambda e: _on_wheel(gui._ppl_canvas, e))
         widget.bind("<Button-5>", lambda e: _on_wheel(gui._ppl_canvas, e))
-    return {"frame": line, "bar": bar, "bg": bg, "bg_widgets": bg_widgets,
-            "var": var, "check": check, "glyph": glyph_label,
+        if clickable:
+            # 整行可点：VR 里激光笔本来就不好瞄小方块，勾选框已去掉，
+            # 点名字/距离/字形都算点这一行。
+            widget.configure(cursor="hand2")
+            widget.bind("<Button-1>", lambda e, uid=user_id: _on_toggle(gui, uid))
+    return {"frame": line, "bar": bar, "bg": bg, "widgets": widgets,
+            "clickable": clickable, "glyph": glyph_label,
             "glyph_text": glyph, "glyph_color": color,
             "dist": dist_label, "dist_text": dist_text,
             "name": name_label, "name_text": name_text}
@@ -292,19 +289,16 @@ def _render_row(gui, parent, row: dict, chosen: set[str]) -> dict:
 def _update_row(gui, entry: dict, row: dict, chosen: set[str]) -> None:
     """就地更新一行：只在值真的变了才 configure，避免无谓重排。"""
     user_id = str(row.get("user_id") or "")
-    selected = bool(user_id) and user_id in chosen
-    if entry["check"] is not None and bool(entry["var"].get()) != selected:
-        entry["var"].set(selected)           # set() 不会触发 command，安全
+    selected = bool(user_id) and not row.get("self") and user_id in chosen
     bg = ROW_BG_SEL if selected else PANEL
     if entry["bg"] != bg:
         entry["bg"] = bg
-        for widget in entry["bg_widgets"]:
+        for widget in entry["widgets"]:
             widget.configure(bg=bg)
         entry["bar"].configure(bg=ACCENT if selected else bg)
-        if entry["check"] is not None:
-            entry["check"].configure(activebackground=bg)
-        entry["name"].configure(fg=TEXT if selected else TEXT_DIM,
-                                font=ui_tk.FONT_BOLD_SM if selected else ui_tk.FONT_SMALL)
+        entry["name"].configure(
+            fg=TEXT if selected else (TEXT_MUTED if row.get("self") else TEXT_DIM),
+            font=ui_tk.FONT_ROW_BOLD if selected else ui_tk.FONT_ROW)
     glyph, color = _glyph(row)
     if entry["glyph_text"] != glyph:
         entry["glyph_text"] = glyph
@@ -328,11 +322,23 @@ def _clip(name: str) -> str:
 
 
 def _distance_text(row: dict) -> str:
-    from .players.positions import format_distance
+    """距离文本：新鲜就 `8.3m`，过期加 `~`，连自己的位置都没有就 `?`。
+
+    位置是**按需下发**的：移动中的玩家 70~100% 的消息带位置，静坐者只有约 2%，
+    所以最后一帧可能很久没更新。留空（旧行为）看起来像「没这个功能」，给个带
+    `~` 的旧值反而更能说明「他还在这，只是没动」；`?` 表示算不出来 —— 可能是
+    **缺自己的坐标**（自己还没动过），也可能是这个人在 Photon 表里**对不上
+    actor**（名单里已经有人、名字事件还没到），两种情况右栏都只能显示 `?`。
+    """
+    from .players.positions import DEFAULT_MAX_AGE_S, format_distance
     distance = row.get("distance")
     if not isinstance(distance, (int, float)):
-        return ""
-    return format_distance(float(distance))
+        return "?" if row.get("self_ok") is False else ""
+    text = format_distance(float(distance))
+    age = row.get("distance_age")
+    if isinstance(age, (int, float)) and age > DEFAULT_MAX_AGE_S:
+        return "~" + text
+    return text
 
 
 def _glyph(row: dict) -> tuple[str, str]:
@@ -381,14 +387,14 @@ def _on_mode(gui) -> None:
     _save(gui, "select_mode", key)
 
 
-def _on_toggle(gui, user_id: str, var) -> None:
+def _on_toggle(gui, user_id: str) -> None:
+    """切换某个玩家的勾选状态（整行点击的落点，勾选框已去掉）。"""
     ps = _settings(gui)
     users = list(ps.select_users)
-    if bool(var.get()):
-        if user_id not in users:
-            users.append(user_id)
-    else:
+    if user_id in users:
         users = [u for u in users if u != user_id]
+    else:
+        users.append(user_id)
     if ps.select_mode == "all":
         # `all` 下勾人等于「我要只翻这几个」，顺手切到 only，否则勾了没反应。
         # 但这会让**其他人立刻停翻**，所以状态栏要明说，不能静默。

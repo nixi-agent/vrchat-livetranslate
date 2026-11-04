@@ -38,7 +38,8 @@ import threading
 import time
 from typing import Callable
 
-from . import capture_linux, gcm, guard, names, pending, photon, positions, procfs
+from . import (capture_linux, gcm, guard, names, pending, photon, positions, procfs,
+               roster)
 from ..players_settings import MODE_DECRYPT, PlayersSettings
 
 _WIN = os.name == "nt"
@@ -220,6 +221,15 @@ class PlayerWarmup:
         # 注意：Photon 出向 RaiseEvent **不带**发送者 actor，出向 Event 12 的
         # body 前 4 字节是服务器时间而不是 actor，所以只能走 user id。
         self._log_scan: tuple[dict[str, str], str] | None = None
+        # 房间名单：**行**以 output_log 为准（谁在房里），名字事件表只提供 actor 号。
+        # 只用名字表当名单时换房间不会清空（UU 下 host 不变、不触发重绑），上一间房
+        # 的人会一直挂在右栏 —— 这是 `roster` 存在的原因（见该模块文档）。
+        self._roster = roster.Roster()
+        self._roster_lock = threading.Lock()
+        self._log_tail: roster.LogTail | None = None
+        #: 首轮 poll 是把整份日志重放一遍（重建名单），那些历史「进房间」不该当
+        #: 实时事件报到界面上，否则一启动就刷出好几条上一间房的通知。
+        self._roster_live = False
         self._frag: dict[str, photon.Fragmenter] = {
             "in": photon.Fragmenter(), "out": photon.Fragmenter()}
         self._world = ""
@@ -235,6 +245,12 @@ class PlayerWarmup:
         self.packets = 0
         self.decrypted = 0
         self.rescans = 0
+        # 位置诊断：右栏距离「时有时无」时，光看日志分不清是「没收到位置消息」、
+        # 「收到了但没解出本机位置」还是「表里过期了」。这三个数 + 下面那行日记
+        # 能把三种情况分开。
+        self.pos_msgs = 0          # 收到的 Event 12（别人的位置）
+        self.pos_self_msgs = 0     # 解出的本机位置（出向 Event 12 且 body 解析成功）
+        self._pos_diag_at = 0.0
 
     # ------------------------------------------------------------ 生命周期
 
@@ -350,6 +366,41 @@ class PlayerWarmup:
             if not self._names:
                 self._names = names.NameTable(log_table)
 
+    def _poll_roster(self) -> None:
+        """尾随 `output_log`，把「进房 / 加入 / 离开」翻译成房间名单。
+
+        没有这个，名单只能靠 Photon 名字事件表：换房间时它**不会清空**（UU 加速下
+        host 不变、不触发重绑），上一间房的人会一直挂在右栏；反过来，抓包晚于进房门
+        的人则永远补不回来。日志两件事都有（`Entering Room:` 清空、`OnPlayerJoined`
+        / `OnPlayerLeft` 增减），所以名单以它为准。
+
+        由预热线程调用（不是 GUI 线程）：读日志是同步 IO。每次只读新增的字节，
+        文件换了会从头重放一遍，因此重启程序也能立刻得到正确名单。
+        """
+        if self._log_tail is None:
+            self._log_tail = roster.LogTail()
+        try:
+            lines = self._log_tail.poll()
+        except Exception:                           # noqa: BLE001 - 读日志失败不算故障
+            return
+        if not lines:
+            return
+        live = self._roster_live
+        with self._roster_lock:
+            for line in lines:
+                if self._roster.observe_line(line) != "world":
+                    continue
+                # 进新房间：Photon 名字表里上一间房的 actor 也该清了，否则
+                # `player_rows()` 会按 user_id 把旧 actor 的距离/说话状态带过来。
+                with self._names_lock:
+                    self._names.clear()
+                self._world = self._roster.world
+                if live and self.on_status is not None:
+                    # 不带人数：`Entering Room` 那一瞬还没收到任何 `OnPlayerJoined`，
+                    # 报「0 人」只会让人以为名单没生效（右栏标题才是实时人数）。
+                    self._on_status("info", f"进房间：{self._roster.world}")
+            self._roster_live = True
+
     def _self_user_id(self) -> str:
         """本机账号的 `usr_…`（认不出就是空串）。
 
@@ -367,28 +418,76 @@ class PlayerWarmup:
         return "" if cached is None else cached[1]
 
     def player_rows(self) -> list[dict]:
-        """房间玩家（名字表 + 位置表拼出来），给 GUI 右栏用。
+        """房间玩家：**行**来自 output_log 名单，**列**来自 Photon 名字/位置表。
 
         键名不叫 `players`：那个键是**人数**（旧状态页在用），改成列表会破坏它。
         借出期间用翻译腿的实时状态覆盖 `speaking`/`translating`（只有它知道
         谁真的在说话、谁已经有 ASR 会话）。
+
+        为什么行要认名单：只按名字事件表出行时，上一间房的人不会消失（换房不清表），
+        而抓包晚于进房的人永远补不回来。但名单里的人在名字事件还没到时**也要出行**
+        —— 那时只是没有 actor（距离留空、说话状态为假），一旦 actor 学到就自动补齐。
         """
         with self._names_lock:
             snapshot = self._names.snapshot()
+        with self._roster_lock:
+            members = self._roster.members()
+            roster_ready = self._roster.synced
         self_uid = self._self_user_id()
-        rows: list[dict] = []
+        now = time.time()
+
+        # user_id / 显示名 → actor：距离与说话状态都挂在 actor 上
+        by_uid: dict[str, int] = {}
+        by_name: dict[str, int] = {}
         for actor, record in snapshot.items():
-            if self_uid and (record.user_id or "").lower() == self_uid:
-                continue                            # 自己由右栏硬编码那一行代表
-            rows.append({
+            uid = (record.user_id or "").lower()
+            if uid:
+                by_uid.setdefault(uid, actor)
+            label = record.display_name or ""
+            if label:
+                by_name.setdefault(label.casefold(), actor)
+
+        def make_row(actor: int | None, user_id: str, name: str) -> dict:
+            if actor is None:
+                meters, age_s, self_ok = None, None, False
+            else:
+                meters, age_s, self_ok = self._pos.distance_detail(actor, now=now)
+            return {
                 "actor": actor,
-                "user_id": record.user_id or "",
-                "name": record.display_name or "",
-                "distance": self._pos.distance(actor),
+                "user_id": user_id,
+                "name": name,
+                # `distance` 可能是**旧值**（位置按需下发，静坐者很久才有一条）：
+                # 配合 `distance_age` 让界面标成 `~8.3m`，比直接留空好得多。
+                "distance": meters,
+                "distance_age": age_s,
+                "self_ok": self_ok,
                 "self": False,
                 "speaking": False,
                 "translating": False,
-            })
+            }
+
+        rows: list[dict] = []
+        if roster_ready:
+            for member in members:
+                uid = (member.user_id or "").lower()
+                if self_uid and uid == self_uid:
+                    continue                        # 自己由右栏硬编码那一行代表
+                actor = by_uid.get(uid) if uid else None
+                if actor is None and member.name:
+                    actor = by_name.get(member.name.casefold())
+                name = member.name
+                if not name and actor is not None:
+                    name = snapshot[actor].display_name or ""
+                rows.append(make_row(actor, uid, name))
+        else:
+            # 日志还没读到过（VRChat 没写过 / 目录认不出）：退回老行为，别让右栏空掉。
+            # 注意判据是「读过日志」而不是「名单非空」—— 刚换房间那一瞬名单是空的，
+            # 那代表「这房间没人」，此时再按名字表凑人就会把上一间房的人拉回来。
+            for actor, record in snapshot.items():
+                uid = (record.user_id or "").lower()
+                if self_uid and uid == self_uid:
+                    continue
+                rows.append(make_row(actor, uid, record.display_name or ""))
         live = self._leased_status
         if live is not None:
             try:
@@ -405,6 +504,15 @@ class PlayerWarmup:
     def status(self) -> dict:
         with self._names_lock:
             players = len(self._names)
+        with self._roster_lock:
+            roster_size = len(self._roster)
+            room = self._roster.world
+            roster_synced = self._roster.synced
+        if roster_synced:
+            # 日志是名单的权威来源：它知道谁真的在这个房间里（名字事件表不知道离开）。
+            # 判 `synced` 而不是 `roster_size`：离开房间后名单是**空**的，空正是
+            # 「这房间没人」这个答案；按大小判会把上一个世界的人数又报回来。
+            players = roster_size
         name_events = self.name_events
         decrypted = self.decrypted
         # 借出期间：用翻译腿的实时计数（否则状态页会停在「借用前的数字」）
@@ -427,6 +535,7 @@ class PlayerWarmup:
             "rescans": self.rescans,
             "key": self._key.fingerprint if self._key else "",
             "host_pid": self._host.pid if self._host else 0,
+            "room": room,
             "player_rows": self.player_rows(),
         }
 
@@ -501,6 +610,7 @@ class PlayerWarmup:
             if host is None or len(usable) < 2:
                 return None
             self._set_phase(PHASE_ACQUIRING, "正在获取密钥（扫描游戏内存，约 1~20 秒）…")
+            last_error = ""
             for needle in ("q", "i"):
                 if self._stop.is_set():
                     return None
@@ -515,15 +625,24 @@ class PlayerWarmup:
                     if reply.get("blocked"):
                         self._set_phase(PHASE_FAILED, f"读内存被拒绝：{reply.get('error')}")
                         return None
-                    print(f"[warmup] ⚠️ 扫描失败（needle={needle}）：{reply.get('error')}",
+                    last_error = str(reply.get("error") or "")
+                    print(f"[warmup] ⚠️ 扫描失败（needle={needle}）：{last_error}",
                           flush=True)
+                    if _WIN:
+                        # Windows 不分 needle（不读内存，扫的是 pagefile）：换个 needle
+                        # 再来一次只会重复同一次读盘、再弹一次 UAC（实测连弹 6 次）。
+                        break
                     continue
                 candidates = [bytes.fromhex(h) for h in reply.get("candidates", [])]
                 hit = gcm.validate_candidates(candidates, usable)
                 if hit is not None:
                     self._install_key(hit)
                     return hit
-            self._set_phase(PHASE_FAILED, "没找到能通过 GCM 认证的密钥")
+            # 失败原因要进界面：只说「没找到密钥」的话，用户分不清是没提权、
+            # UAC 点了否、pagefile 定位异常，还是真没扫到。
+            self._set_phase(
+                PHASE_FAILED,
+                f"取钥失败：{last_error}" if last_error else "没找到能通过 GCM 认证的密钥")
             return None
 
     def _install_key(self, hit: gcm.KeyHit) -> None:
@@ -546,14 +665,17 @@ class PlayerWarmup:
     def _run(self) -> None:
         self._load_log_names()
         while not self._stop.is_set():
+            # 名单必须每轮都更（跟 socket 无关：日志是 VRChat 自己写的）；借出期间
+            # 也要更，否则翻译腿跑着的时候换房间，右栏还是上一间房的人。
+            self._poll_roster()
             host = self._find_host()
             if host is None:
                 self._drop_capture()
                 if self._host is not None:
                     self._host = None
-                    self._set_phase(PHASE_WAITING, "等待 VRChat 进程…")
+                    self._set_phase(PHASE_WAITING, self._wait_detail())
                 elif self._phase == PHASE_OFF:
-                    self._set_phase(PHASE_WAITING, "等待 VRChat 进程…")
+                    self._set_phase(PHASE_WAITING, self._wait_detail())
                 self._stop.wait(self._poll_s)
                 continue
             if self._retry_pending:
@@ -592,7 +714,8 @@ class PlayerWarmup:
             # 第一次绑定时不能清：那里面是预热线程首轮从 output_log 灌进来的名字兜底表。
             with self._names_lock:
                 self._names.clear()
-        self._pos.clear_actors()
+        # 换进程（游戏重启）＝换会话：自己那份位置也作废，否则右栏会拿旧坐标算距离。
+        self._pos.reset()
         self._key = None
         self._opener = None
         self._samples.clear()
@@ -686,6 +809,7 @@ class PlayerWarmup:
                     self._pre_key.append(dg)
                 continue
             self._decrypt_into(dg)
+        self._log_pos_diag()
 
     def _decrypt_into(self, dg: capture_linux.Datagram, *, count_failure: bool = True) -> None:
         opener = self._opener
@@ -728,6 +852,7 @@ class PlayerWarmup:
             actor = photon.scan_actor(msg.payload)
             if actor:
                 self._pos.observe(actor, msg.payload, ts=ts)
+                self.pos_msgs += 1
         elif msg.kind == photon.TYPE_OP_REQUEST and msg.code == 253:
             ev = msg.param(244)
             data = msg.param(245)
@@ -735,7 +860,8 @@ class PlayerWarmup:
                     and data is not None
                     and isinstance(data.value, (bytes, bytearray))):
                 body = bytes(data.value)
-                self._pos.observe_body(0, body, ts=ts, is_self=True)
+                if self._pos.observe_body(0, body, ts=ts, is_self=True) is not None:
+                    self.pos_self_msgs += 1
         if msg.kind == photon.TYPE_EVENT and (
                 msg.code in names.NAME_EVENT_CODES or msg.code == names.LEAVE_EVENT):
             parsed, _diag = ([], {})
@@ -754,9 +880,35 @@ class PlayerWarmup:
                 # output_log 兜底表（`_log_names`）不受影响，所以清一次没有副作用。
                 with self._names_lock:
                     self._names.clear()
-                self._pos.clear_actors()
+                # 位置必须连**自己**一起清（`reset`）：世界坐标系换了，留着上个世界的
+                # 自己算出来的距离全是噪声。
+                self._pos.reset()
                 self._frag = {"in": photon.Fragmenter(), "out": photon.Fragmenter()}
                 self._world = world
+                self._log_pos_diag(force=True)
+
+    def _log_pos_diag(self, *, force: bool = False) -> None:
+        """每 ~10s 一行位置诊断（右栏距离「时有时无」时靠它定位）。
+
+        要分开的三种情况：①一条位置消息都没收到（抓包/解密问题）；
+        ②收到了但解不出**本机**位置（出向 Event 12 的 body 没带位置块 → 所有距离都是
+        None）；③都正常，只是对方静坐太久没刷新（位置表过期 → 界面上标 `~`）。
+        """
+        now = time.monotonic()
+        if not force and now - self._pos_diag_at < 10.0:
+            return
+        self._pos_diag_at = now
+        self_ok = "有" if self._pos.self_position is not None else "缺"
+        track = len(self._pos)
+        stale = 0
+        wall = time.time()
+        for actor in self._pos.snapshot():
+            _meters, age_s, _ok = self._pos.distance_detail(actor, now=wall)
+            if age_s is not None and age_s > self._pos.max_age_s:
+                stale += 1
+        print(f"[pos][diag] 位置消息 {self.pos_msgs}（自己 {self.pos_self_msgs}），"
+              f"跟踪 {track} 人（过期 {stale}），自己位置={self_ok}", flush=True)
+
 
     # ------------------------------------------------------------ 状态
 
@@ -770,6 +922,28 @@ class PlayerWarmup:
             self._on_status(level, message)
         except Exception:                                 # noqa: BLE001 - 状态回调不该影响抓包
             pass
+
+    def _wait_detail(self) -> str:
+        """「等待 VRChat」那句的细则：带上当前可见进程数。
+
+        打包成 exe 后 `CreateToolhelp32Snapshot` 曾被拦成空表，界面只有一句
+        「等待 VRChat 进程…」，看不出是「枚举被拦」还是「游戏真没开」。带上
+        这个数字（外加 `procfs_win` 里那条一次性警告）就能一眼分辨。
+        """
+        try:
+            count = len(procfs.iter_processes())
+        except Exception:                                 # noqa: BLE001 - 诊断不该抛
+            count = -1
+        if count < 0:
+            return "等待 VRChat 进程…（进程枚举不可用）"
+        # 按 10 分档：这个数字每秒都在抖（开一个浏览器标签页就变），而
+        # `_set_phase()` 是按「文案变了」推送状态的 —— 不分档的话等待期每轮
+        # 都会刷一条状态和一行日志。
+        # 四舍五入到最近的 10，并且 count>0 时最小显示 10：`0` 这个值本身是
+        # 「快照被拦成空表」的信号，不能被进程数抖动撞掉（34 个进程曾显示
+        # 「约 0 个」，正好和要区分的那种故障撞车）。
+        shown = count if count < 10 else (count + 5) // 10 * 10
+        return f"等待 VRChat 进程…（可见进程约 {shown} 个）"
 
     def _set_phase(self, phase: str, detail: str) -> None:
         if phase == self._phase and detail == self._detail:

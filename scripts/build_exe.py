@@ -41,6 +41,16 @@ import tempfile
 import time
 from pathlib import Path
 
+# 中文 Windows 的控制台默认是 GBK：本脚本最后会打 `✅`/`✓`，没设 PYTHONIOENCODING 时
+# 直接 `UnicodeEncodeError: 'gbk' codec can't encode character '\u2705'` 崩在收尾那行 ——
+# PyInstaller 其实已经成功、`portable.txt` 也写了，但自检被跳过，看着像构建失败。
+# 这里自己兜底成 UTF-8，用户不必记得设环境变量。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001 - 被重定向成非 TextIOWrapper 就算了
+        pass
+
 REPO = Path(__file__).resolve().parent.parent
 _VENV_PY = REPO / ".venv" / "Scripts" / "python.exe"
 # 没建项目 venv 也能跑（CI / conda / 系统 Python 直接调）：退回**当前解释器**。

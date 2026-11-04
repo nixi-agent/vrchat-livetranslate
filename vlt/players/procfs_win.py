@@ -104,26 +104,74 @@ class _FILETIME(C.Structure):
     _fields_ = [("dwLowDateTime", W.DWORD), ("dwHighDateTime", W.DWORD)]
 
 
+_SNAP_WARNED = False
+_UDP_FALLBACK_LOGGED = False
+_UDP_WARNED = False
+#: 快照本身拿不到（不是「没找到 VRChat」）。只有这种状态下才值得走 UDP 反查：
+#: 游戏没开时 `discover()` 同样是空表，那不该每 2 s 去拉一遍 UDP 表、开一堆进程。
+_SNAP_BROKEN = False
+
+
+def _warn_snapshot_once(detail: str) -> None:
+    """快照拿不到时**只喊一次**。
+
+    这条以前是静默 `return []`：打包成 exe 后它一直返回空表，界面就永远停在
+    「等待 VRChat 进程…」，日志里一个字都没有 —— 排查全靠猜。现在至少留下
+    `GetLastError`，并且 `find_vrchat()` 会改走 UDP 表反查兜底。
+    """
+    global _SNAP_WARNED
+    if _SNAP_WARNED:
+        return
+    _SNAP_WARNED = True
+    print(f"[procfs][warn] 进程枚举不可用：{detail}（改用 UDP 表反查）", flush=True)
+
+
+def _warn_udp_once(detail: str) -> None:
+    """UDP 反查自己失败时的告警。
+
+    不能复用 `_warn_snapshot_once`：那句话的主语是「进程枚举不可用」，而这里
+    枚举是好的、坏的是兜底路径 —— 文案错了会把人带偏。
+    """
+    global _UDP_WARNED
+    if _UDP_WARNED:
+        return
+    _UDP_WARNED = True
+    print(f"[procfs][warn] UDP 表反查也失败了：{detail}（看不到 VRChat 进程）",
+          flush=True)
+
+
 def iter_processes() -> list[tuple[int, str, int]]:
     """全系统进程快照 `[(pid, exe 名, 父 pid)]`。
 
     `TH32CS_SNAPPROCESS` 拿的是**名字**，不碰任何进程内部 —— 这也正是
     `TH32CS_SNAPMODULE` 被 EAC 拒绝时唯一还能用的那份信息。
     """
+    global _SNAP_BROKEN
     snap = _k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if not snap or int(snap) == 0xFFFFFFFFFFFFFFFF:
+        _SNAP_BROKEN = True
+        _warn_snapshot_once(
+            f"CreateToolhelp32Snapshot 失败 err={C.get_last_error()}")
         return []
     out: list[tuple[int, str, int]] = []
     try:
         entry = _PROCESSENTRY32W()
         entry.dwSize = C.sizeof(_PROCESSENTRY32W)
         ok = _k32.Process32FirstW(snap, C.byref(entry))
+        if not ok:
+            _SNAP_BROKEN = True
+            _warn_snapshot_once(
+                f"Process32FirstW 失败 err={C.get_last_error()}")
         while ok:
             out.append((int(entry.th32ProcessID), entry.szExeFile,
                         int(entry.th32ParentProcessID)))
             ok = _k32.Process32NextW(snap, C.byref(entry))
     finally:
         _k32.CloseHandle(snap)
+    if ok or out:
+        # 这次快照是好的：清掉标记，下次找不到 VRChat 就只是「游戏没开」，
+        # 不该再去拉 UDP 表。
+        _SNAP_BROKEN = False
     return out
 
 
@@ -226,8 +274,60 @@ def discover(markers: tuple[str, ...], *, limit: int = 400) -> list[ProcInfo]:
 
 
 def find_vrchat() -> list[ProcInfo]:
-    """所有看起来像 VRChat 的进程（游戏本体 + 受保护启动器）。"""
-    return discover(GAME_MARKERS)
+    """所有看起来像 VRChat 的进程（游戏本体 + 受保护启动器）。
+
+    两条路：正常走 Toolhelp 快照；**快照被拦时改走 UDP 表反查** ——
+    打包成 exe 后实测 Toolhelp 恒返回空表（`CreateToolhelp32Snapshot` 直接
+    失败），界面就永远「等待 VRChat 进程…」，而 `GetExtendedUdpTable` 与
+    `QueryFullProcessImageNameW` 都还能用（后者只要求
+    `PROCESS_QUERY_LIMITED_INFORMATION`，EAC 不剥）。
+
+    兜底**只在快照本身失败时**启用：快照是好的、只是没有 VRChat，等于「游戏
+    没开」—— 那种时候每轮都去拉 UDP 表、逐个 `OpenProcess` 只是白烧 CPU。
+    """
+    procs = discover(GAME_MARKERS)
+    if procs:
+        return procs
+    if not _SNAP_BROKEN:
+        return []
+    return _discover_by_udp(GAME_MARKERS)
+
+
+def _discover_by_udp(markers: tuple[str, ...]) -> list[ProcInfo]:
+    """用 UDP 表里出现的 pid 反查 exe 名（不依赖 Toolhelp）。
+
+    游戏无论直连还是走加速器，都必然至少有一个 UDP 套接字，所以「有 UDP 端点的
+    pid」是它的超集；再逐个 `image_path` 比名字即可。开销：本机约几十个 pid，
+    每次轮询几毫秒。
+    """
+    global _UDP_FALLBACK_LOGGED
+    wanted = tuple(m.lower() for m in markers)
+    pids: dict[int, str] = {}
+    try:
+        rows = dgram.udp_table()
+    except Exception as exc:                     # noqa: BLE001 - 兜底路径不许抛
+        _warn_udp_once(str(exc) or "GetExtendedUdpTable 调用失败")
+        return []
+    for _addr, _port, owner in rows:
+        if owner > 0:
+            pids.setdefault(owner, "")
+    found: list[ProcInfo] = []
+    for pid in pids:
+        path = image_path(pid)
+        if not path:
+            continue
+        name = path.rsplit("\\", 1)[-1]
+        low = name.lower()
+        if not any(m in low for m in wanted):
+            continue
+        found.append(collect(pid, exe=name))
+    if found and not _UDP_FALLBACK_LOGGED:
+        # 只喊一次：以后看日志就知道这一次是走兜底找到的，还是 Toolhelp 正常。
+        _UDP_FALLBACK_LOGGED = True
+        detail = "、".join(f"{p.pid} {p.comm}" for p in found)
+        print(f"[procfs][info] 快照为空，已按 UDP 表反查到：{detail}",
+              flush=True)
+    return found
 
 
 def find_eac() -> list[ProcInfo]:

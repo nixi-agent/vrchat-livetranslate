@@ -358,9 +358,13 @@ def _decode_samples(raw) -> dict:
     return groups
 
 
-def _scan_job(job: dict, *, pid: int, conn: socket.socket,
-              deadline: float) -> dict:
-    """真正的特权工作：定位 pagefile → 驱逐脏页 → 扫 key → 交回（不含明文日志）。"""
+def _scan_job_inner(job: dict, *, pid: int, conn: socket.socket,
+                    deadline: float, info: dict) -> dict:
+    """真正的特权工作：定位 pagefile → 驱逐脏页 → 扫 key → 交回（不含明文日志）。
+
+    ``info`` 是**出参**：把定位到的 pagefile 记录号/卷序列号塞进去，好让
+    ``_scan_job`` 在失败时也能带回去（下次就不用再扫一遍 MFT 了）。
+    """
     groups = _decode_samples(job.get("samples"))
     if not groups:
         return {"ok": False, "error": "没有可用的 Photon 加密包样本", "fatal": True}
@@ -408,6 +412,10 @@ def _scan_job(job: dict, *, pid: int, conn: socket.socket,
         if pf is None:
             return {"ok": False, "fatal": True, "error": "没在 MFT 里定位到 pagefile.sys"}
         log(pf.summary())
+        # 无论后面成不成，这个记录号都值得带回去缓存：hint 过期时正是靠这一次
+        # 全表扫描把它纠正过来的，失败也照样写回。
+        info["mft"] = pf.mft_index
+        info["serial"] = int(getattr(volume, "serial", 0) or 0)
         if not pf.real_bytes:
             return {"ok": False, "fatal": True,
                     "error": "pagefile 是空的：取钥前要先进一次世界"}
@@ -457,6 +465,25 @@ def _scan_job(job: dict, *, pid: int, conn: socket.socket,
         "pagefile_mft": pf.mft_index,
         "volume_serial": int(getattr(volume, "serial", 0) or 0),
     }
+
+
+def _scan_job(job: dict, *, pid: int, conn: socket.socket,
+              deadline: float) -> dict:
+    """``_scan_job_inner`` 的薄包装：**任何异常都要变成一条回复**。
+
+    子进程直接抛异常退出时，主程序只读到 EOF，界面显示的是「提权子进程没有
+    交出结果就断开了」—— 真实原因就此丢掉（实测踩过，只能靠猜）。这里兜住一切
+    异常，并保证成功失败都带回 pagefile 记录号。
+    """
+    info: dict = {}
+    try:
+        out = _scan_job_inner(job, pid=pid, conn=conn, deadline=deadline, info=info)
+    except Exception as exc:                    # noqa: BLE001 - 兜住一切，别静默退出
+        out = {"ok": False, "fatal": False,
+               "error": f"提权子进程内部出错：{type(exc).__name__}: {exc}"}
+    out.setdefault("pagefile_mft", int(info.get("mft") or 0))
+    out.setdefault("volume_serial", int(info.get("serial") or 0))
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:

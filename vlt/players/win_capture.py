@@ -29,7 +29,9 @@ from collections import deque
 from dataclasses import replace
 from pathlib import Path
 
-from . import dgram, gcm, gcm_win, key_win, keyd, names, opus, pagefile, procfs, procfs_win
+from .. import paths
+from . import (dgram, gcm, gcm_win, key_win, keyd, names, opus, pagefile,
+               procfs, procfs_win)
 
 # AAD 口径：`key_win` 的命名 → `gcm` 的 layout 名。
 # `hdr19` = AAD 取包前 19 字节（peerID+flag+challenge+nonce），实测唯一成立的那个。
@@ -45,15 +47,35 @@ REPLAY_S = 5.0
 MAX_REPLAY = 4096
 # 与 `leg.SAMPLE_TARGET` 对齐：够了就开始扫，不用等收满。
 SAMPLE_TARGET = 40
-# pagefile 的 MFT 记录号在单机上是不变的；给出来能省掉整表扫描（实测 67 s → 0 s）。
-# 优先级：环境变量 `VLT_PAGEFILE_MFT` > 上次扫到的缓存文件 > 自己扫。
-# 缓存带卷序列号校验：换了系统盘/重装系统会自动失效，退回整表扫一次再刷新。
+# pagefile 的 MFT 记录号只在**这个文件被重建之前**有效；给出来能省掉整表扫描
+# （实测 67 s → 0 s）。优先级：环境变量 `VLT_PAGEFILE_MFT` > 缓存文件 > 自己扫。
+# 缓存带卷序列号校验，读的时候还要过 `pagefile._take_hint` 的名字/大小校验：
+# pagefile 改过大小就会被系统重建成新记录，旧记录号可能落到别的文件上。
 HINT_ENV = "VLT_PAGEFILE_MFT"
-HINT_FILE = (Path(os.environ.get("LOCALAPPDATA") or Path.home())
-             / "vlt" / "pagefile-hint.json")
+#: 缓存写哪儿：先写可写目录（绿色版就是 exe 旁边，与 config.yaml 同处），
+#: 写不进去再退回老位置 `%LOCALAPPDATA%\vlt`。实测打包版写 `%LOCALAPPDATA%`
+#: 会被杀软拦掉（静默失败），于是每次都重扫 324 万条 MFT —— 多给一个落点。
+HINT_NAME = "pagefile-hint.json"
+
+
+def _hint_files() -> list[Path]:
+    """缓存的候选落点（按优先级）。每次现算，免得 `app_dir()` 过早求值。"""
+    out: list[Path] = []
+    try:
+        out.append(paths.app_dir() / HINT_NAME)
+    except Exception:                          # noqa: BLE001 - 只是缓存，别炸
+        pass
+    legacy = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "vlt" / HINT_NAME
+    if legacy not in out:
+        out.append(legacy)
+    return out
 # 方向判定端口的刷新间隔。加速器的出站端口是临时端口，重连后会换；
 # 与 `leg.ENDPOINT_REFRESH_S` 同值，但这里自己定义 —— 从 `leg` 取会循环导入。
 DIR_REFRESH_S = 2.0
+# 取钥失败后的冷却：失败原因多半是「pagefile 记录号过时 / 内存压缩开着」，
+# 立刻重试只会再弹一次 UAC —— 用户看到的就是「一直弹窗但一直拿不到密钥」
+# （实测 27 秒里连弹了 6 次）。同一进程冷却期内直接报错，不再拉起子进程。
+ELEVATE_COOLDOWN_S = 25.0
 
 
 class KeyUnavailable(RuntimeError):
@@ -62,6 +84,34 @@ class KeyUnavailable(RuntimeError):
     def __init__(self, message: str, *, fatal: bool = False) -> None:
         super().__init__(message)
         self.fatal = fatal
+
+
+#: 取钥失败过的进程 → 失败时刻（单调钟）。用来压住连弹 UAC。
+_elevate_fail: dict[tuple[int, int], float] = {}
+_elevate_lock = threading.Lock()
+
+
+def _gate_elevation(ident: "key_win.Identity") -> None:
+    """同一游戏进程刚失败过就先别弹 UAC，直接报还有多少秒。"""
+    tag = (int(ident.pid), int(ident.created))
+    with _elevate_lock:
+        last = _elevate_fail.get(tag)
+    if last is None:
+        return
+    wait = ELEVATE_COOLDOWN_S - (time.monotonic() - last)
+    if wait > 0:
+        raise KeyUnavailable(
+            f"上一次取钥失败，{wait:.0f} 秒后再试（避免连续弹 UAC）")
+
+
+def _note_elevation_failure(ident: "key_win.Identity") -> None:
+    with _elevate_lock:
+        _elevate_fail[(int(ident.pid), int(ident.created))] = time.monotonic()
+
+
+def _clear_elevation_failure(ident: "key_win.Identity") -> None:
+    with _elevate_lock:
+        _elevate_fail.pop((int(ident.pid), int(ident.created)), None)
 
 
 def _hint_from_env() -> int:
@@ -81,36 +131,47 @@ def _hint_mft() -> int:
     hint = _hint_from_env()
     if hint:
         return hint
-    try:
-        data = json.loads(HINT_FILE.read_text("utf-8"))
-        mft = int(data.get("mft_index") or 0)
-        return mft if mft > 0 else 0
-    except (OSError, ValueError, TypeError, AttributeError):
-        return 0
+    for path in _hint_files():
+        try:
+            data = json.loads(path.read_text("utf-8"))
+            mft = int(data.get("mft_index") or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        if mft > 0:
+            return mft
+    return 0
 
 
-def _save_hint(mft_index: int, volume_serial: int) -> None:
-    """记住这次扫到的 pagefile MFT 记录号（写不进就算了，不影响取钥）。"""
+def _save_hint(mft_index: int, volume_serial: int) -> "Path | None":
+    """记住这次扫到的 pagefile MFT 记录号，返回真正写成功的那个文件。
+
+    写不进就算了（不影响取钥），但要多试一个落点：实测打包版写
+    `%LOCALAPPDATA%` 会被杀软静默拦掉，于是每次启动都重扫整表。
+    """
     if mft_index <= 0:
-        return
-    try:
-        HINT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        HINT_FILE.write_text(
-            json.dumps({"mft_index": int(mft_index),
-                        "volume_serial": int(volume_serial or 0)},
-                       ensure_ascii=False) + "\n",
-            "utf-8")
-    except OSError:
-        pass
+        return None
+    blob = json.dumps({"mft_index": int(mft_index),
+                       "volume_serial": int(volume_serial or 0)},
+                      ensure_ascii=False) + "\n"
+    for path in _hint_files():
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(blob, "utf-8")
+        except OSError:
+            continue
+        return path
+    return None
 
 
 def _cached_serial() -> int:
     """缓存里记的卷序列号（0 = 没有缓存）。用来判断缓存是否还适用于当前系统盘。"""
-    try:
-        data = json.loads(HINT_FILE.read_text("utf-8"))
-        return int(data.get("volume_serial") or 0)
-    except (OSError, ValueError, TypeError, AttributeError):
-        return 0
+    for path in _hint_files():
+        try:
+            data = json.loads(path.read_text("utf-8"))
+            return int(data.get("volume_serial") or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return 0
 
 
 def samples_to_groups(samples) -> tuple[dict, dict]:
@@ -367,6 +428,7 @@ class _WinCapture:
     def _scan_via_keyd(self, ident: key_win.Identity, groups: dict,
                        flows: dict) -> gcm.KeyHit:
         """非管理员路径：把样本交给提权子进程，它只回一个 32 字节候选。"""
+        _gate_elevation(ident)
         self._status("info", "取钥需要读 pagefile 的原始扇区 —— 现在弹一次 UAC"
                             "（只这一次，换房间不会再弹）")
         try:
@@ -379,8 +441,18 @@ class _WinCapture:
                 on_log=lambda m: self._status("info", m),
             )
         except keyd.KeyDenied as exc:
+            _note_elevation_failure(ident)
             raise KeyUnavailable(str(exc)) from exc
         if not reply.get("ok"):
+            _note_elevation_failure(ident)
+            # 失败也要把子进程定位到的记录号写回：hint 过期时正是靠这次全表扫描
+            # 才纠正过来的，不写回的话下次还得再扫 324 万条 MFT、再弹一次 UAC。
+            saved = _save_hint(int(reply.get("pagefile_mft") or 0),
+                               int(reply.get("volume_serial") or 0))
+            if saved is None:
+                self._status("info", "⚠️ pagefile 记录号没能缓存下来（下次要多扫一遍 MFT）")
+            else:
+                self._status("info", f"pagefile 记录号已缓存：{saved}")
             raise KeyUnavailable(
                 str(reply.get("error") or "提权子进程没有交出密钥"),
                 fatal=bool(reply.get("fatal")),
@@ -410,9 +482,14 @@ class _WinCapture:
             auth.close()
 
         self._cache.store(ident, key)
+        _clear_elevation_failure(ident)
         # 子进程顺带报告了它定位页文件用的记录号；存下来下次就不用再扫 324 万条 MFT。
-        _save_hint(int(reply.get("pagefile_mft") or 0),
-                   int(reply.get("volume_serial") or 0))
+        saved = _save_hint(int(reply.get("pagefile_mft") or 0),
+                           int(reply.get("volume_serial") or 0))
+        if saved is None:
+            self._status("info", "⚠️ pagefile 记录号没能缓存下来（下次要多扫一遍 MFT）")
+        else:
+            self._status("info", f"pagefile 记录号已缓存：{saved}")
         self._status("info", f"密钥命中（指纹 {key_win.key_fingerprint(key)}，"
                              f"位置 0x{int(reply.get('offset') or 0):X}，"
                              f"由提权子进程扫得）")
@@ -495,7 +572,11 @@ class _WinCapture:
             )
         key = result.hit.key
         self._cache.store(ident, key)
-        _save_hint(pf.mft_index, int(getattr(volume, "serial", 0) or 0))
+        saved = _save_hint(pf.mft_index, int(getattr(volume, "serial", 0) or 0))
+        if saved is None:
+            self._status("info", "⚠️ pagefile 记录号没能缓存下来（下次要多扫一遍 MFT）")
+        else:
+            self._status("info", f"pagefile 记录号已缓存：{saved}")
         self._status("info", f"密钥命中（指纹 {key_win.key_fingerprint(key)}，"
                              f"位置 0x{result.hit.offset:X}）")
         return make_hit(key, groups, flows, result.hit.flow)

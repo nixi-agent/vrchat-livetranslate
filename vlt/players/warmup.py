@@ -513,6 +513,7 @@ class PlayerWarmup:
             if host is None or len(usable) < 2:
                 return None
             self._set_phase(PHASE_ACQUIRING, "正在获取密钥（扫描游戏内存，约 1~20 秒）…")
+            last_error = ""
             for needle in ("q", "i"):
                 if self._stop.is_set():
                     return None
@@ -527,15 +528,24 @@ class PlayerWarmup:
                     if reply.get("blocked"):
                         self._set_phase(PHASE_FAILED, f"读内存被拒绝：{reply.get('error')}")
                         return None
-                    print(f"[warmup] ⚠️ 扫描失败（needle={needle}）：{reply.get('error')}",
+                    last_error = str(reply.get("error") or "")
+                    print(f"[warmup] ⚠️ 扫描失败（needle={needle}）：{last_error}",
                           flush=True)
+                    if _WIN:
+                        # Windows 不分 needle（不读内存，扫的是 pagefile）：换个 needle
+                        # 再来一次只会重复同一次读盘、再弹一次 UAC（实测连弹 6 次）。
+                        break
                     continue
                 candidates = [bytes.fromhex(h) for h in reply.get("candidates", [])]
                 hit = gcm.validate_candidates(candidates, usable)
                 if hit is not None:
                     self._install_key(hit)
                     return hit
-            self._set_phase(PHASE_FAILED, "没找到能通过 GCM 认证的密钥")
+            # 失败原因要进界面：只说「没找到密钥」的话，用户分不清是没提权、
+            # UAC 点了否、pagefile 定位异常，还是真没扫到。
+            self._set_phase(
+                PHASE_FAILED,
+                f"取钥失败：{last_error}" if last_error else "没找到能通过 GCM 认证的密钥")
             return None
 
     def _install_key(self, hit: gcm.KeyHit) -> None:

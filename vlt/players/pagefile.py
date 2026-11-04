@@ -73,6 +73,10 @@ PAGEFILE_EXACT = frozenset({
     "pagefile.sys", "$pagefile", "$pagefile.sys", "$pagef~1.sys", "pagef~1.sys",
 })
 
+#: 采信「记录号缓存」的下限。真的 pagefile.sys 至少是这个量级；比它小就说明那条
+#: MFT 记录早被系统重建成别的文件了（pagefile 改过大小/重建时记录号会变）。
+_HINT_MIN_BYTES = 64 << 20
+
 Log = Callable[[str], None] | None
 
 
@@ -642,6 +646,49 @@ class Pagefile:
                 f"real={self.real_bytes / 2**30:.2f} GiB")
 
 
+def _take_hint(mft: "_Mft", volume: Volume, hint_mft: int, *,
+               on_log: Log = None) -> Pagefile | None:
+    """按缓存的记录号直取 pagefile；**不可信就返回 None**，让调用方走全表扫描。
+
+    只判「解析出 extent」会踩坑：pagefile 被系统重建（改大小、换盘、重装）后，
+    同一个记录号会落到另一个完全不相干的小文件上，直取拿到的是一份 0 GiB 的
+    extent 区间 —— 扫描自然一条候选都出不来，还白弹一次 UAC（实测踩过：
+    pagefile 从 31 GiB 变 30 GiB 后，缓存的 mft#42614 指向了别的文件）。
+    """
+    rec = mft.record(hint_mft)
+    if rec is None:
+        if on_log:
+            on_log(f"mft#{hint_mft} 读不到记录，回退全表扫描")
+        return None
+    names = _record_names(rec)
+    runs, real = mft.stream_runs(hint_mft)
+    pf = _make_pagefile(hint_mft, names[0] if names else "pagefile.sys",
+                        runs, real, volume)
+    named = any("pagefile" in n.lower() for n in names)
+    sized = bool(runs) and pf.allocated_bytes >= _HINT_MIN_BYTES
+    if not (named and sized):
+        if on_log:
+            why = []
+            if not runs:
+                why.append("解析不出 extent")
+            elif pf.allocated_bytes < _HINT_MIN_BYTES:
+                why.append(f"只占 {pf.allocated_bytes / 2**20:.1f} MiB")
+            if not named:
+                why.append(f"名字是 {names or '（读不到）'}")
+            on_log(f"缓存的 mft#{hint_mft} 已不可信（{'；'.join(why)}），"
+                   "回退全表扫描")
+        return None
+    if on_log:
+        on_log(f"{pf.summary()}（按 mft#{hint_mft} 直取）")
+    return pf
+
+
+def _record_names(rec: bytes) -> list[str]:
+    """记录里的所有 FILE_NAME 值（长名与 8.3 短名各一条）。"""
+    return [nm for at, a in _iter_attrs(rec) if at == ATTR_FILE_NAME
+            for nm in (_parse_file_name(a),) if nm]
+
+
 def find_pagefile(
     disk: Disk,
     volume: Volume,
@@ -652,19 +699,15 @@ def find_pagefile(
     """定位 pagefile.sys。
 
     ``hint_mft`` 给了就先按记录号直接解析（省掉整表扫描，实测 72 s → 0 s）；
-    解析不出 extent 就退回全 MFT 扫描。扫描时**不遇到第一个就返回** —— MFT 里
-    名字带 "pagefile" 的还有普通文件，按 (精确名, 物理占用) 取最大。
+    但**直取结果要过校验**（见 ``_take_hint``）—— 不可信就退回全 MFT 扫描。
+    扫描时**不遇到第一个就返回** —— MFT 里名字带 "pagefile" 的还有普通文件，
+    按 (精确名, 物理占用) 取最大。
     """
     mft = _Mft(disk, volume, on_log=on_log)
     if hint_mft:
-        runs, real = mft.stream_runs(hint_mft)
-        if runs:
-            pf = _make_pagefile(hint_mft, "pagefile.sys", runs, real, volume)
-            if on_log:
-                on_log(f"{pf.summary()}（按 mft#{hint_mft} 直取）")
+        pf = _take_hint(mft, volume, hint_mft, on_log=on_log)
+        if pf is not None:
             return pf
-        if on_log:
-            on_log(f"mft#{hint_mft} 直取失败，回退全表扫描")
 
     best: tuple | None = None
     scanned = 0
@@ -675,8 +718,7 @@ def find_pagefile(
         rec = _apply_fixup(rec, volume.bytes_per_sector)
         if not struct.unpack_from("<H", rec, 0x16)[0] & 0x01:   # 未使用的记录
             continue
-        names = [nm for at, a in _iter_attrs(rec) if at == ATTR_FILE_NAME
-                 for nm in (_parse_file_name(a),) if nm]
+        names = _record_names(rec)
         if not any("pagefile" in n.lower() for n in names):
             continue
         runs, real = mft.stream_runs(idx)

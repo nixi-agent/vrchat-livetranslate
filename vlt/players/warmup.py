@@ -936,10 +936,14 @@ class PlayerWarmup:
             count = -1
         if count < 0:
             return "等待 VRChat 进程…（进程枚举不可用）"
-        # 按 50 分档：这个数字每秒都在抖（开一个浏览器标签页就变），而
+        # 按 10 分档：这个数字每秒都在抖（开一个浏览器标签页就变），而
         # `_set_phase()` 是按「文案变了」推送状态的 —— 不分档的话等待期每轮
         # 都会刷一条状态和一行日志。
-        return f"等待 VRChat 进程…（可见进程约 {count // 50 * 50} 个）"
+        # 四舍五入到最近的 10，并且 count>0 时最小显示 10：`0` 这个值本身是
+        # 「快照被拦成空表」的信号，不能被进程数抖动撞掉（34 个进程曾显示
+        # 「约 0 个」，正好和要区分的那种故障撞车）。
+        shown = count if count < 10 else (count + 5) // 10 * 10
+        return f"等待 VRChat 进程…（可见进程约 {shown} 个）"
 
     def _set_phase(self, phase: str, detail: str) -> None:
         if phase == self._phase and detail == self._detail:

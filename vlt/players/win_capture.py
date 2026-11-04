@@ -122,6 +122,30 @@ def _hint_from_env() -> int:
         return 0
 
 
+def _read_hint() -> "tuple[int, int]":
+    """一次读出缓存里的 (记录号, 卷序列号)；没有缓存就是 `(0, 0)`。
+
+    两个值必须来自**同一份**文件：分开遍历 `_hint_files()` 时，若首选那份只写了
+    `mft_index`、兜底那份才有 `volume_serial`，就会拿 A 的记录号配 B 的序列号 ——
+    而 `want = 0` 会让「这条缓存属于另一块盘」的校验被静默跳过，于是又把别的盘上
+    的 MFT 记录号当成 pagefile（review #135 指出）。顺手也省掉一次文件读。
+    """
+    for path in _hint_files():
+        try:
+            data = json.loads(path.read_text("utf-8"))
+            mft = int(data.get("mft_index") or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        if mft <= 0:
+            continue
+        try:
+            serial = int(data.get("volume_serial") or 0)
+        except (TypeError, ValueError):
+            serial = 0
+        return mft, serial
+    return 0, 0
+
+
 def _hint_mft() -> int:
     """pagefile.sys 的 MFT 记录号：环境变量 > 上次缓存 > 0（自己扫）。
 
@@ -131,15 +155,7 @@ def _hint_mft() -> int:
     hint = _hint_from_env()
     if hint:
         return hint
-    for path in _hint_files():
-        try:
-            data = json.loads(path.read_text("utf-8"))
-            mft = int(data.get("mft_index") or 0)
-        except (OSError, ValueError, TypeError, AttributeError):
-            continue
-        if mft > 0:
-            return mft
-    return 0
+    return _read_hint()[0]
 
 
 def _save_hint(mft_index: int, volume_serial: int) -> "Path | None":
@@ -164,14 +180,11 @@ def _save_hint(mft_index: int, volume_serial: int) -> "Path | None":
 
 
 def _cached_serial() -> int:
-    """缓存里记的卷序列号（0 = 没有缓存）。用来判断缓存是否还适用于当前系统盘。"""
-    for path in _hint_files():
-        try:
-            data = json.loads(path.read_text("utf-8"))
-            return int(data.get("volume_serial") or 0)
-        except (OSError, ValueError, TypeError, AttributeError):
-            continue
-    return 0
+    """缓存里记的卷序列号（0 = 没有缓存）。用来判断缓存是否还适用于当前系统盘。
+
+    必须与 `_hint_mft()` 取自同一份文件，所以都走 `_read_hint()`。
+    """
+    return _read_hint()[1]
 
 
 def samples_to_groups(samples) -> tuple[dict, dict]:

@@ -329,6 +329,26 @@ def test_row_key_separates_actors_of_same_account() -> bool:
         gui.close()
 
 
+def test_idless_rows_without_actor_get_own_rows() -> bool:
+    """还没有 user_id 也还没有 actor 时（名单已有人、名字事件没到）各占一行。
+
+    这条是实机踩过的坑：`_row_key()` 早先对「无 id」一律返回
+    `\\x00actor{actor}`，而 roster 上线后 `actor` 允许为 `None` —— 于是整屋子
+    「名字已知、actor 未知」的人全落到同一个 `\\x00actorNone` 键上，渲染缓存
+    互相顶掉、重排时拿到重复控件，右栏只剩最后一个人。
+    """
+    rows = [_row(None, "", "甲", None), _row(None, "", "乙", None)]
+    gui, panel = _panel(rows)
+    try:
+        panel._sync(gui)
+        assert set(gui._ppl_rows) == {"\x00self", "\x00name:甲", "\x00name:乙"}, gui._ppl_rows
+        assert gui._ppl_title.cget("text") == "房间玩家 (2)", gui._ppl_title.cget("text")
+        print("  ✓ 无 id 且无 actor 的两人各占一行（key 落到名字）")
+        return True
+    finally:
+        gui.close()
+
+
 def test_no_position_rows_sort_last() -> bool:
     """没有距离的人垫底，且距离列不留「None」这种脏文本。"""
     rows = [_row(1, "usr_a", "阿诺", None), _row(2, "usr_b", "小明", 2.0)]
@@ -355,6 +375,7 @@ def main() -> int:
         test_select_all_is_noop_under_all_mode,
         test_toggle_under_all_switches_to_only,
         test_row_key_separates_actors_of_same_account,
+        test_idless_rows_without_actor_get_own_rows,
         test_no_position_rows_sort_last,
     )
     all_ok = True

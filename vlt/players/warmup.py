@@ -507,8 +507,11 @@ class PlayerWarmup:
         with self._roster_lock:
             roster_size = len(self._roster)
             room = self._roster.world
-        if roster_size:
-            # 日志是名单的权威来源：它知道谁真的在这个房间里（名字事件表不知道离开）
+            roster_synced = self._roster.synced
+        if roster_synced:
+            # 日志是名单的权威来源：它知道谁真的在这个房间里（名字事件表不知道离开）。
+            # 判 `synced` 而不是 `roster_size`：离开房间后名单是**空**的，空正是
+            # 「这房间没人」这个答案；按大小判会把上一个世界的人数又报回来。
             players = roster_size
         name_events = self.name_events
         decrypted = self.decrypted
@@ -931,7 +934,12 @@ class PlayerWarmup:
             count = len(procfs.iter_processes())
         except Exception:                                 # noqa: BLE001 - 诊断不该抛
             count = -1
-        return f"等待 VRChat 进程…（可见进程 {count} 个）"
+        if count < 0:
+            return "等待 VRChat 进程…（进程枚举不可用）"
+        # 按 50 分档：这个数字每秒都在抖（开一个浏览器标签页就变），而
+        # `_set_phase()` 是按「文案变了」推送状态的 —— 不分档的话等待期每轮
+        # 都会刷一条状态和一行日志。
+        return f"等待 VRChat 进程…（可见进程约 {count // 50 * 50} 个）"
 
     def _set_phase(self, phase: str, detail: str) -> None:
         if phase == self._phase and detail == self._detail:

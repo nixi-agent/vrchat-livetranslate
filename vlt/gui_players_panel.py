@@ -156,7 +156,15 @@ def _row_key(row: dict) -> str:
     user_id = str(row.get("user_id") or "")
     actor = row.get("actor")
     if not user_id:
-        return f"\x00actor{actor}"           # 还没学到 id：只能按 actor 认
+        # 没有 id（老日志 / 名字事件还没到）只能按名字认。这一支**允许**
+        # `actor is None` —— 名单里的人在名字事件到达前就是没有 actor 的；若还
+        # 拿 actor 当键，所有这类行的键都会变成 `\x00actorNone`，`_render()` 的
+        # 缓存互相覆盖、`_reorder()` 拿到的是同一个控件。有 actor 时再带上它，
+        # 这样两个同名的人在名字事件到了之后能各占一行。
+        name = str(row.get("name") or "").casefold()
+        if actor is None:
+            return f"\x00name:{name}"
+        return f"\x00actor{actor}|{name}"
     return f"{user_id}#{actor}"
 
 
@@ -248,8 +256,9 @@ def _render_row(gui, parent, row: dict, chosen: set[str]) -> dict:
                            width=2)
     glyph_label.pack(side=tk.RIGHT)
     dist_text = _distance_text(row)
+    # width=6：`~1500m` 是 6 个字符，宽度 5 会把单位裁掉（过期距离带 `~`）。
     dist_label = tk.Label(line, text=dist_text, bg=bg, fg=TEXT_MUTED,
-                          font=ui_tk.FONT_SMALL, width=5, anchor="e")
+                          font=ui_tk.FONT_SMALL, width=6, anchor="e")
     dist_label.pack(side=tk.RIGHT)
 
     name = row.get("name") or (t("我") if is_self else "")
@@ -317,8 +326,9 @@ def _distance_text(row: dict) -> str:
 
     位置是**按需下发**的：移动中的玩家 70~100% 的消息带位置，静坐者只有约 2%，
     所以最后一帧可能很久没更新。留空（旧行为）看起来像「没这个功能」，给个带
-    `~` 的旧值反而更能说明「他还在这，只是没动」；`?` 表示缺的是自己的坐标，
-    此时所有人的距离都算不出来，等自己动一下就好。
+    `~` 的旧值反而更能说明「他还在这，只是没动」；`?` 表示算不出来 —— 可能是
+    **缺自己的坐标**（自己还没动过），也可能是这个人在 Photon 表里**对不上
+    actor**（名单里已经有人、名字事件还没到），两种情况右栏都只能显示 `?`。
     """
     from .players.positions import DEFAULT_MAX_AGE_S, format_distance
     distance = row.get("distance")

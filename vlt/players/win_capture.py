@@ -447,12 +447,17 @@ class _WinCapture:
             _note_elevation_failure(ident)
             # 失败也要把子进程定位到的记录号写回：hint 过期时正是靠这次全表扫描
             # 才纠正过来的，不写回的话下次还得再扫 324 万条 MFT、再弹一次 UAC。
-            saved = _save_hint(int(reply.get("pagefile_mft") or 0),
-                               int(reply.get("volume_serial") or 0))
-            if saved is None:
-                self._status("info", "⚠️ pagefile 记录号没能缓存下来（下次要多扫一遍 MFT）")
-            else:
-                self._status("info", f"pagefile 记录号已缓存：{saved}")
+            # 但 `pagefile_mft == 0` 表示子进程在 `find_pagefile()` 之前就失败了
+            # （打不开盘 / 读不到引导扇区），压根没有记录号可存 —— 那时报「没能
+            # 缓存下来」等于把另一种故障说成缓存问题，故只在拿到记录号时才写。
+            mft = int(reply.get("pagefile_mft") or 0)
+            if mft > 0:
+                saved = _save_hint(mft, int(reply.get("volume_serial") or 0))
+                if saved is None:
+                    self._status(
+                        "info", "⚠️ pagefile 记录号没能缓存下来（下次要多扫一遍 MFT）")
+                else:
+                    self._status("info", f"pagefile 记录号已缓存：{saved}")
             raise KeyUnavailable(
                 str(reply.get("error") or "提权子进程没有交出密钥"),
                 fatal=bool(reply.get("fatal")),

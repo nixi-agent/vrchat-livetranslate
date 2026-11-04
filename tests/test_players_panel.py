@@ -133,7 +133,7 @@ def test_reuse_controls_and_update_text() -> bool:
         before = _ids(gui)
         assert len(before) == 4, f"应有 1 行自己 + 3 行别人，实际 {before}"
         assert gui._ppl_title.cget("text") == "房间玩家 (3)", gui._ppl_title.cget("text")
-        assert _order(gui) == ["\x00self", "usr_b#2", "usr_a#1", "\x00actor3"], _order(gui)
+        assert _order(gui) == ["\x00self", "usr_b#2", "usr_a#1", "\x00actor3|还没 id"], _order(gui)
         dist_before = gui._ppl_rows["usr_a#1"]["dist"].cget("text")
 
         # 距离互换（排序会变）+ 一个人改名字，没有增删
@@ -143,7 +143,7 @@ def test_reuse_controls_and_update_text() -> bool:
 
         after = _ids(gui)
         assert after == before, f"控件被重建了：{before} → {after}"
-        assert _order(gui) == ["\x00self", "usr_a#1", "\x00actor3", "usr_b#2"], _order(gui)
+        assert _order(gui) == ["\x00self", "usr_a#1", "\x00actor3|还没 id", "usr_b#2"], _order(gui)
         dist_after = gui._ppl_rows["usr_a#1"]["dist"].cget("text")
         assert dist_after != dist_before, f"距离文本没更新：{dist_before!r}"
         print(f"  ✓ 3 名玩家换位只重排：控件 {len(after)} 个全部复用，"
@@ -183,7 +183,7 @@ def test_self_and_idless_rows_not_clickable() -> bool:
     try:
         panel._sync(gui)
         assert not gui._ppl_rows["\x00self"]["clickable"], "自己那行可以点"
-        assert not gui._ppl_rows["\x00actor3"]["clickable"], "没 id 的行可以点"
+        assert not gui._ppl_rows["\x00actor3|还没 id"]["clickable"], "没 id 的行可以点"
         assert gui._ppl_rows["usr_a#1"]["clickable"], "有 id 的行不能点"
         # 不可点的行不该绑 <Button-1>：否则误点一下就把自己写进名单
         assert not gui._ppl_rows["\x00self"]["name"].bind("<Button-1>"), "自己那行绑了点击"

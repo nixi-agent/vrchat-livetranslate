@@ -73,6 +73,18 @@ PAGEFILE_EXACT = frozenset({
     "pagefile.sys", "$pagefile", "$pagefile.sys", "$pagef~1.sys", "pagef~1.sys",
 })
 
+
+def _is_pagefile_name(name: str) -> bool:
+    """这个名字像不像 pagefile（含 8.3 短名 `pagef~1.sys`）。
+
+    「按缓存记录号直取」和「全表扫描」必须用**同一套**判据：以前两处都写成
+    `"pagefile" in name.lower()`，而 8.3 短名是 `pagef~1.sys`；万一某条记录只
+    剩短名，直取会判「不可信」退回全表扫，全表扫又用同一个子串判据找不到 ——
+    白扫 60 秒之后失败。
+    """
+    low = (name or "").lower()
+    return low in PAGEFILE_EXACT or "pagefile" in low
+
 #: 采信「记录号缓存」的下限。真的 pagefile.sys 至少是这个量级；比它小就说明那条
 #: MFT 记录早被系统重建成别的文件了（pagefile 改过大小/重建时记录号会变）。
 _HINT_MIN_BYTES = 64 << 20
@@ -664,7 +676,7 @@ def _take_hint(mft: "_Mft", volume: Volume, hint_mft: int, *,
     runs, real = mft.stream_runs(hint_mft)
     pf = _make_pagefile(hint_mft, names[0] if names else "pagefile.sys",
                         runs, real, volume)
-    named = any("pagefile" in n.lower() for n in names)
+    named = any(_is_pagefile_name(n) for n in names)
     sized = bool(runs) and pf.allocated_bytes >= _HINT_MIN_BYTES
     if not (named and sized):
         if on_log:
@@ -719,7 +731,7 @@ def find_pagefile(
         if not struct.unpack_from("<H", rec, 0x16)[0] & 0x01:   # 未使用的记录
             continue
         names = _record_names(rec)
-        if not any("pagefile" in n.lower() for n in names):
+        if not any(_is_pagefile_name(n) for n in names):
             continue
         runs, real = mft.stream_runs(idx)
         if not runs:

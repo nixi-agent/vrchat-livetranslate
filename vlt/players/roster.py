@@ -106,7 +106,9 @@ class Roster:
         self.version += 1
 
     def add(self, name: str, user_id: str = "") -> bool:
-        member = Member(user_id or "", (name or "").strip())
+        # id 统一小写存：`contains()`/`name_of()` 查的时候都会 `.lower()`，
+        # 外部直接把日志里的大写 `usr_` 传进来时不该出现「加了却查不到」。
+        member = Member((user_id or "").lower(), (name or "").strip())
         if not member.name and not member.user_id:
             return False
         key = member.key
@@ -126,7 +128,7 @@ class Roster:
         """有人离开。优先按 user_id 认，其次按名字（老格式 / 名字事件还没来）。"""
         keys: list[str] = []
         if user_id:
-            keys.append(user_id)
+            keys.append(user_id.lower())
         if name:
             keys.append("name:" + name.casefold())
         for key in keys:

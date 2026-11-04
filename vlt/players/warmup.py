@@ -227,6 +227,9 @@ class PlayerWarmup:
         self._roster = roster.Roster()
         self._roster_lock = threading.Lock()
         self._log_tail: roster.LogTail | None = None
+        #: 首轮 poll 是把整份日志重放一遍（重建名单），那些历史「进房间」不该当
+        #: 实时事件报到界面上，否则一启动就刷出好几条上一间房的通知。
+        self._roster_live = False
         self._frag: dict[str, photon.Fragmenter] = {
             "in": photon.Fragmenter(), "out": photon.Fragmenter()}
         self._world = ""
@@ -382,6 +385,7 @@ class PlayerWarmup:
             return
         if not lines:
             return
+        live = self._roster_live
         with self._roster_lock:
             for line in lines:
                 if self._roster.observe_line(line) != "world":
@@ -391,9 +395,11 @@ class PlayerWarmup:
                 with self._names_lock:
                     self._names.clear()
                 self._world = self._roster.world
-                if self.on_status is not None:
-                    self._on_status("info", f"进房间：{self._roster.world}"
-                                           f"（{len(self._roster)} 人）")
+                if live and self.on_status is not None:
+                    # 不带人数：`Entering Room` 那一瞬还没收到任何 `OnPlayerJoined`，
+                    # 报「0 人」只会让人以为名单没生效（右栏标题才是实时人数）。
+                    self._on_status("info", f"进房间：{self._roster.world}")
+            self._roster_live = True
 
     def _self_user_id(self) -> str:
         """本机账号的 `usr_…`（认不出就是空串）。

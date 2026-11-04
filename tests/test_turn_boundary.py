@@ -17,7 +17,10 @@
 5. `_src_buf`（原文）跨轮清空；
 6. 同一句在同一轮重复说、且中途被快封过（`_emitted_chars` 要靠 `_emit` 的返回值推进）；
 7. `Merger` **不**做跨回合去重 / 前缀剥离：短应答两轮重复照发、新句以上一句开头不被裁
-   （评审 R1：这层没有轮次身份，早先的兜底会误伤真发言）。
+   （评审 R1：这层没有轮次身份，早先的兜底会误伤真发言）；
+8. 换轮（`response.created`）前必须把上一轮**还没终结**的短句补成终版 —— 否则它只
+   发过 partial，`_buf` 一清就永远等不到终版（短句看着像「没翻译」）；
+9. 服务端改写了已发前缀时只发新增部分，绝不整段重发（短句被「粘」到下一句开头）。
 
 跑法：.venv/bin/python tests/test_turn_boundary.py
 """
@@ -33,7 +36,8 @@ if str(ROOT) not in sys.path:
 
 from vlt.output.merger import Merger  # noqa: E402
 from vlt.session.base import SessionConfig, TextDelta, normalize_text  # noqa: E402
-from vlt.session.qwen38 import QwenLiveTranslateSession  # noqa: E402
+from vlt.session.qwen38 import (QwenLiveTranslateSession,  # noqa: E402
+                                strip_emitted_prefix)
 
 FAILS: list[str] = []
 
@@ -198,6 +202,66 @@ def test_merger_cross_turn_passthrough() -> None:
     check("normalize_text 去标点", normalize_text(" はい。 ") == "はい")
 
 
+def test_response_created_seals_pending() -> None:
+    print("[turn] 换轮前把上一轮没终结的短句封成终版")
+    session, sink = _session()
+    _created(session)
+    _event(session, "response.text.delta", delta="谢谢")
+    check("短句只发过 partial", sink.finals() == [], str(sink.finals()))
+    _created(session)                       # 下一轮开始，上一轮不会再有 done
+    check("换轮前补上了终版", sink.finals() == ["谢谢"], str(sink.finals()))
+
+    _event(session, "response.text.delta", delta="你好")
+    _event(session, "response.text.done", text="你好")
+    check("下一轮的终版只含自己", sink.finals() == ["谢谢", "你好"], str(sink.finals()))
+
+
+def test_response_created_after_sealed_no_dup() -> None:
+    print("[turn] 已封过终版的一轮，换轮时不再补发")
+    session, sink = _session()
+    _created(session)
+    _event(session, "response.text.delta", delta="はい")
+    session._last_text_at = time.perf_counter() - 5.0      # noqa: SLF001
+    session.tick()
+    _created(session)
+    check("没有重复终版", sink.finals() == ["はい"], str(sink.finals()))
+
+
+def test_final_remainder_revision() -> None:
+    print("[turn] 服务端改写已发前缀时不整段重发")
+    session, sink = _session()
+    _created(session)
+    _event(session, "response.text.delta", delta="今天很热")
+    session._last_text_at = time.perf_counter() - 5.0      # noqa: SLF001
+    session.tick()
+    check("先封第一段", sink.finals() == ["今天很热"], str(sink.finals()))
+
+    # 服务端回头改了措辞：全文不再以已发前缀开头
+    _event(session, "response.text.done", text="今天太热了")
+    check("只发公共前缀之后的新增", sink.finals()[-1] == "太热了", str(sink.finals()))
+    check("没有把「今天很热」再发一遍",
+          not any(f.startswith("今天很热") for f in sink.finals()[1:]), str(sink.finals()))
+
+
+def test_strip_emitted_prefix_pure() -> None:
+    print("[turn] strip_emitted_prefix（纯函数）")
+    check("正常前缀 → 只发后面",
+          strip_emitted_prefix("今天很热。谢谢", "今天很热") == "谢谢",
+          strip_emitted_prefix("今天很热。谢谢", "今天很热"))
+    check("只差标点 → 空串",
+          strip_emitted_prefix("今天很热", "今天很热。") == "",
+          strip_emitted_prefix("今天很热", "今天很热。"))
+    check("对不齐 → 只发公共前缀之后的新增",
+          strip_emitted_prefix("今天太热了", "今天很热") == "太热了",
+          strip_emitted_prefix("今天太热了", "今天很热"))
+    check("没有公共前缀 → 整段都是新的",
+          strip_emitted_prefix("第二句译文", "第一句译文") == "第二句译文",
+          strip_emitted_prefix("第二句译文", "第一句译文"))
+    check("英文不从单词中间切",
+          strip_emitted_prefix("Hella yes", "Hello") == "Hella yes",
+          strip_emitted_prefix("Hella yes", "Hello"))
+
+
 def main() -> int:
     test_tick_then_late_delta()
     test_done_and_response_done()
@@ -207,6 +271,10 @@ def main() -> int:
     test_same_word_next_turn_allowed()
     test_same_word_next_turn_then_late_delta()
     test_merger_cross_turn_passthrough()
+    test_response_created_seals_pending()
+    test_response_created_after_sealed_no_dup()
+    test_final_remainder_revision()
+    test_strip_emitted_prefix_pure()
     print()
     if FAILS:
         print(f"FAILED: {len(FAILS)} 项 → {', '.join(FAILS)}")

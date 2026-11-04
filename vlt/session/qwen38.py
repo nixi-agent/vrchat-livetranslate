@@ -41,6 +41,56 @@ CLOSE_WAIT_S = 2.0
 FINISH_WAIT_S = 1.0
 
 
+# 剥掉已发前缀后，顺手吃掉的标点/空白（否则会多出 "。ちょっと"）
+TRIM_AFTER_PREFIX = " 　。．.!！?？、，,～~…·"
+
+
+def shared_prefix_len(a: str, b: str) -> int:
+    """两个字符串的公共前缀长度（纯函数，离线可测）。"""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def strip_emitted_prefix(authoritative: str, emitted: str) -> str:
+    """从服务端全文里剥掉「已经发出去的那一段」，只返回新增部分（纯函数，离线可测）。
+
+    三种情况：
+    1. 全文以已发前缀开头 → 直接切掉（正常路径，占绝大多数）；
+    2. 归一化后相同（只差标点）→ 空串，不发；
+    3. 对不齐（服务端换词 / 补标点 / 改语序）→ 按**公共前缀**切，只发后面新增的部分。
+
+    ⚠️ 第 3 种情况绝不能退回「整段照发」：那会把上一句已上屏的译文再送一遍 ——
+    chatbox 换气泡、字幕多一条、GUI 同一条气泡被顶掉，用户看到的就是
+    「短句被附加到下一句开头」。
+    """
+    if not emitted:
+        return authoritative.strip()
+    if authoritative.startswith(emitted):
+        return authoritative[len(emitted):].lstrip(TRIM_AFTER_PREFIX).strip()
+    if normalize_text(authoritative) == normalize_text(emitted):
+        return ""
+    n = shared_prefix_len(authoritative, emitted)
+    # 只重合 1 个字符（「第」一 vs 「第」二、「好」/「好的」）基本是巧合，按「对不齐」
+    # 处理：宁可把这一小段重发一次，也不能把后面的内容裁掉。
+    if n < 2:
+        # 没有可用的公共前缀 = 服务端交付的是另一段文本（典型：上一轮没收到
+        # `response.created`，这段其实是新一轮的全文）→ 整段都是新的，照发。
+        return authoritative.strip()
+    # 词边界回退：英文 / 数字别从单词中间切开，否则会发出 "ank you" 这类残词。
+    if (n < len(authoritative) and authoritative[n].isascii()
+            and authoritative[n].isalnum()
+            and not authoritative[n - 1].isspace()):
+        back = n
+        while (back > 0 and authoritative[back - 1].isascii()
+               and authoritative[back - 1].isalnum()):
+            back -= 1
+        n = back
+    return authoritative[n:].lstrip(TRIM_AFTER_PREFIX).strip()
+
+
 def is_fatal_server_error(payload: dict) -> bool:
     """服务端 `error` 事件是否属于**已判定的致命类**（纯函数，离线可测）。
 
@@ -457,17 +507,22 @@ class QwenLiveTranslateSession(LiveTranslateSession):
     def _final_remainder(self, authoritative: str | None) -> str:
         """终版该发的那段：服务端给了全文就剥掉已发前缀，没给就用本地累积。"""
         full = self._full_text()
-        emitted = full[:self._emitted_chars]
-        if authoritative is not None:
-            text = authoritative
-            if emitted:
-                if text.startswith(emitted):
-                    # 剥掉已发前缀；顺手吃掉前缀后残留的句读（否则会多出 "。ちょっと"）
-                    text = text[len(emitted):].lstrip(" 　。．.!！?？、，,～~…·")
-                elif normalize_text(text) == normalize_text(emitted):
-                    text = ""
-            return text.strip()
-        return full[self._emitted_chars:].strip()
+        if authoritative is None:
+            return full[self._emitted_chars:].strip()
+        return strip_emitted_prefix(authoritative, full[:self._emitted_chars])
+
+    def _seal_pending_turn(self) -> None:
+        """换轮前把上一轮**还没终结**的文本补成终版，再让 `_reset_turn()` 清缓冲。
+
+        短句最容易踩：它的增量已经作为 non-final 发到下游，但还没到 `tick()` 的静默
+        阈值；下一轮的 `response.created` 一到，`_reset_turn()` 会把 `_buf` 直接清空 ——
+        下游永远等不到这条的终版（表现：短句只闪一下 partial 就被下一句顶掉，
+        看起来像「根本没翻译」）。
+        """
+        if not self._buf:
+            return
+        if self._emit(confirmed=self._pending_text(), pending="", is_final=True):
+            self._advance()
 
     def _handle_event(self, ev: dict) -> None:
         etype = ev.get("type", "")
@@ -496,6 +551,8 @@ class QwenLiveTranslateSession(LiveTranslateSession):
             self._first_after_stop_ms = None
             return
         if etype == "response.created":
+            # 换轮前先给上一轮的残留文本补一条终版（短句只有 partial 时最容易丢）。
+            self._seal_pending_turn()
             self._reset_turn()
             return
 

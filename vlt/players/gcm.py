@@ -153,6 +153,40 @@ def opener(key: bytes, layout: str = LAYOUTS[0]):
     return _open
 
 
+def opener_multi(key: bytes, layout: str = LAYOUTS[0], *, on_fallback=None):
+    """命中布局优先、其余布局兜底的解密函数；换形态之后记住生效的那一种。
+
+    为什么需要：`validate_candidates` 只在**取钥当时那几个包**上判出布局
+    （`KeyHit.layout`），而 `_install_key` 原来把这个布局写死。会话中途 Photon
+    换了 AAD 形态（重连、换服务端）之后，写死的布局会把**所有**新包判成「解不开」，
+    连着 10 个就触发「密钥失效 → 重扫 → 又找到同一把钥 → 装上即失效」的死循环。
+    2026-11-05 17:39 那次就是：指纹 `8d4ee60c`、页文件地址 `0xB9717C4E80`
+    全程没变，却每隔 20 ms 被判死一次。
+    """
+    aead = _aesgcm(key)
+    others = [item for item in LAYOUTS if item != layout]
+    good = layout
+
+    def _open(pkt: bytes) -> bytes | None:
+        nonlocal good
+        plain = _open_with(aead, pkt, good)
+        if plain is not None:
+            return plain
+        for item in others:
+            plain = _open_with(aead, pkt, item)
+            if plain is not None:
+                good = item
+                if on_fallback is not None:
+                    try:
+                        on_fallback(layout, item)
+                    except Exception:              # noqa: BLE001 - 回调不该影响解密
+                        pass
+                return plain
+        return None
+
+    return _open
+
+
 def try_open(key: bytes, pkt: bytes, layout: str = LAYOUTS[0]) -> bytes | None:
     """用一把候选密钥解一个包；解不开返回 None（**不许抛**，扫描要靠它快速筛）。"""
     return _open_with(_aesgcm(key), pkt, layout)

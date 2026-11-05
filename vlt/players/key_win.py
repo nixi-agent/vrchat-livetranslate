@@ -432,9 +432,11 @@ class _State:
         self.seen: set[bytes] = set()
         self.markers: dict[str, int] = {}          # pagefile 里的堆路标计数（见 note_markers）
         self.last_report = 0.0
-        # 「该扫但没读到」的字节与盘号：不许把「盘打不开」静默算成「扫过了没命中」，
-        # 否则上层会把 0% 覆盖率报成「扫了 X GiB 都不通过 GCM」。
-        self.unread = 0
+        # 「该扫但没读到」按**读窗**记账：键是 (盘号, 窗起点)，值是 (窗字节, 读到的字节)。
+        # 不许把「盘打不开」静默算成「扫过了没命中」，否则上层会把 0% 覆盖率报成
+        # 「扫了 X GiB 都不通过 GCM」。按区域记还顺带解决两件事：补扫那一遍会把同样
+        # 的窗再读一次（旧实现直接相加，覆盖率翻倍）；补扫读成功能修掉第一遍的缺口。
+        self.windows: dict[tuple[int, int], tuple[int, int]] = {}
         self.failed_disks: set[int] = set()
         #: challenge 第二条路已经跑过多少字节（用来钉住总预算，见 CHALLENGE_BUDGET）
         self.challenge_bytes = 0
@@ -445,10 +447,41 @@ class _State:
         self.needle_windows = 0
         self.challenge_windows = 0
 
-    def note_unread(self, nbytes: int, disk_no: int) -> None:
+    def note_window(self, disk_no: int, pos: int, step: int, ok: int) -> None:
+        """记一个读窗能读到多少字节（`ok < step` 就是缺口）。
+
+        同一个窗被两遍（锚点法 / challenge 补扫）各读一次也只留一条，取两次里更好的
+        那个 `ok` —— 所以 `unread_bytes()` 不可能把同一片盘算两次，补扫成功还能把
+        第一遍的缺口消掉。
+        """
+        if step <= 0:
+            return
+        step = int(step)
+        ok = max(0, min(int(ok), step))
+        key = (int(disk_no), int(pos))
         with self.lock:
-            self.unread += int(nbytes)
-            self.failed_disks.add(int(disk_no))
+            prev = self.windows.get(key)
+            if prev is None or ok > prev[1]:
+                self.windows[key] = (step, ok)
+            if ok < step:
+                self.failed_disks.add(int(disk_no))
+
+    def unread_bytes(self) -> int:
+        """应当扫、却没读到的字节数（按读窗并集，重复那遍不会翻倍）。"""
+        with self.lock:
+            items = list(self.windows.values())
+        return sum(step - ok for step, ok in items if ok < step)
+
+    def merge_windows(self, other) -> None:
+        """把另一遍（challenge 补扫）的读窗账并进来，同窗取更大的 `ok`。"""
+        with self.lock:
+            for key, (step, ok) in other.items():
+                step, ok = int(step), int(ok)
+                prev = self.windows.get(key)
+                if prev is None or ok > prev[1]:
+                    self.windows[key] = (step, ok)
+                if ok < step:
+                    self.failed_disks.add(int(key[0]))
 
     def note_hits(self, n: int) -> None:
         with self.lock:
@@ -768,6 +801,25 @@ def _stats_on() -> bool:
             in ("1", "true", "yes", "on"))
 
 
+def _windows_of(off: int, size: int):
+    """按 `_worker` 同一套算法枚举一个任务的读窗，产出 ``(窗起点, 本任务字节数)``。
+
+    「盘打不开」时不能整段记一笔就完事：补扫那一遍会用同样的窗边界去读，两边键
+    必须对得上才能去重。这里不读盘，只做与 `_worker` 完全一样的回退对齐与切分；
+    窗头退到上一个任务的重叠区（`off - OVERLAP` 对齐）时，那一段不属于本任务，
+    计数字节要裁掉 —— 否则 unread 会比 region_bytes 还大。
+    """
+    begin = max(((int(off) - OVERLAP) // OVERLAP_ALIGN) * OVERLAP_ALIGN, 0)
+    end = int(off) + int(size)
+    pos = begin
+    while pos < end:
+        step = min(WINDOW, end - pos)
+        lo = max(pos, int(off))
+        hi = min(pos + step, end)
+        yield pos, hi - lo
+        pos += step
+
+
 def _worker(state: _State, tasks: list[tuple[int, int, int]], groups, *,
             deadline: float, aad_kind: str, mode: str | None = None) -> None:
     """扫自己那份任务。任务是 ``(盘号, 盘上偏移, 字节数)``，按盘惰性开句柄。
@@ -790,7 +842,10 @@ def _worker(state: _State, tasks: list[tuple[int, int, int]], groups, *,
                     try:
                         disk = pagefile.Disk.open(disk_no, 0)
                     except OSError:
-                        state.note_unread(int(size), disk_no)
+                        # 盘打不开：按窗算术登记缺口（不读盘，成本可忽略）。键与真正
+                        # 读过的窗一致，所以补扫那一遍再来一次也只算一次。
+                        for w_pos, w_step in _windows_of(off, size):
+                            state.note_window(disk_no, w_pos, w_step, 0)
                         continue
                     disks[disk_no] = disk
                 # 从 off 往前退到 OVERLAP 对齐的位置，好让跨任务边界那 39 字节也能读到
@@ -798,6 +853,11 @@ def _worker(state: _State, tasks: list[tuple[int, int, int]], groups, *,
                 pos, end = begin, int(off) + int(size)
                 while pos < end:
                     step = min(WINDOW, end - pos)
+                    # 窗头那段（off 往前退的重叠区）不属于本任务：只按 [off, end)
+                    # 内的字节记账，否则 unread 会比 region_bytes 还大。键仍用 pos，
+                    # 与 `_windows_of()` 的「盘打不开」账完全对得上。
+                    lo = max(pos, int(off))
+                    hi = min(pos + step, end)
                     n = min(step + OVERLAP, end - pos)     # 多读 39 字节防跨窗漏 key
                     # 物理盘 ReadFile 的长度必须按扇区对齐（不对齐是 err=87）：跨窗那
                     # 39 字节不满一个扇区，先把读取长度向上取整，再切回 n 字节。
@@ -806,13 +866,16 @@ def _worker(state: _State, tasks: list[tuple[int, int, int]], groups, *,
                     try:
                         view = disk.read_view(pos, read_n)
                     except OSError:
-                        state.note_unread(step, disk_no)
+                        state.note_window(disk_no, pos, hi - lo, 0)
                         break
-                    take = min(len(view), n)
-                    data = bytes(view[:take])
-                    view.release()
-                    if take < step:
-                        state.note_unread(step - take, disk_no)
+                    try:
+                        take = min(len(view), n)
+                        data = bytes(view[:take])
+                    finally:
+                        # 必须放 finally：`bytes()` 抛 MemoryError 时漏掉 release()
+                        # 会让 BufferError 顶掉原始异常，线程静默死掉不留任何痕迹。
+                        view.release()
+                    state.note_window(disk_no, pos, hi - lo, min(pos + take, hi) - lo)
                     if data:
                         # 路标只用来判断「游戏堆有没有落进 pagefile」，不需要每窗都数：
                         # bytes.count 三次实测吃掉约 25% 吞吐（0.736→0.488 GiB/s）。
@@ -953,7 +1016,10 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
     # 会走到 challenge，只是多付一次读盘。
     if state.hit is None and mode == "auto":
         state2 = _State(total)
-        deadline2 = time.monotonic() + max(30.0, deadline_s)
+        # 补扫复用同一个绝对 deadline：旧实现又拿一份完整 deadline，两遍墙钟可能
+        # 接近 2×，直接超过客户端 keyd 的 DEFAULT_LIFETIME(240s)，于是客户端先报
+        # 「提权子进程没有交出结果就断开了」，而子进程还在持锁读盘、下一轮只能干等。
+        deadline2 = deadline
         workers2 = [
             threading.Thread(
                 target=_worker, name=f"vlt-keychal-{i}", daemon=True,
@@ -984,7 +1050,9 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
         state.challenge_bytes += state2.challenge_bytes
         state.challenge_seconds += state2.challenge_seconds
         state.challenge_windows += state2.challenge_windows
-        state.unread += state2.unread
+        # 读窗账按区域合并（不是相加）：同一片盘被两遍各读一次也只算一次缺口，
+        # 补扫读成功能把第一遍的缺口修掉。
+        state.merge_windows(state2.windows)
         state.failed_disks |= state2.failed_disks
         if state2.hit is not None:
             state.hit = state2.hit
@@ -992,7 +1060,7 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
     elapsed_ms = (time.monotonic() - t0) * 1000.0
     if state.hit:
         stopped = "found"
-    elif state.unread:
+    elif state.unread_bytes():
         stopped = "partial"          # 有字节根本没读到，不许报成「扫完了没命中」
     elif time.monotonic() >= deadline:
         stopped = "deadline"
@@ -1014,7 +1082,7 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
         chunks=state.chunks_done,
         threads=nthreads,
         pagefile_mft=pf.mft_index,
-        unread_bytes=state.unread,
+        unread_bytes=state.unread_bytes(),
         failed_disks=sorted(state.failed_disks),
         scan_mode=mode,
         challenge_bytes=state.challenge_bytes,

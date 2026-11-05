@@ -1022,9 +1022,19 @@ class PlayerWarmup:
         清掉了、之后没补回来。
         """
         now = time.monotonic()
-        if not force and now - self._pos_diag_at < 10.0:
+        # getattr 兜底：有些用例/替身对象不走 __init__，缺这个字段不该让诊断把
+        # `player_rows()` 一起带崩（诊断永远不能影响抓包）。
+        last = getattr(self, "_pos_diag_at", 0.0) or 0.0
+        if not force and now - last < 10.0:
             return
         self._pos_diag_at = now
+        try:
+            self._log_pos_diag_body(now=now, force=force, rows=rows)
+        except Exception as exc:                    # noqa: BLE001 - 诊断不该影响抓包
+            print(f"[pos][diag] 诊断没跑起来：{type(exc).__name__}: {exc}", flush=True)
+
+    def _log_pos_diag_body(self, *, now: float, force: bool,
+                           rows: list[dict] | None) -> None:
         has_self = self._pos.self_position is not None
         self_ok = "有" if has_self else "缺"
         track = len(self._pos)

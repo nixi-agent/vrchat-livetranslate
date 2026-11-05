@@ -455,6 +455,19 @@ def _dump_failure(pf, result, groups, *, log=None) -> str:
             "threads": result.threads,
             "regions": result.regions,
             "markers": getattr(result, "markers", {}),
+            # 覆盖率证据：只报 stopped=partial 而不给这些数字，离线根本判断不了
+            # 是「盘读不到」还是「扫完了真没命中」。
+            "unread_bytes": getattr(result, "unread_bytes", 0),
+            "region_bytes": getattr(result, "region_bytes", 0),
+            "failed_disks": list(getattr(result, "failed_disks", []) or []),
+            "scan_mode": getattr(result, "scan_mode", ""),
+            "needle_fallback": bool(getattr(result, "needle_fallback", False)),
+            "elapsed_ms": round(float(getattr(result, "elapsed_ms", 0.0)), 1),
+            "challenge_bytes": getattr(result, "challenge_bytes", 0),
+            "challenge_seconds": round(float(getattr(result, "challenge_seconds", 0.0)), 3),
+            "challenge_windows": getattr(result, "challenge_windows", 0),
+            "needle_seconds": round(float(getattr(result, "needle_seconds", 0.0)), 3),
+            "needle_windows": getattr(result, "needle_windows", 0),
             # 全量落盘：上一轮只留 10 万个，真钥可能正好在被截掉的那一半里
             "candidates": [c.hex() for c in result.candidates],
             "samples": samples,
@@ -580,9 +593,18 @@ def _scan_job_inner(job: dict, *, pid: int, conn: socket.socket,
                     "error": f"驱逐脏页失败（errno={stats['trim_err']}）"}
 
         _t = time.monotonic()
+        # 给扫描的预算必须是客户端**剩余**预算减去余量，不能是新起一个 180s：
+        # 客户端 `_drive` 只等到 deadline 就判「提权子进程没有交出结果就断开了」，
+        # 而扫描两遍共用这一个绝对 deadline（见 key_win.scan_key）。夹住之后最坏
+        # 情况是这一轮早退并报 stopped=deadline，而不是让客户端等超时、子进程还
+        # 持着盘锁读下去（那时下一轮只能 scan_busy 干等）。
+        budget = deadline - time.monotonic() - 10.0
+        deadline_s = max(1.0, min(budget, key_win.SCAN_TIMEOUT))
+        if budget < 5.0:
+            log(f"留给扫描的时间只剩 {max(0.0, budget):.1f}s，这一轮只做短扫"
+                "（stopped 会是 deadline，属预期）")
         result = key_win.scan_key(pf, groups, layout=layout, aad_kind="hdr19",
-                                 deadline_s=max(5.0, deadline - time.monotonic() - 10.0),
-                                 on_progress=progress)
+                                  deadline_s=deadline_s, on_progress=progress)
         log(f"scan_key 用时 {time.monotonic() - _t:.1f}s（stopped={result.stopped}；"
             f"needle {result.needle_seconds:.1f}s/{result.needle_windows}窗、"
             f"challenge {result.challenge_seconds:.1f}s/{result.challenge_windows}窗；"

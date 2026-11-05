@@ -37,6 +37,16 @@ OVERLAY_ERR_RUNTIME = "runtime"    # VR 运行时没在运行 / 不可用（Wind
 OVERLAY_ERR_COMPOSITOR = "compositor"  # 运行时在跑，但它的**合成器**没起来（Windows: vrcompositor）
 OVERLAY_ERR_HMD = "hmd"            # 运行时在跑，但没检测到头显
 OVERLAY_ERR_ANCHOR = "anchor"      # 锚点设备没被追踪（手柄 / tracker 不在线）
+# 运行时在跑，但 **vrclient 建不出自己的日志文件**（`<Steam>/logs/vrclient_<程序名>.txt`）：
+# openvr 把这种情况报成 `InitError_Init_NoLogPath`（枚举 112）。它不是「SteamVR 没跑」——
+# 本机实测：SteamVR 明明在跑、`vrserver.txt` 还在长，我们却连吃 10 次 112 后被自动退回勾选，
+# 而状态栏照旧说「SteamVR 没在运行」，用户完全没有可行动的线索。所以单列一个码。
+OVERLAY_ERR_LOGPATH = "logpath"    # 日志目录写不进去（占用 / 杀软拦截 / 权限）
+# 这把 overlay key 已经被**别的进程**占着（`OverlayError_KeyInUse`），而且我们删不掉它
+# （`OverlayError_PermissionDenied` —— SteamVR 只允许 owner 销毁自己的 overlay）。
+# 本机实测（v0.12.3）：桌面上还开着两个旧版本实例，它们的 key 都是默认的 `vlt.wrist.panel`，
+# 新手腕屏就永远起不来，而状态栏只写「未知原因」—— 这条要单列，解药是「关掉另一个实例」。
+OVERLAY_ERR_KEY_IN_USE = "keyinuse"  # 同一个 overlay key 被另一个翻译器实例占着
 OVERLAY_ERR_OTHER = "other"        # 其它（细节看日志）
 
 # ------------------------------------------------- 降级说明「变化才推」（GUI / CLI 共用一份）

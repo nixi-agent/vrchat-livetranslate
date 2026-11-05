@@ -17,7 +17,10 @@ Linux 侧的对等物是 `vlt/output/openxr_overlay.py`（自建 OpenXR overlay�
 from __future__ import annotations
 
 import ctypes
+import json
 import math
+import os
+import sys
 import time
 from pathlib import Path
 
@@ -26,7 +29,8 @@ from PIL import Image
 from ..paths import APP_DIR as ROOT
 from .overlay import (OverlayConfig, _unpack_entry, render_conversation, render_panel,
                       OVERLAY_ERR_ANCHOR, OVERLAY_ERR_COMPOSITOR, OVERLAY_ERR_HMD,
-                      OVERLAY_ERR_OTHER, OVERLAY_ERR_RUNTIME)
+                      OVERLAY_ERR_LOGPATH, OVERLAY_ERR_OTHER, OVERLAY_ERR_RUNTIME,
+                      OVERLAY_ERR_KEY_IN_USE)
 from .win_d3d11 import D3D11Texture
 
 # 交给 SteamVR 的贴图色空间（OpenVR 的 EColorSpace）。Auto(=0) 实测可用；Linear 会被 SteamVR
@@ -41,6 +45,13 @@ OVERLAY_COLOR_SPACE = 0
 #    `_escalate` 要等 raw 再攒够 3 次连续失败才被调用（按旧路特性约 200 帧/2 分钟）——
 #    重试挂在 `_escalate` 上等于永远等不到（复审第 1 条就是这么抓出来的）。
 TEX_RETRY_AFTER_S = 2.0
+
+# `InitError_Init_NoLogPath` 的重试节奏。实测这个错是**瞬时**的：本机同一秒连吃 10 次 112，
+# 过一会儿（占着日志文件的旧实例退出后）就能正常连上 vrserver + vrcompositor
+# （`vrclient_VRChatLiveTranslate.txt` 里留着那次成功流水）。一次失败就把勾选退回去太亏，
+# 所以先短重试两次再判失败；别的初始化错误不重试（重试只会拖慢失败反馈）。
+LOGPATH_RETRIES = 2
+LOGPATH_RETRY_S = 0.8
 
 # —— 「面板整个不可用」之后的重试节奏（`available=False` 的自愈，见 `_maybe_reinit`）——
 # 背景：`_hard_reinit()` 失败会置 `available=False`，而上传 / 心跳 / 热重载**全部**有
@@ -140,12 +151,18 @@ _INIT_ERROR_HINTS = {
     "InitError_Init_PathRegistryNotWritable":
         "SteamVR 的路径/日志目录不可写（权限问题）",
     "InitError_Init_NoLogPath":
-        "SteamVR 的日志目录不可用",
+        "vrclient 建不出自己的日志文件（`<Steam 安装目录>\\logs\\vrclient_<程序名>.txt`）："
+        "该目录被别的进程占着、被杀软拦了写，或程序没有写权限。"
+        "这不是「SteamVR 没在运行」—— 日志里会打出具体路径与 openvr 自己的报错",
     "InitError_Init_Retry":
         "SteamVR 让稍后重试（多半正在启动/切换场景）：过几秒再勾一次",
     "InitError_IPC_CompositorConnectFailed":
         "SteamVR 在跑，但它的合成器（vrcompositor）没起来 —— 手腕屏面板必须由合成器显示。"
         "把 SteamVR 完全退出后重新启动一次；不行就重启电脑",
+    "OverlayError_KeyInUse":
+        "这把 overlay key 已经被**另一个进程**占着（多半是桌面上还开着一个翻译器实例，"
+        "旧版 / 另一个窗口都算）。SteamVR 只允许创建者销毁自己的 overlay，所以清不掉 —— "
+        "关掉那个实例再勾一次，或在设置里把 overlay_key 改成不一样的名字",
 }
 
 
@@ -157,6 +174,38 @@ def _no_server_hint() -> str:
             "（重启 SteamVR；不行就重启电脑）")
 
 
+def _vrclient_log_path() -> Path | None:
+    """这次 vrclient 要写的日志文件路径（`<Steam>/logs/vrclient_<程序名>.txt`）。
+
+    ⚠️ 只为把**具体路径**写进日志：`InitError_Init_NoLogPath` 这个名字本身不带路径，
+    用户拿不到任何可行动的线索（本机实测就是这么卡住的：连吃 10 次，日志里只有类名）。
+    路径来源是 OpenVR 自己的 `%LOCALAPPDATA%\\openvr\\openvrpaths.vrpath`（`log` 数组），
+    不是我们猜 Steam 装在哪。
+    """
+    try:
+        local = os.environ.get("LOCALAPPDATA") or ""
+        if not local:
+            return None
+        raw = (Path(local) / "openvr" / "openvrpaths.vrpath").read_text(encoding="utf-8")
+        log_dirs = json.loads(raw).get("log") or []
+        if not log_dirs:
+            return None
+        # 打包版用 exe 名（`VRChatLiveTranslate`），源码跑就是 python.exe 的名字 —— 与 vrclient 一致
+        exe = Path(sys.executable if getattr(sys, "frozen", False) else (sys.argv[0] or "python"))
+        return Path(str(log_dirs[0])) / f"vrclient_{exe.stem}.txt"
+    except Exception:                        # noqa: BLE001 —— 纯诊断信息，取不到就不打路径
+        return None
+
+
+def _logpath_hint() -> str:
+    """112 的可行动方向：这是**写不了日志文件**，不是「SteamVR 没跑」。"""
+    path = _vrclient_log_path()
+    where = f"（本次要写：{path}）" if path else ""
+    return ("排查：SteamVR 在跑，但它要求 vrclient 先建好自己的日志文件 "
+            f"{where}—— 先看这个文件是不是被别的程序占着（同时开着两个翻译器实例最像，"
+            "旧实例没退干净就一直占着它），或被杀软拦了写；也可以手动删掉它再勾一次")
+
+
 # ------------------------------------------------- 失败原因：给界面一个**可翻译的码**
 # 界面（状态栏）只认码；完整原因由下面的中文提示负责（日志保持中文，诊断用）。
 _RUNTIME_ERRORS = (
@@ -165,7 +214,7 @@ _RUNTIME_ERRORS = (
     "InitError_Init_VRMonitorStartupFailed", "InitError_Init_AnotherAppLaunching",
     "InitError_Init_ShuttingDown", "InitError_Init_UserConfigDirectoryInvalid",
     "InitError_Init_PathRegistryNotFound", "InitError_Init_PathRegistryNotWritable",
-    "InitError_Init_NoLogPath", "InitError_Init_Retry",
+    "InitError_Init_Retry",
 )
 _HMD_ERRORS = ("InitError_Init_HmdNotFound", "InitError_Init_HmdNotFoundPresenceFailed")
 # 合成器（vrcompositor）没起来：overlay 接口连不上它 → 面板根本建不出来。
@@ -173,6 +222,16 @@ _HMD_ERRORS = ("InitError_Init_HmdNotFound", "InitError_Init_HmdNotFoundPresence
 #   [overlay] ⚠️ 创建 overlay 失败…：InitError_IPC_CompositorConnectFailed:
 # 与「SteamVR 没跑」解药不同（那句「先启动 SteamVR」在这条上纯误导）。
 _COMPOSITOR_ERRORS = ("InitError_IPC_CompositorConnectFailed", "Compositor")
+# vrclient 写不出自己的日志文件（`<Steam>/logs/vrclient_<程序名>.txt`）。
+# ⚠️ 它原来在 `_RUNTIME_ERRORS` 里 → 状态栏一律说「SteamVR 没在运行」。
+#    本机实测（v0.12.3，SteamVR 正常在跑、`vrserver.txt` 还在长）：勾一次手腕屏连吃 10 次
+#    `InitError_Init_NoLogPath`，用户按那句提示重启 SteamVR 一辈子也不会好 —— 真因是那个
+#    日志文件当时打不开（占用/杀软/权限）。所以单列一个码，界面另给可行动的文案。
+_LOGPATH_ERRORS = ("InitError_Init_NoLogPath",)
+# overlay 这一层（不是 init）的错：`createOverlay` 撞上同名 key，而 key 的主人是**别的进程**。
+# ⚠️ 本机实测（v0.12.3）：桌面上还开着两个旧版本实例 → 新手腕屏永远起不来，状态栏只
+#    写「未知原因」。它的解药（关掉另一个实例 / 换 key）与上面任何一条都不同。
+_KEYINUSE_ERRORS = ("OverlayError_KeyInUse",)
 
 
 def _reason_code(text: str) -> str:
@@ -180,6 +239,10 @@ def _reason_code(text: str) -> str:
     blob = str(text or "")
     if "invalidtrackeddevice" in blob.lower():
         return OVERLAY_ERR_ANCHOR
+    if any(name in blob for name in _LOGPATH_ERRORS):
+        return OVERLAY_ERR_LOGPATH          # 必须先判：它原来混在 RUNTIME 里被错报成「SteamVR 没跑」
+    if any(name in blob for name in _KEYINUSE_ERRORS):
+        return OVERLAY_ERR_KEY_IN_USE       # 也得先判：它的解药是「关掉另一个实例」，不是重启 SteamVR
     if any(name in blob for name in _HMD_ERRORS):
         return OVERLAY_ERR_HMD
     if any(name in blob for name in _COMPOSITOR_ERRORS):
@@ -309,9 +372,25 @@ class WristOverlay:
             print(f"[overlay] openvr 不可用：{exc}")
             self.last_error = OVERLAY_ERR_OTHER
             return False
-        try:
-            self._vr = openvr.init(openvr.VRApplication_Background)
-        except Exception as exc:  # noqa: BLE001
+        self._vr = None
+        last_exc: Exception | None = None
+        for attempt in range(LOGPATH_RETRIES + 1):
+            try:
+                self._vr = openvr.init(openvr.VRApplication_Background)
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                name = type(exc).__name__
+                if name not in _LOGPATH_ERRORS or attempt >= LOGPATH_RETRIES:
+                    break
+                print(f"[overlay] vrclient 的日志文件这次打不开（{name}，"
+                      f"要写 {_vrclient_log_path() or '路径未知'}）："
+                      f"{LOGPATH_RETRY_S:.1f}s 后重试（{attempt + 1}/{LOGPATH_RETRIES}）",
+                      flush=True)
+                time.sleep(LOGPATH_RETRY_S)
+        if last_exc is not None:
+            exc = last_exc
             # ⚠️ 打**类名**：openvr 异常的 str() 恒为空，只打 `{exc}` 等于没有信息
             name = type(exc).__name__
             self.last_error = _reason_code(name)
@@ -322,6 +401,8 @@ class WristOverlay:
                   flush=True)
             if name == "InitError_Init_NoServerForBackgroundApp":
                 print(f"[overlay]   {_no_server_hint()}", flush=True)
+            elif self.last_error == OVERLAY_ERR_LOGPATH:
+                print(f"[overlay]   {_logpath_hint()}", flush=True)
             return False
         try:
             # ⚠️ overlay 接口是**模块级工厂函数** `openvr.IVROverlay()`，
@@ -348,6 +429,13 @@ class WristOverlay:
                 except Exception as exc2:  # noqa: BLE001
                     print(f"[overlay]   清理残留 overlay 未成功（继续尝试重建）："
                           f"{type(exc2).__name__}: {exc2}", flush=True)
+                    # `OverlayError_PermissionDenied` 的语义是「这把 key 属于别的进程」——
+                    # SteamVR 只让创建者销毁自己的 overlay。本机实测就是另一个实例在占着，
+                    # 这时线索比「清理失败」有用得多（用户才知道该关谁）。
+                    if "PermissionDenied" in f"{type(exc2).__name__}{exc2}":
+                        print(f"[overlay]   这把 key（'{self.cfg.overlay_key}'）属于**另一个进程**："
+                              f"桌面上还开着别的翻译器实例（旧版也算）—— 关掉它再勾一次，"
+                              f"或在设置里把 overlay_key 改成不同的名字", flush=True)
                 self._handle = self._overlay.createOverlay(self.cfg.overlay_key, "VLT 手腕屏")
             self._device = self._resolve_anchor()
             # ⚠️ available 必须在 _apply_transform 之前置位：它开头有

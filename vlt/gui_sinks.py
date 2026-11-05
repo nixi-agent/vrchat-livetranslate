@@ -6,7 +6,8 @@ from . import platform
 from . import config as _cfg_mod
 from .config_io import _fmt_scalar, _write_config_text, _yaml_set_or_create
 from .output.overlay import (OverlayConfig, OVERLAY_ERR_ANCHOR, OVERLAY_ERR_COMPOSITOR,
-                             OVERLAY_ERR_HMD, OVERLAY_ERR_OTHER, OVERLAY_ERR_RUNTIME)
+                             OVERLAY_ERR_HMD, OVERLAY_ERR_LOGPATH, OVERLAY_ERR_OTHER,
+                             OVERLAY_ERR_RUNTIME, OVERLAY_ERR_KEY_IN_USE)
 from .i18n import t
 from .gui_engine_context import EngineCtx
 
@@ -89,8 +90,18 @@ def overlay_error_text(code: str) -> str:
     """
     if code == OVERLAY_ERR_RUNTIME:
         return t("SteamVR 没在运行或不可用：先启动 SteamVR，再勾一次")
+    if code == OVERLAY_ERR_LOGPATH:
+        # 实测（v0.12.3）：SteamVR 好好在跑，`vrserver.txt` 还在长，我们却连吃 10 次
+        # `InitError_Init_NoLogPath`。旧归类把它算进 RUNTIME → 用户按「先启动 SteamVR」
+        # 重启一万次也不会好。真因是 vrclient 写不出自己的日志文件。
+        return t("SteamVR 在跑，但它写不出自己的日志文件：先关掉另一个翻译器实例再勾一次")
     if code == OVERLAY_ERR_COMPOSITOR:
         return t("SteamVR 在跑，但它的合成器没起来：完全退出 SteamVR 再启动一次")
+    if code == OVERLAY_ERR_KEY_IN_USE:
+        # 实测（v0.12.3）：桌面上还开着两个旧版本实例，它们都用默认的 `vlt.wrist.panel`，
+        # 新手腕屏永远起不来（`OverlayError_KeyInUse` + 删不掉 → PermissionDenied），
+        # 状态栏却只写「未知原因」。用户唯一能行动的就是关掉那个实例。
+        return t("手腕屏被另一个翻译器实例占着：关掉多余的实例（旧版也算）再勾一次")
     if code == OVERLAY_ERR_HMD:
         return t("SteamVR 在跑，但没检测到头显：戴上头显、确认 SteamVR 里能看到设备，再勾一次")
     if code == OVERLAY_ERR_ANCHOR:

@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import ctypes as C
+import time
 from ctypes import wintypes as W
 from typing import Iterable
 
@@ -107,9 +108,22 @@ class _FILETIME(C.Structure):
 _SNAP_WARNED = False
 _UDP_FALLBACK_LOGGED = False
 _UDP_WARNED = False
-#: 快照本身拿不到（不是「没找到 VRChat」）。只有这种状态下才值得走 UDP 反查：
-#: 游戏没开时 `discover()` 同样是空表，那不该每 2 s 去拉一遍 UDP 表、开一堆进程。
+#: 快照本身拿不到（不是「没找到 VRChat」）。留着做诊断/日志措辞用，但
+#: `find_vrchat()` 不再拿它当「要不要兜底」的开关 —— 打包版见过快照成功却
+#: 只有几十条用户态进程的形态，那时它是 False，兜底就永远不跑。
 _SNAP_BROKEN = False
+#: UDP 反查的最小间隔（秒）。它是兜底而非主路径，游戏没开时也会被调用，
+#: 限制到每秒一次就够：`_run()` 的轮询本身是 2 s 一轮。
+_UDP_MIN_INTERVAL_S = 1.0
+_last_udp_ts = 0.0
+#: 最近一次**成功**的结果 + 它的时间戳。给 `find_vrchat()` 兜一层宽限：
+#: 打包版里「快照被过滤 + 兜底被节流」会让它每隔一轮吐一次空表，上层
+#: `PlayerWarmup._run()` 会把这次空当成「游戏退了」→ 清 host、断抓包、
+#: 再选一次 host（`_key` 被清、`_next_scan` 归零）→ 立刻重新提权取钥，
+#: 真机上就是「反复弹 UAC + 状态反复跳」。宽限期内只要进程还活着就不吐空。
+_LAST_GOOD_TTL_S = 10.0
+_last_good: list[ProcInfo] = []
+_last_good_ts = 0.0
 
 
 def _warn_snapshot_once(detail: str) -> None:
@@ -276,21 +290,56 @@ def discover(markers: tuple[str, ...], *, limit: int = 400) -> list[ProcInfo]:
 def find_vrchat() -> list[ProcInfo]:
     """所有看起来像 VRChat 的进程（游戏本体 + 受保护启动器）。
 
-    两条路：正常走 Toolhelp 快照；**快照被拦时改走 UDP 表反查** ——
-    打包成 exe 后实测 Toolhelp 恒返回空表（`CreateToolhelp32Snapshot` 直接
-    失败），界面就永远「等待 VRChat 进程…」，而 `GetExtendedUdpTable` 与
-    `QueryFullProcessImageNameW` 都还能用（后者只要求
-    `PROCESS_QUERY_LIMITED_INFORMATION`，EAC 不剥）。
+    两条路：正常走 Toolhelp 快照；**快照里看不到 VRChat 时改走 UDP 表反查** ——
+    打包成 exe 后见过两种形态：`CreateToolhelp32Snapshot` 直接失败，以及**快照
+    成功但列表被过滤成几十条用户态进程**（`_SNAP_BROKEN` 还是 False）。后一种
+    以前会在「快照是好的、只是没有 VRChat」这里直接 `return []`，于是每轮都
+    「等待 VRChat 进程…」，`[procfs]` 一条日志都没有，看着像卡死。
 
-    兜底**只在快照本身失败时**启用：快照是好的、只是没有 VRChat，等于「游戏
-    没开」—— 那种时候每轮都去拉 UDP 表、逐个 `OpenProcess` 只是白烧 CPU。
+    所以不再按「快照是否失败」分流，而是按**结果**分流：拿不到 VRChat 就查一遍
+    UDP 表（`GetExtendedUdpTable` + `QueryFullProcessImageNameW`，后者只要
+    `PROCESS_QUERY_LIMITED_INFORMATION`，EAC 不剥）。开销是几十个 pid 的
+    `OpenProcess`，几毫秒，这里再用 `_UDP_MIN_INTERVAL_S` 限一次频率，
+    游戏真没开时也不至于每轮都扫。
+
+    但「这一轮没查到」和「游戏退了」是两件事：节流窗口正好落在一轮轮询上，
+    或者兜底那次 `image_path` 撞上进程刚建的瞬间，都会返回空表。上层
+    `PlayerWarmup._run()` 只看返回值，于是把空表当成「游戏退了」→ 断抓包、
+    清 host，再接上时又走一遍 `_select_new_host()`（清 `_key`、`_next_scan`
+    归零）→ 立刻重新提权取钥，真机上就是「反复弹 UAC + 状态反复跳」。
+    所以这里对**最近一次成功结果**给 `_LAST_GOOD_TTL_S` 的宽限：只要那些进程
+    还活着（`(pid, 创建时间)` 一致），就别吐空。
     """
+    global _last_udp_ts, _last_good, _last_good_ts
     procs = discover(GAME_MARKERS)
+    if not procs:
+        now = time.monotonic()
+        if now - _last_udp_ts >= _UDP_MIN_INTERVAL_S:
+            _last_udp_ts = now
+            procs = _discover_by_udp(GAME_MARKERS)
     if procs:
+        _last_good = procs
+        _last_good_ts = time.monotonic()
         return procs
-    if not _SNAP_BROKEN:
-        return []
-    return _discover_by_udp(GAME_MARKERS)
+    if (_last_good and time.monotonic() - _last_good_ts <= _LAST_GOOD_TTL_S
+            and _alive_same(_last_good)):
+        return list(_last_good)
+    return []
+
+
+def _alive_same(procs: list[ProcInfo]) -> bool:
+    """这些进程是否还活着、且还是同一批（用 `(pid, 创建时间)` 认）。
+
+    pid 会被复用，所以只比 pid 不够：游戏退出后新进程占了同一个 pid，
+    宽限期就会一直把死进程当成 VRChat。
+    """
+    for proc in procs:
+        created = process_created(proc.pid)
+        if created is None:
+            return False
+        if proc.starttime and created != proc.starttime:
+            return False
+    return True
 
 
 def _discover_by_udp(markers: tuple[str, ...]) -> list[ProcInfo]:
@@ -325,7 +374,7 @@ def _discover_by_udp(markers: tuple[str, ...]) -> list[ProcInfo]:
         # 只喊一次：以后看日志就知道这一次是走兜底找到的，还是 Toolhelp 正常。
         _UDP_FALLBACK_LOGGED = True
         detail = "、".join(f"{p.pid} {p.comm}" for p in found)
-        print(f"[procfs][info] 快照为空，已按 UDP 表反查到：{detail}",
+        print(f"[procfs][info] 进程快照里看不到 VRChat，已按 UDP 表反查到：{detail}",
               flush=True)
     return found
 

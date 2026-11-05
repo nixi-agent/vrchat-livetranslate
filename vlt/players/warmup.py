@@ -51,6 +51,8 @@ if _WIN:                                             # pragma: no cover - 平台
         """Windows：进程发现走 `procfs_win`（`procfs` 读的是 `/proc`）。"""
         return procfs_win.pick_host(procfs_win.find_vrchat())
 
+    _iter_processes = procfs_win.iter_processes
+
     def _udp_ports(pid: int) -> set[int]:
         from . import dgram
 
@@ -73,6 +75,7 @@ if _WIN:                                             # pragma: no cover - 平台
 
 else:
     _pick_host = lambda: procfs.pick_host(procfs.find_vrchat())   # noqa: E731
+    _iter_processes = procfs.iter_processes
     _udp_ports = procfs.udp_ports
     _assess = lambda: guard.assess(guard.collect())              # noqa: E731
     _default_drain = capture_linux.drain
@@ -89,6 +92,12 @@ SAMPLE_TARGET = 40
 MAX_DECRYPT_FAILURES = 10
 VOICE_REPLAY_S = 5.0
 POLL_S = 2.0
+#: 连续几轮查不到 VRChat 才认定「游戏退了」。真实退出会一直查不到，而打包版里
+#: 快照被过滤/兜底被节流会偶发空表 —— 那时拆掉抓包就等于白弹一次 UAC。
+HOST_MISS_TOLERANCE = 2
+#: 两次提权取钥之间的最小间隔（秒）。取钥失败后立刻重来会连弹 UAC，
+#: 失败原因多半（没提权 / UAC 被否 / pagefile 定位异常）不会自愈，等一会儿再说。
+ACQUIRE_COOLDOWN_S = 20.0
 DRAIN_S = 0.25
 LOCAL_PORTS_REFRESH_S = 5.0
 WIN_SAMPLE_TIMEOUT = 20.0          # Windows：等第一批加密包当样本的上限
@@ -210,6 +219,10 @@ class PlayerWarmup:
         # 拿到密钥之前收到的包：装好密钥后**补解一遍**（加入世界那批名单就在里面）
         self._pre_key: list[capture_linux.Datagram] = []
         self._retry_pending = False
+        #: 连续多少轮没查到 VRChat（见 `HOST_MISS_TOLERANCE`）
+        self._host_misses = 0
+        #: 下一次允许提权取钥的时间点（见 `ACQUIRE_COOLDOWN_S`）
+        self._acquire_not_before = 0.0
 
         self._names = names.NameTable()
         # 位置表也归预热器：没开始翻译时右栏要按距离排序，就靠它在后台一直喂。
@@ -670,6 +683,14 @@ class PlayerWarmup:
             self._poll_roster()
             host = self._find_host()
             if host is None:
+                self._host_misses += 1
+                if self._host is not None and self._host_misses < HOST_MISS_TOLERANCE:
+                    # 一两轮查不到不等于游戏退了：抓包 socket 还在、密钥还能用，
+                    # 一旦拆掉（`_drop_capture` + `_select_new_host`）就得重新提权 ——
+                    # 真机上就是「状态反复跳 + 反复弹 UAC」。`procfs_win.find_vrchat()`
+                    # 那边也有宽限，这里是第二层保险。
+                    self._stop.wait(self._poll_s)
+                    continue
                 self._drop_capture()
                 if self._host is not None:
                     self._host = None
@@ -678,6 +699,7 @@ class PlayerWarmup:
                     self._set_phase(PHASE_WAITING, self._wait_detail())
                 self._stop.wait(self._poll_s)
                 continue
+            self._host_misses = 0
             if self._retry_pending:
                 self._retry_pending = False
                 self._select_new_host(host, force=True)
@@ -707,25 +729,41 @@ class PlayerWarmup:
         host = host or self._find_host()
         if host is None:
             return
-        had_host = self._host is not None
+        prev = self._host
+        # 「同一个进程」＝ pid 与创建时间都对得上（创建时间为 0 表示那次没读到，
+        # 不能据此判成换了进程，否则又退回老毛病）。
+        same_proc = bool(
+            prev is not None and host.pid == prev.pid
+            and (not host.starttime or not prev.starttime
+                 or host.starttime == prev.starttime))
+        had_host = prev is not None
+        if same_proc and self._key is not None and self._socket is not None:
+            # 还是那个进程、密钥和抓包 socket 都在：**什么都不用做**。
+            # 以前这里会无条件清 `_key` 再重新 bootstrap，于是只要上层误判一次
+            # 「游戏退了」，就会重新扫一遍 pagefile、re-弹一次 UAC。
+            return
         self._drop_capture()
         self._host = host
-        if had_host:
+        if had_host and not same_proc:
             # 第一次绑定时不能清：那里面是预热线程首轮从 output_log 灌进来的名字兜底表。
             with self._names_lock:
                 self._names.clear()
-        # 换进程（游戏重启）＝换会话：自己那份位置也作废，否则右栏会拿旧坐标算距离。
-        self._pos.reset()
-        self._key = None
-        self._opener = None
-        self._samples.clear()
+        if not same_proc:
+            # 换进程（游戏重启）＝换会话：自己那份位置也作废，否则右栏会拿旧坐标算距离。
+            self._pos.reset()
+            # 密钥是**进程级**的（同一个 VRChat 进程里换房间、换世界都不换），
+            # 只有换进程才该清 —— 清了就得重新读 pagefile，真机上等于再弹一次 UAC。
+            self._key = None
+            self._opener = None
+            self._samples.clear()
+            self._pre_key.clear()
+            self._world = ""
+            self._frag = {"in": photon.Fragmenter(), "out": photon.Fragmenter()}
+            self._buffer = pending.PreKeyBuffer(
+                max_bytes=max(1, int(self.settings.prewarm_buffer_mb)) << 20,
+                world_ready=True)
+            self._next_scan = 0.0
         self._fail_streak = 0
-        self._pre_key.clear()
-        self._world = ""
-        self._frag = {"in": photon.Fragmenter(), "out": photon.Fragmenter()}
-        self._buffer = pending.PreKeyBuffer(
-            max_bytes=max(1, int(self.settings.prewarm_buffer_mb)) << 20, world_ready=True)
-        self._next_scan = 0.0
         if self._auth_failed and not force:
             self._set_phase(PHASE_UNAUTHORIZED, "未授权（可点「重新授权」）")
             return
@@ -734,6 +772,12 @@ class PlayerWarmup:
             reasons = "；".join(getattr(verdict, "reasons", []) or [])
             self._set_phase(PHASE_BLOCKED, f"EAC 闸门拒绝：{reasons}")
             return
+        # 冷却：一次授权**失败**后别马上再来一遍（用户在场时会连弹 UAC）。
+        # 注意：这里只「检查」，不「记时」——成功拿到密钥时不该罚下一次
+        # （游戏重启后立刻需要重新取钥，没必要干等 20 s）。
+        if not force and time.monotonic() < self._acquire_not_before:
+            self._set_phase(PHASE_FAILED, "上一次取钥失败，稍后自动重试（避免连续弹 UAC）")
+            return
         # **一次授权**做完：开抓包 + 采样 + 扫内存（同一个短命助手）。
         # 以前是「开抓包一个助手 + 扫内存一个助手」→ 用户被连着要两次密码。
         self._set_phase(PHASE_ACQUIRING, "正在等待系统授权…")
@@ -741,12 +785,14 @@ class PlayerWarmup:
             result = self._bootstrap(host)
         except Exception as exc:                          # noqa: BLE001
             self._auth_failed = True
+            self._acquire_not_before = time.monotonic() + ACQUIRE_COOLDOWN_S
             self._set_phase(PHASE_UNAUTHORIZED, f"授权失败：{exc}")
             return
         with self._lock:
             self._socket = result.socket
         if result.socket is None:
             self._auth_failed = True
+            self._acquire_not_before = time.monotonic() + ACQUIRE_COOLDOWN_S
             self._set_phase(PHASE_UNAUTHORIZED, result.detail or "没有拿到抓包 fd")
             return
         self._auth_failed = False
@@ -760,6 +806,7 @@ class PlayerWarmup:
         if key is not None:
             self._install_key(key)
         elif getattr(result, "blocked", False):
+            self._acquire_not_before = time.monotonic() + ACQUIRE_COOLDOWN_S
             self._set_phase(PHASE_FAILED, result.detail or "读内存被拒绝")
         else:
             self._set_phase(PHASE_ACQUIRING,
@@ -926,12 +973,16 @@ class PlayerWarmup:
     def _wait_detail(self) -> str:
         """「等待 VRChat」那句的细则：带上当前可见进程数。
 
-        打包成 exe 后 `CreateToolhelp32Snapshot` 曾被拦成空表，界面只有一句
+        打包成 exe 后进程枚举曾被拦成空表 / 被过滤成几十条，界面只有一句
         「等待 VRChat 进程…」，看不出是「枚举被拦」还是「游戏真没开」。带上
         这个数字（外加 `procfs_win` 里那条一次性警告）就能一眼分辨。
+
+        这里必须用 `_iter_processes`（平台分派）：以前直接调 `procfs`，在
+        Windows 上读 `/proc` 必抛，于是文案**恒**为「（进程枚举不可用）」，
+        正好把「枚举被拦」和「分派写错」混成一条。
         """
         try:
-            count = len(procfs.iter_processes())
+            count = len(_iter_processes())
         except Exception:                                 # noqa: BLE001 - 诊断不该抛
             count = -1
         if count < 0:

@@ -58,6 +58,7 @@ import os
 import secrets
 import socket
 import sys
+import tempfile
 import time
 
 from pathlib import Path
@@ -358,6 +359,203 @@ def _decode_samples(raw) -> dict:
     return groups
 
 
+#: 全机只允许一个提权扫描（命名互斥体）。本机实测：GUI 里多个采集实例/多次重试
+#: 会并行拉起 6 个以上的子进程同时扫 34 GiB —— 日志里六条进度交错、IO 打满，
+#: 而且谁都扫不完（互相拖慢到超时）。这里在**操作系统层面**保证串行。
+MUTEX_NAME = "vrchat_livetranslate_keyd_scan"        # 会话内命名互斥体（无需 Global 前缀）
+
+
+def _acquire_scan_mutex():
+    """拿到 → 返回句柄；拿不到（已有扫描在跑）→ 返回 None。"""
+    try:
+        k32 = ctypes.windll.kernel32
+        # 句柄是 64 位：不设 restype 会被截成 int32，CloseHandle/ReleaseMutex 就作用在
+        # 一个错的值上（而且静默失败，看起来像「互斥体没生效」）。
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+        h = k32.CreateMutexW(None, False, MUTEX_NAME)
+        if not h:
+            return None
+        ERROR_ALREADY_EXISTS = 183
+        if k32.GetLastError() == ERROR_ALREADY_EXISTS:
+            k32.CloseHandle(ctypes.c_void_p(h))
+            return None
+        return h
+    except (AttributeError, OSError):
+        return None   # 非 Windows / 拿不到互斥体：不拦，照旧扫
+
+
+#: `OpenMutexW` 只要 SYNCHRONIZE 就够了（我们只问「存不存在」，不要改它）。
+_SYNCHRONIZE = 0x00100000
+
+
+def scan_busy() -> bool:
+    """现在是否已有另一个提权扫描在跑（**父进程侧**探测，不弹 UAC）。
+
+    为什么要在父进程探：子进程撞锁时已经「连上 → 收到 job → 才回 busy」，
+    那时 UAC 窗口早弹过了。实测一轮重试里连弹 5 次 UAC，用户看到的就是
+    「一直弹窗但一直拿不到钥匙」。提前探到就能直接等那一路的结果，
+    一个窗口都不用弹。
+
+    非 Windows / 探测失败一律返回 False（宁可多扫一次，也别卡死在「等」上）。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.OpenMutexW.restype = ctypes.c_void_p      # 句柄是 64 位，别被截成 int32
+        h = k32.OpenMutexW(ctypes.c_uint32(_SYNCHRONIZE), False, MUTEX_NAME)
+        if not h:
+            return False
+        k32.CloseHandle(ctypes.c_void_p(h))
+        return True
+    except (AttributeError, OSError):
+        return False
+
+
+def _release_scan_mutex(h) -> None:
+    if not h:
+        return
+    try:
+        k32 = ctypes.windll.kernel32
+        # ReleaseMutex 只对「持锁的那个线程」有效；句柄不是自己拿的（例如上层把一个
+        # 别人创建的句柄传下来）就会失败 —— 这里不当作错误，句柄该关还是要关。
+        k32.ReleaseMutex(ctypes.c_void_p(h))
+    except (AttributeError, OSError):
+        pass
+    try:
+        ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(h))
+    except (AttributeError, OSError):
+        pass
+
+def _child_log_path() -> "Path":
+    """子进程自己的日志（在 %TEMP%，和排查包放一起）。"""
+    return Path(tempfile.gettempdir()) / "vlt_keyd.log"
+
+
+def _dump_failure(pf, result, groups, *, log=None) -> str:
+    """失败时把「扫到了什么」落一份 JSON：样本报文 + 候选 key + 统计。
+
+    没有这份东西，「候选 5 万个全不通过」只能靠猜（内存压缩？偏移不对？样本不对？）。
+    有了它可以在**不重新提权**的情况下离线复验每一种 AAD 形态/候选偏移。
+    只写 `%TEMP%`，只含密文与候选（没有明文、没有用户名）。
+
+    候选可能到 40 万个（≈27 MB），而取钥失败会每 10 s 重试一次 —— 不轮转的话
+    `%TEMP%` 会被同一份排查包反复堆满。这里只保留最近 `_DUMP_KEEP` 份。
+    """
+    try:
+        import tempfile
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        tmpdir = Path(tempfile.gettempdir())
+        path = tmpdir / f"vlt_keyd_dump_{ts}.json"
+        items = groups.items() if isinstance(groups, dict) else groups
+        samples = {}
+        for tag, pkts in items:
+            try:
+                peer, chal = tag
+            except (TypeError, ValueError):
+                peer, chal = b"", b""
+            samples[f"{bytes(peer).hex()}|{bytes(chal).hex()}"] = [
+                bytes(x).hex() for x in pkts[:8]]
+        payload = {
+            "time": ts,
+            "pagefile": getattr(pf, "summary", lambda: "")(),
+            "scanned_bytes": result.scanned_bytes,
+            "chunks": result.chunks,
+            "stopped": result.stopped,
+            "needle_hits": result.needle_hits,
+            "aad_kind_default": result.aad_kind,
+            "threads": result.threads,
+            "regions": result.regions,
+            "markers": getattr(result, "markers", {}),
+            # 覆盖率证据：只报 stopped=partial 而不给这些数字，离线根本判断不了
+            # 是「盘读不到」还是「扫完了真没命中」。
+            "unread_bytes": getattr(result, "unread_bytes", 0),
+            "region_bytes": getattr(result, "region_bytes", 0),
+            "failed_disks": list(getattr(result, "failed_disks", []) or []),
+            "scan_mode": getattr(result, "scan_mode", ""),
+            "needle_fallback": bool(getattr(result, "needle_fallback", False)),
+            "elapsed_ms": round(float(getattr(result, "elapsed_ms", 0.0)), 1),
+            "challenge_bytes": getattr(result, "challenge_bytes", 0),
+            "challenge_seconds": round(float(getattr(result, "challenge_seconds", 0.0)), 3),
+            "challenge_windows": getattr(result, "challenge_windows", 0),
+            "needle_seconds": round(float(getattr(result, "needle_seconds", 0.0)), 3),
+            "needle_windows": getattr(result, "needle_windows", 0),
+            # 全量落盘：上一轮只留 10 万个，真钥可能正好在被截掉的那一半里
+            "candidates": [c.hex() for c in result.candidates],
+            "samples": samples,
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        _prune_dumps(tmpdir, keep=_DUMP_KEEP)
+        if log is not None:
+            log(f"排查包已保存：{path}（{len(payload['candidates'])} 个候选）")
+        return str(path)
+    except Exception as exc:                                   # noqa: BLE001 - 只影响排查
+        if log is not None:
+            log(f"排查包写不出来：{type(exc).__name__}: {exc}")
+        return ""
+
+
+#: 排查包保留份数（文件名里的时间戳天然可排序）。
+_DUMP_KEEP = 3
+
+
+def _prune_dumps(tmpdir: "Path", *, keep: int) -> None:
+    """只留最近 `keep` 份排查包 —— 失败会每 10 s 重试，不清理会堆满 `%TEMP%`。"""
+    try:
+        dumps = sorted(tmpdir.glob("vlt_keyd_dump_*.json"))
+        for old in dumps[:-keep] if keep > 0 else dumps:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+_COMPRESSION_KEY = r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+STRICT_COMPRESSION_ENV = "VLT_KEY_SCAN_STRICT_COMPRESSION"
+
+
+def _strict_compression() -> bool:
+    """`VLT_KEY_SCAN_STRICT_COMPRESSION=1`：压缩开着就当作致命错误、不扫。
+
+    默认不拦（见 `_scan_job_inner`）：Win10/11 默认开着内存压缩，一刀切会把
+    大多数机器判成「取钥失败」；而压缩只是让扫描大概率落空，不是不可能成功
+    （小页/未压缩页仍可能命中），该由用户看到警告后自己决定。
+    """
+    raw = (os.environ.get(STRICT_COMPRESSION_ENV, "") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _memory_compression_state() -> bool | None:
+    """Windows 内存压缩开关：True=开 / False=关 / None=问不出来。
+
+    先读注册表（**非管理员也能读**），读不到再退回 CIM（只有管理员能问）。
+    这么排的原因是：压缩检查要能在弹 UAC **之前**做（子进程起来时用户已经点过
+    提权了，那时才告诉他「注定失败」等于白弹一次）。查失败**不影响**扫描。
+    """
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _COMPRESSION_KEY) as k:
+            value, _kind = winreg.QueryValueEx(k, "MemoryCompression")
+        return bool(int(value))
+    except FileNotFoundError:
+        return None                     # 老系统没有这个值：不知道，别当成「关」
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        import subprocess
+        p = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "(Get-MMAgent).MemoryCompression"],
+            capture_output=True, text=True, timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        out = (p.stdout or "").strip().lower()
+        if out in ("true", "false"):
+            return out == "true"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 def _scan_job_inner(job: dict, *, pid: int, conn: socket.socket,
                     deadline: float, info: dict) -> dict:
     """真正的特权工作：定位 pagefile → 驱逐脏页 → 扫 key → 交回（不含明文日志）。
@@ -372,6 +570,14 @@ def _scan_job_inner(job: dict, *, pid: int, conn: socket.socket,
     last = [0.0]
 
     def log(message: str) -> None:
+        # 先落盘再发：进程被硬杀时，磁盘上至少还有最后一步是什么
+        try:
+            _fh = globals().get("_CHILD_FH")
+            if _fh is not None:
+                _fh.write(f"{time.strftime('%H:%M:%S')} {message}" + chr(10))
+                _fh.flush()
+        except (OSError, ValueError):
+            pass
         try:
             _send(conn, {"stage": "log", "message": message})
         except OSError:
@@ -391,6 +597,22 @@ def _scan_job_inner(job: dict, *, pid: int, conn: socket.socket,
     segs = f"，{len(layout.extents)} 段" if len(layout.extents) > 1 else ""
     log(f"系统盘在 PhysicalDrive{layout.disk_no}"
         f"（盘上起点 {layout.base_offset / 2**30:.1f} GiB{segs}）")
+    compression = _memory_compression_state()
+    if compression:
+        # 压缩开着时 pagefile 里多半是 XPRESS 压缩块，不是原始堆页 —— 扫描大概率落空
+        # （上游实测 9,109 个候选全部认证失败）。但 Win10/11 默认就开着，一刀切
+        # 会让大多数机器直接「取钥失败」，所以默认只警告、继续扫；真要硬拦得
+        # 显式设 `VLT_KEY_SCAN_STRICT_COMPRESSION=1`。
+        msg = ("内存压缩开着（MemoryCompression=On）→ pagefile 里多半不是原始堆页，"
+               "扫描很可能落空。若确实扫不到，用管理员执行 "
+               "Disable-MMAgent -MemoryCompression 后重启再试")
+        if _strict_compression():
+            log("⚠️ " + msg + "（VLT_KEY_SCAN_STRICT_COMPRESSION=1，本轮不扫）")
+            return {"ok": False, "fatal": True, "error": msg,
+                    "memory_compression": True}
+        log("⚠️ " + msg + "（继续扫，先看结果）")
+    if compression is False:
+        log("内存压缩：关（扫描前提满足）")
 
     with disk:
         try:
@@ -428,12 +650,26 @@ def _scan_job_inner(job: dict, *, pid: int, conn: socket.socket,
                     "error": f"驱逐脏页失败（errno={stats['trim_err']}）"}
 
         _t = time.monotonic()
+        # 给扫描的预算必须是客户端**剩余**预算减去余量，不能是新起一个 180s：
+        # 客户端 `_drive` 只等到 deadline 就判「提权子进程没有交出结果就断开了」，
+        # 而扫描两遍共用这一个绝对 deadline（见 key_win.scan_key）。夹住之后最坏
+        # 情况是这一轮早退并报 stopped=deadline，而不是让客户端等超时、子进程还
+        # 持着盘锁读下去（那时下一轮只能 scan_busy 干等）。
+        budget = deadline - time.monotonic() - 10.0
+        deadline_s = max(1.0, min(budget, key_win.SCAN_TIMEOUT))
+        if budget < 5.0:
+            log(f"留给扫描的时间只剩 {max(0.0, budget):.1f}s，这一轮只做短扫"
+                "（stopped 会是 deadline，属预期）")
         result = key_win.scan_key(pf, groups, layout=layout, aad_kind="hdr19",
-                                 deadline_s=max(5.0, deadline - time.monotonic() - 10.0),
-                                 on_progress=progress)
-        log(f"scan_key 用时 {time.monotonic() - _t:.1f}s（stopped={result.stopped}）")
+                                  deadline_s=deadline_s, on_progress=progress)
+        log(f"scan_key 用时 {time.monotonic() - _t:.1f}s（stopped={result.stopped}；"
+            f"needle {result.needle_seconds:.1f}s/{result.needle_windows}窗、"
+            f"challenge {result.challenge_seconds:.1f}s/{result.challenge_windows}窗；"
+            f"锚点 {result.needle_hits}、候选 {len(result.candidates)}、"
+            f"偏移 {len(key_win._cand_offsets())}、形态 {len(key_win._kind_order(result.aad_kind))}）")
 
     if result.hit is None:
+        dump = _dump_failure(pf, result, groups, log=log)
         unread = ""
         if result.unread_bytes:
             unread = (f"；另有 {result.unread_bytes / 2**20:.1f} MiB 根本没读到"
@@ -443,8 +679,12 @@ def _scan_job_inner(job: dict, *, pid: int, conn: socket.socket,
             "ok": False,
             "error": (f"扫了 {result.scanned_bytes / 2**30:.1f} GiB"
                       f"（{result.chunks} 块）、候选 {len(result.candidates)} 个，"
-                      "都不通过 GCM 认证。最可能的原因：内存压缩又开着了"
-                      f"（Disable-MMAgent -MemoryCompression 后重启）{unread}"),
+                      "都不通过 GCM 认证。常见原因：内存压缩开着"
+                      "（管理员执行 Disable-MMAgent -MemoryCompression 后重启）"
+                      "、进世界后堆已换过一轮（重新授权一次）"
+                      f"{unread}"
+                      f"，pagefile 里的游戏堆路标：{getattr(result, 'markers', {})}"
+                      + (f"；排查包：{dump}" if dump else "")),
         }
     peer, chal = result.hit.flow
     return {
@@ -455,6 +695,8 @@ def _scan_job_inner(job: dict, *, pid: int, conn: socket.socket,
         "ok_count": result.hit.ok,
         "total": result.hit.total,
         "offset": result.hit.offset,
+        "aad_kind": result.hit.kind,
+        "key_off": result.hit.key_off,
         "fingerprint": key_win.key_fingerprint(result.hit.key),
         "scanned_bytes": result.scanned_bytes,
         "chunks": result.chunks,
@@ -500,9 +742,40 @@ def main(argv: list[str] | None = None) -> int:
                         help="存活上限秒数（到点自退）")
     args = parser.parse_args(argv)
 
+    # 子进程没有控制台（ShellExecuteW runas 起的），出事先死在没人看得见的地方。
+    # 自己留一份日志 + faulthandler：硬崩（访问越界/栈溢出）也能看到当时的栈。
+    log_path = _child_log_path()
+    try:
+        _fh = open(log_path, "a", encoding="utf-8", buffering=1)   # noqa: SIM115 - 进程内不关
+        import faulthandler
+        faulthandler.enable(file=_fh)
+        _fh.write(f"--- keyd {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                  f"pid={os.getpid()} lifetime={args.lifetime} "
+                  f"port={args.port} pid_arg={args.pid}" + chr(10))
+        _fh.flush()
+    except OSError:
+        _fh = None
+    globals()["_CHILD_FH"] = _fh
+    if _fh is not None:
+        _fh.write(f"argv={sys.argv[1:]}" + chr(10))
+        _fh.flush()
+
     if not is_admin():
         print("[keyd] 必须以管理员运行（由主程序提权拉起）", file=sys.stderr, flush=True)
         return EXIT_NOT_ADMIN
+    # 后台任务：整机不能被扫盘拖垮，但降级会直接吃掉扫描吞吐（本机实测 BELOW_NORMAL
+    # 只有 ~0.27 GiB/s，NORMAL 时 1.0 GiB/s）。所以交给 VLT_KEY_SCAN_PRIORITY 决定：
+    #   normal（默认）：进程保持正常优先级，扫得快；32 MiB 切窗已能防止把机器拖死
+    #   below：BELOW_NORMAL_PRIORITY_CLASS，前台优先
+    #   lowest：IDLE_PRIORITY_CLASS，最保守（更慢）
+    _prio = (os.environ.get("VLT_KEY_SCAN_PRIORITY", "") or "normal").strip().lower()
+    _class = {"normal": 0x20, "below": 0x4000, "lowest": 0x40}.get(_prio)
+    if _class is not None:
+        try:
+            ctypes.windll.kernel32.SetPriorityClass(
+                ctypes.windll.kernel32.GetCurrentProcess(), _class)
+        except (AttributeError, OSError):
+            pass
 
     deadline = time.monotonic() + max(30.0, args.lifetime)
     try:
@@ -534,15 +807,30 @@ def main(argv: list[str] | None = None) -> int:
                          "error": "任务里的进程创建时间与命令行不一致（PID 可能被复用）"})
             return EXIT_BAD_TARGET
 
+        mutex = _acquire_scan_mutex()
+        if mutex is None and os.name == "nt":
+            if _fh is not None:
+                _fh.write("skip: 已有另一个提权扫描在跑（互斥体占用）" + chr(10))
+                _fh.flush()
+            _send(conn, {"stage": "error", "fatal": False,
+                         "error": "已有另一个取钥扫描在进行，本次跳过（避免两路同时读盘）"})
+            return 0
         try:
             result = _scan_job(job, pid=args.pid, conn=conn, deadline=deadline)
         except Exception as exc:                      # noqa: BLE001 - 必须回报给主程序
+            if _fh is not None:
+                import traceback
+                _fh.write(f"!! _scan_job 抛异常：{type(exc).__name__}: {exc}" + chr(10))
+                _fh.write(traceback.format_exc())
+                _fh.flush()
             result = {"ok": False, "fatal": False,
                       "error": f"{type(exc).__name__}: {exc}"}
         try:
             _send(conn, {"stage": "done", **result})
         except OSError:
+            _release_scan_mutex(mutex)
             return EXIT_BAD_CONNECT
+        _release_scan_mutex(mutex)
 
         # 等主程序收完说 bye；它异常退出（EOF）也立刻收摊，不空转到 lifetime。
         while time.monotonic() < deadline:
@@ -555,6 +843,12 @@ def main(argv: list[str] | None = None) -> int:
             conn.close()
         except OSError:
             pass
+        if _fh is not None:
+            try:
+                _fh.write(f"--- keyd 退出 pid={os.getpid()}" + chr(10))
+                _fh.flush()
+            except OSError:
+                pass
 
 
 def maybe_run_from_argv(argv: list[str] | None = None) -> bool:

@@ -51,6 +51,8 @@ if _WIN:                                             # pragma: no cover - 平台
         """Windows：进程发现走 `procfs_win`（`procfs` 读的是 `/proc`）。"""
         return procfs_win.pick_host(procfs_win.find_vrchat())
 
+    _iter_processes = procfs_win.iter_processes
+
     def _udp_ports(pid: int) -> set[int]:
         from . import dgram
 
@@ -73,6 +75,7 @@ if _WIN:                                             # pragma: no cover - 平台
 
 else:
     _pick_host = lambda: procfs.pick_host(procfs.find_vrchat())   # noqa: E731
+    _iter_processes = procfs.iter_processes
     _udp_ports = procfs.udp_ports
     _assess = lambda: guard.assess(guard.collect())              # noqa: E731
     _default_drain = capture_linux.drain
@@ -89,6 +92,12 @@ SAMPLE_TARGET = 40
 MAX_DECRYPT_FAILURES = 10
 VOICE_REPLAY_S = 5.0
 POLL_S = 2.0
+#: 连续几轮查不到 VRChat 才认定「游戏退了」。真实退出会一直查不到，而打包版里
+#: 快照被过滤/兜底被节流会偶发空表 —— 那时拆掉抓包就等于白弹一次 UAC。
+HOST_MISS_TOLERANCE = 2
+#: 两次提权取钥之间的最小间隔（秒）。取钥失败后立刻重来会连弹 UAC，
+#: 失败原因多半（没提权 / UAC 被否 / pagefile 定位异常）不会自愈，等一会儿再说。
+ACQUIRE_COOLDOWN_S = 20.0
 DRAIN_S = 0.25
 LOCAL_PORTS_REFRESH_S = 5.0
 WIN_SAMPLE_TIMEOUT = 20.0          # Windows：等第一批加密包当样本的上限
@@ -210,6 +219,10 @@ class PlayerWarmup:
         # 拿到密钥之前收到的包：装好密钥后**补解一遍**（加入世界那批名单就在里面）
         self._pre_key: list[capture_linux.Datagram] = []
         self._retry_pending = False
+        #: 连续多少轮没查到 VRChat（见 `HOST_MISS_TOLERANCE`）
+        self._host_misses = 0
+        #: 下一次允许提权取钥的时间点（见 `ACQUIRE_COOLDOWN_S`）
+        self._acquire_not_before = 0.0
 
         self._names = names.NameTable()
         # 位置表也归预热器：没开始翻译时右栏要按距离排序，就靠它在后台一直喂。
@@ -251,6 +264,23 @@ class PlayerWarmup:
         self.pos_msgs = 0          # 收到的 Event 12（别人的位置）
         self.pos_self_msgs = 0     # 解出的本机位置（出向 Event 12 且 body 解析成功）
         self._pos_diag_at = 0.0
+        # `?` 诊断：右栏那一栏 `?` 有两个完全不同的来源（见 `_log_pos_diag`
+        # 的 docstring），只看「自己位置=有/缺」分不清，所以额外记两笔累计次数：
+        #   names_cleared —— `Entering Room` 清空名字表的次数（清完只能等 255/253 补回）
+        #   pos_resets    —— `PositionTable.reset()` 的次数（连自己的坐标一起清）
+        self.names_cleared = 0
+        self.pos_resets = 0
+        self._self_ok_prev: bool | None = None
+        # 解密失败诊断：`_install_key` 只按「取钥当时那几个包」判布局，若会话中途
+        # Photon 换了 AAD 形态或冒出一条用别的钥的 flow，就会「装上即解不开 →
+        # 10 个判失效 → 重扫到同一把钥」。（实测 2026-11-05 17:39 起 3 次，
+        # 指纹与页文件地址都没变。）这两笔数 + 每条 flow 的失败数能把二者分开。
+        self.layout_fallbacks = 0        # 布局兜底生效的次数
+        self.layout_now = ""             # 当前实际生效的布局
+        self.dec_fails = 0               # 解密失败包数（累计）
+        self._fail_flows: dict[str, int] = {}   # flow → 失败包数（最多记 8 条）
+        # 最近一次成功解开的 flow：只有它的失败才算「这把钥失效」。
+        self._last_ok_flow: str | None = None
 
     # ------------------------------------------------------------ 生命周期
 
@@ -393,7 +423,12 @@ class PlayerWarmup:
                 # 进新房间：Photon 名字表里上一间房的 actor 也该清了，否则
                 # `player_rows()` 会按 user_id 把旧 actor 的距离/说话状态带过来。
                 with self._names_lock:
+                    dropped = len(self._names)
                     self._names.clear()
+                self.names_cleared += 1
+                print(f"[pos][diag] 进房间 → 清空名字表（丢掉 {dropped} 个 actor），"
+                      f"名单里的人要等 255/253 名字事件才能重新对上班",
+                      flush=True)
                 self._world = self._roster.world
                 if live and self.on_status is not None:
                     # 不带人数：`Entering Room` 那一瞬还没收到任何 `OnPlayerJoined`，
@@ -499,6 +534,9 @@ class PlayerWarmup:
                 if patch:
                     row["speaking"] = bool(patch.get("speaking"))
                     row["translating"] = bool(patch.get("translating"))
+        # 借出期间 `_run` 不 drain，位置诊断只有这条（GUI 每秒刷新）能按时打出来。
+        # 内部有 10s 节流，且这里没持锁，代价可以忽略。
+        self._log_pos_diag(rows=rows)
         return rows
 
     def status(self) -> dict:
@@ -602,6 +640,11 @@ class PlayerWarmup:
         with self._key_lock:
             if self._key is not None:
                 return self._key
+            if self._auth_failed:
+                # 授权/取钥已经明确失败过一次（UAC 被拒、子进程连不上、读盘被拒），
+                # 翻译腿每 10 s 调到这里时不该再自动重试：要么再弹一次 UAC，要么
+                # 把 34 GiB 再扫一遍。清标记只走「重新授权」（`authorize()`）。
+                return None
             host = self._host
             usable = list(samples or [])
             if len(usable) < 2:
@@ -629,8 +672,8 @@ class PlayerWarmup:
                     print(f"[warmup] ⚠️ 扫描失败（needle={needle}）：{last_error}",
                           flush=True)
                     if _WIN:
-                        # Windows 不分 needle（不读内存，扫的是 pagefile）：换个 needle
-                        # 再来一次只会重复同一次读盘、再弹一次 UAC（实测连弹 6 次）。
+                        # Windows 不分 needle（不读内存，扫的是 pagefile）：换一个
+                        # needle 只会把同一次读盘再做一遍、再弹一次 UAC（实测连弹 5 次）。
                         break
                     continue
                 candidates = [bytes.fromhex(h) for h in reply.get("candidates", [])]
@@ -639,7 +682,7 @@ class PlayerWarmup:
                     self._install_key(hit)
                     return hit
             # 失败原因要进界面：只说「没找到密钥」的话，用户分不清是没提权、
-            # UAC 点了否、pagefile 定位异常，还是真没扫到。
+            # UAC 点了否、另一路在扫、pagefile 定位异常，还是真没扫到。
             self._set_phase(
                 PHASE_FAILED,
                 f"取钥失败：{last_error}" if last_error else "没找到能通过 GCM 认证的密钥")
@@ -647,8 +690,15 @@ class PlayerWarmup:
 
     def _install_key(self, hit: gcm.KeyHit) -> None:
         self._key = hit
-        self._opener = gcm.opener(hit.key, hit.layout)
+        # 布局不写死：取钥时判出的布局只对当时那几个包成立，会话中途 Photon 换
+        # AAD 形态后必须能自己换过去，否则「装上即解不开」会一直重扫。
+        self._opener = gcm.opener_multi(hit.key, hit.layout,
+                                        on_fallback=self._on_layout_fallback)
+        self.layout_now = hit.layout
         self._fail_streak = 0
+        # 这把钥是在哪条 flow 上验过的，就算哪条 flow 是「我们的」：别的 flow 用
+        # 别的钥，它的 10 连败不该把这条链路判死。
+        self._last_ok_flow = str(hit.flow) if hit.flow is not None else None
         # 把「拿到密钥之前」的包补解一遍：加入世界时的 253/255 名单就在这里，
         # 不补的话预热会永远错过整张名单（实测就是这个现象）。
         pending_frames, self._pre_key = self._pre_key, []
@@ -660,6 +710,14 @@ class PlayerWarmup:
               f"（已识别 {count} 位）", flush=True)
         self._set_phase(PHASE_RECORDING, "")
 
+    def _on_layout_fallback(self, was: str, now: str) -> None:
+        """`opener_multi` 换到另一种 AAD 布局时回调（只在第一次换时打印）。"""
+        self.layout_fallbacks += 1
+        self.layout_now = now
+        if self.layout_fallbacks == 1:
+            print(f"[warmup] ⚠️ 报文布局变了：{was} → {now}"
+                  f"（同一把钥继续用，不用重取）", flush=True)
+
     # ------------------------------------------------------------ 线程主体
 
     def _run(self) -> None:
@@ -670,6 +728,14 @@ class PlayerWarmup:
             self._poll_roster()
             host = self._find_host()
             if host is None:
+                self._host_misses += 1
+                if self._host is not None and self._host_misses < HOST_MISS_TOLERANCE:
+                    # 一两轮查不到不等于游戏退了：抓包 socket 还在、密钥还能用，
+                    # 一旦拆掉（`_drop_capture` + `_select_new_host`）就得重新提权 ——
+                    # 真机上就是「状态反复跳 + 反复弹 UAC」。`procfs_win.find_vrchat()`
+                    # 那边也有宽限，这里是第二层保险。
+                    self._stop.wait(self._poll_s)
+                    continue
                 self._drop_capture()
                 if self._host is not None:
                     self._host = None
@@ -678,6 +744,7 @@ class PlayerWarmup:
                     self._set_phase(PHASE_WAITING, self._wait_detail())
                 self._stop.wait(self._poll_s)
                 continue
+            self._host_misses = 0
             if self._retry_pending:
                 self._retry_pending = False
                 self._select_new_host(host, force=True)
@@ -707,25 +774,46 @@ class PlayerWarmup:
         host = host or self._find_host()
         if host is None:
             return
-        had_host = self._host is not None
+        prev = self._host
+        # 「同一个进程」＝ pid 与创建时间都对得上（创建时间为 0 表示那次没读到，
+        # 不能据此判成换了进程，否则又退回老毛病）。
+        same_proc = bool(
+            prev is not None and host.pid == prev.pid
+            and (not host.starttime or not prev.starttime
+                 or host.starttime == prev.starttime))
+        had_host = prev is not None
+        if same_proc and self._key is not None and self._socket is not None:
+            # 还是那个进程、密钥和抓包 socket 都在：**什么都不用做**。
+            # 以前这里会无条件清 `_key` 再重新 bootstrap，于是只要上层误判一次
+            # 「游戏退了」，就会重新扫一遍 pagefile、re-弹一次 UAC。
+            return
         self._drop_capture()
         self._host = host
-        if had_host:
+        if had_host and not same_proc:
             # 第一次绑定时不能清：那里面是预热线程首轮从 output_log 灌进来的名字兜底表。
             with self._names_lock:
                 self._names.clear()
-        # 换进程（游戏重启）＝换会话：自己那份位置也作废，否则右栏会拿旧坐标算距离。
-        self._pos.reset()
-        self._key = None
-        self._opener = None
-        self._samples.clear()
+        if not same_proc:
+            # 换进程（游戏重启）＝换会话：自己那份位置也作废，否则右栏会拿旧坐标算距离。
+            had_self = self._pos.self_position is not None
+            dropped_actors = len(self._pos)
+            self._pos.reset()
+            self.pos_resets += 1
+            print(f"[pos][diag] 换主机/换会话 → pos.reset()（清掉 {dropped_actors} 个 actor，"
+                  f"自己位置 {'有' if had_self else '缺'} → 缺）", flush=True)
+            # 密钥是**进程级**的（同一个 VRChat 进程里换房间、换世界都不换），
+            # 只有换进程才该清 —— 清了就得重新读 pagefile，真机上等于再弹一次 UAC。
+            self._key = None
+            self._opener = None
+            self._samples.clear()
+            self._pre_key.clear()
+            self._world = ""
+            self._frag = {"in": photon.Fragmenter(), "out": photon.Fragmenter()}
+            self._buffer = pending.PreKeyBuffer(
+                max_bytes=max(1, int(self.settings.prewarm_buffer_mb)) << 20,
+                world_ready=True)
+            self._next_scan = 0.0
         self._fail_streak = 0
-        self._pre_key.clear()
-        self._world = ""
-        self._frag = {"in": photon.Fragmenter(), "out": photon.Fragmenter()}
-        self._buffer = pending.PreKeyBuffer(
-            max_bytes=max(1, int(self.settings.prewarm_buffer_mb)) << 20, world_ready=True)
-        self._next_scan = 0.0
         if self._auth_failed and not force:
             self._set_phase(PHASE_UNAUTHORIZED, "未授权（可点「重新授权」）")
             return
@@ -734,6 +822,12 @@ class PlayerWarmup:
             reasons = "；".join(getattr(verdict, "reasons", []) or [])
             self._set_phase(PHASE_BLOCKED, f"EAC 闸门拒绝：{reasons}")
             return
+        # 冷却：一次授权**失败**后别马上再来一遍（用户在场时会连弹 UAC）。
+        # 注意：这里只「检查」，不「记时」——成功拿到密钥时不该罚下一次
+        # （游戏重启后立刻需要重新取钥，没必要干等 20 s）。
+        if not force and time.monotonic() < self._acquire_not_before:
+            self._set_phase(PHASE_FAILED, "上一次取钥失败，稍后自动重试（避免连续弹 UAC）")
+            return
         # **一次授权**做完：开抓包 + 采样 + 扫内存（同一个短命助手）。
         # 以前是「开抓包一个助手 + 扫内存一个助手」→ 用户被连着要两次密码。
         self._set_phase(PHASE_ACQUIRING, "正在等待系统授权…")
@@ -741,12 +835,14 @@ class PlayerWarmup:
             result = self._bootstrap(host)
         except Exception as exc:                          # noqa: BLE001
             self._auth_failed = True
+            self._acquire_not_before = time.monotonic() + ACQUIRE_COOLDOWN_S
             self._set_phase(PHASE_UNAUTHORIZED, f"授权失败：{exc}")
             return
         with self._lock:
             self._socket = result.socket
         if result.socket is None:
             self._auth_failed = True
+            self._acquire_not_before = time.monotonic() + ACQUIRE_COOLDOWN_S
             self._set_phase(PHASE_UNAUTHORIZED, result.detail or "没有拿到抓包 fd")
             return
         self._auth_failed = False
@@ -760,6 +856,7 @@ class PlayerWarmup:
         if key is not None:
             self._install_key(key)
         elif getattr(result, "blocked", False):
+            self._acquire_not_before = time.monotonic() + ACQUIRE_COOLDOWN_S
             self._set_phase(PHASE_FAILED, result.detail or "读内存被拒绝")
         else:
             self._set_phase(PHASE_ACQUIRING,
@@ -814,8 +911,19 @@ class PlayerWarmup:
     def _decrypt_into(self, dg: capture_linux.Datagram, *, count_failure: bool = True) -> None:
         opener = self._opener
         plain = opener(dg.payload) if opener is not None else None
+        flow_name = str(gcm.Flow.of(dg.src, dg.dst))
         if plain is None:
             if not count_failure:
+                return
+            # 按 flow 记账：能区分「换布局」（全域失败、兜底后立刻好）与「另一条
+            # flow 用别的钥」（只有那一条失败），也是死循环时唯一的现场证据。
+            self.dec_fails += 1
+            if flow_name in self._fail_flows or len(self._fail_flows) < 8:
+                self._fail_flows[flow_name] = self._fail_flows.get(flow_name, 0) + 1
+            # 只有「刚在解的那条 flow」的失败才算这把钥失效：VRChat 会同时挂多条
+            # Photon 连接、各自一把钥，把别的 flow 的失败也数进去，就会 10 连败
+            # 清掉仍然有效的 key，然后重扫又找回同一把（17:39 那次的死循环）。
+            if self._last_ok_flow is not None and flow_name != self._last_ok_flow:
                 return
             self._fail_streak += 1
             if self._fail_streak >= MAX_DECRYPT_FAILURES:
@@ -825,12 +933,23 @@ class PlayerWarmup:
                       f"密钥失效，重新取钥（第 {self.rescans} 次）", flush=True)
                 self._key = None
                 self._opener = None
+                # 采集对象上还缓存着同一把死钥匙（acquire_key 会直接还回来）——必须一起丢，
+                # 否则重扫根本不会发生，界面永远停在「预热不可用」。
+                with self._lock:
+                    cap = self._socket
+                forget = getattr(cap, "forget_key", None)
+                if forget is not None:
+                    try:
+                        forget()
+                    except Exception:                      # noqa: BLE001 - 丢缓存失败不该炸预热
+                        pass
                 self._samples.clear()
                 self._fail_streak = 0
                 self._next_scan = 0.0
                 self._set_phase(PHASE_ACQUIRING, "密钥失效，正在重新获取…")
             return
         self._fail_streak = 0
+        self._last_ok_flow = flow_name
         self.decrypted += 1
         self._on_plaintext(dg, plain)
 
@@ -885,20 +1004,44 @@ class PlayerWarmup:
                 self._pos.reset()
                 self._frag = {"in": photon.Fragmenter(), "out": photon.Fragmenter()}
                 self._world = world
+                # 换世界 = 换 Photon 会话（密钥与 challenge 都变）。样本里混着上个世界的
+                # 密文时，扫出来的「钥匙」可能只解旧包 —— 本机实测：换房后密钥失效重扫，
+                # 找到的仍是旧钥匙，于是判死循环。这里一并丢掉旧样本，重扫用新世界的包。
+                self._samples.clear()
                 self._log_pos_diag(force=True)
 
-    def _log_pos_diag(self, *, force: bool = False) -> None:
-        """每 ~10s 一行位置诊断（右栏距离「时有时无」时靠它定位）。
+    def _log_pos_diag(self, *, force: bool = False,
+                      rows: list[dict] | None = None) -> None:
+        """每 ~10s 一行位置诊断（右栏距离「时有时无」或出现 `?` 时靠它定位）。
 
-        要分开的三种情况：①一条位置消息都没收到（抓包/解密问题）；
-        ②收到了但解不出**本机**位置（出向 Event 12 的 body 没带位置块 → 所有距离都是
-        None）；③都正常，只是对方静坐太久没刷新（位置表过期 → 界面上标 `~`）。
+        要分开的情况：①一条位置消息都没收到（抓包/解密问题）；②收到了但解不出
+        **本机**位置（出向 Event 12 的 body 没带位置块）；③都正常只是对方静坐太久
+        没刷新（表里过期 → 界面标 `~`）；④**对不上 actor**（右栏那行 `?`）。
+
+        ⚠ 面板上的 `?` 只有两个来源（`vlt/gui_players_panel.py` 的 `_distance_text`
+        看 `self_ok`）：`self_ok=False` 要么是 `distance_detail()` 的 `origin is None`
+        （**自己**的坐标空 → 整栏一起 `?`），要么是 `player_rows()` 里 `actor is None`
+        （名单里有这个人、名字事件表里没对上 actor → **只有那行** `?`）。所以这行
+        同时打「自己位置」「名单人数 / 名字表人数」「未映射 N 人（名字）」，再加
+        「清名字表×」「pos.reset×」两个累计数：一眼能看出是不是换房/换世界把它们
+        清掉了、之后没补回来。
         """
         now = time.monotonic()
-        if not force and now - self._pos_diag_at < 10.0:
+        # getattr 兜底：有些用例/替身对象不走 __init__，缺这个字段不该让诊断把
+        # `player_rows()` 一起带崩（诊断永远不能影响抓包）。
+        last = getattr(self, "_pos_diag_at", 0.0) or 0.0
+        if not force and now - last < 10.0:
             return
         self._pos_diag_at = now
-        self_ok = "有" if self._pos.self_position is not None else "缺"
+        try:
+            self._log_pos_diag_body(now=now, force=force, rows=rows)
+        except Exception as exc:                    # noqa: BLE001 - 诊断不该影响抓包
+            print(f"[pos][diag] 诊断没跑起来：{type(exc).__name__}: {exc}", flush=True)
+
+    def _log_pos_diag_body(self, *, now: float, force: bool,
+                           rows: list[dict] | None) -> None:
+        has_self = self._pos.self_position is not None
+        self_ok = "有" if has_self else "缺"
         track = len(self._pos)
         stale = 0
         wall = time.time()
@@ -906,9 +1049,43 @@ class PlayerWarmup:
             _meters, age_s, _ok = self._pos.distance_detail(actor, now=wall)
             if age_s is not None and age_s > self._pos.max_age_s:
                 stale += 1
+        # 逐行统计：调用方已经算好行就用它（GUI 每秒都会调 `player_rows()`，
+        # 借出期间预热线程不 drain，只有那条路还能按 10s 打诊断）；否则自己算，
+        # `player_rows()` 自己加锁，这里没持任何锁，不会和 `_poll_roster` 的
+        # 「roster 锁 → names 锁」顺序打架。诊断失败不能影响抓包。
+        if rows is None:
+            try:
+                rows = self.player_rows()
+            except Exception:                       # noqa: BLE001 - 诊断不该影响抓包
+                rows = []
+        unmapped = [str(row.get("name") or "<无名>") for row in rows
+                    if row.get("actor") is None]
+        no_origin = sum(1 for row in rows
+                        if row.get("actor") is not None and row.get("self_ok") is False)
+        with self._names_lock:
+            name_actors = len(self._names)
+        with self._roster_lock:
+            roster_size = len(self._roster)
+        flip = ""
+        if self._self_ok_prev is not None and self._self_ok_prev != has_self:
+            flip = "，⚠自己位置翻转"
+        self._self_ok_prev = has_self
+        names = "、".join(unmapped[:6]) + ("…" if len(unmapped) > 6 else "")
+        leased = "，借出中（预热线程不读包，计数冻结）" if self._leased_status is not None else ""
+        # 解密失败：分「哪条 flow」与「布局回退」两种口径，正好对应
+        # 「会话中途换布局」和「冒出一条用别的钥的 flow」两种死循环成因。
+        fails = "、".join(f"{flow}×{n}" for flow, n in
+                          sorted(self._fail_flows.items(), key=lambda kv: -kv[1])[:3])
+        layout = (f"，布局回退×{self.layout_fallbacks}（现用 {self.layout_now}）"
+                  if self.layout_fallbacks else "")
         print(f"[pos][diag] 位置消息 {self.pos_msgs}（自己 {self.pos_self_msgs}），"
-              f"跟踪 {track} 人（过期 {stale}），自己位置={self_ok}", flush=True)
-
+              f"跟踪 {track} 人（过期 {stale}），自己位置={self_ok}"
+              f"，名单 {roster_size} 人/名字表 {name_actors} 个 actor"
+              f"，未映射 {len(unmapped)} 人{f'（{names}）' if unmapped else ''}"
+              f"，行 {len(rows)} 条（其中缺自己坐标 {no_origin} 条）"
+              f"，解密失败 {self.dec_fails} 个{f'（{fails}）' if fails else ''}{layout}"
+              f"，清名字表×{self.names_cleared}，pos.reset×{self.pos_resets}{flip}{leased}",
+              flush=True)
 
     # ------------------------------------------------------------ 状态
 
@@ -926,12 +1103,16 @@ class PlayerWarmup:
     def _wait_detail(self) -> str:
         """「等待 VRChat」那句的细则：带上当前可见进程数。
 
-        打包成 exe 后 `CreateToolhelp32Snapshot` 曾被拦成空表，界面只有一句
+        打包成 exe 后进程枚举曾被拦成空表 / 被过滤成几十条，界面只有一句
         「等待 VRChat 进程…」，看不出是「枚举被拦」还是「游戏真没开」。带上
         这个数字（外加 `procfs_win` 里那条一次性警告）就能一眼分辨。
+
+        这里必须用 `_iter_processes`（平台分派）：以前直接调 `procfs`，在
+        Windows 上读 `/proc` 必抛，于是文案**恒**为「（进程枚举不可用）」，
+        正好把「枚举被拦」和「分派写错」混成一条。
         """
         try:
-            count = len(procfs.iter_processes())
+            count = len(_iter_processes())
         except Exception:                                 # noqa: BLE001 - 诊断不该抛
             count = -1
         if count < 0:

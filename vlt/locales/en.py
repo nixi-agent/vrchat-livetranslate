@@ -446,6 +446,11 @@ STRINGS: dict[str, str] = {
     "SteamVR 在跑，但它的合成器没起来：完全退出 SteamVR 再启动一次":
         "SteamVR is running but its compositor is not — quit SteamVR completely "
         "and start it again",
+    "手腕屏被另一个翻译器实例占着：关掉多余的实例（旧版也算）再勾一次":
+        "The wrist panel is held by another translator instance — close the extra instances (old builds count too) and tick again",
+    "SteamVR 在跑，但它写不出自己的日志文件：先关掉另一个翻译器实例再勾一次":
+        "SteamVR is running but it cannot write its own log file — close the other "
+        "translator instance first, then tick again",
     "SteamVR 在跑，但没检测到头显：戴上头显、确认 SteamVR 里能看到设备，再勾一次":
         "SteamVR is running but sees no headset — put the headset on, make sure SteamVR "
         "lists it, then tick again",

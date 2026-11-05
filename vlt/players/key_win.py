@@ -331,29 +331,44 @@ class SessionCache:
         self._lock = threading.Lock()
         self._ident: Identity | None = None
         self._key: bytes | None = None
+        self._kind: str = "hdr19"
 
-    def lookup(self, ident: Identity, samples, *, auth: gcm_win.GcmAuth | None = None
-               ) -> bytes | None:
-        """缓存命中且能通过样本认证才返回 key。"""
+    def take(self, ident: Identity, samples, *, auth: gcm_win.GcmAuth | None = None
+             ) -> tuple[bytes, str] | None:
+        """缓存命中且能通过样本认证才返回 `(key, aad_kind)`。
+
+        kind 必须一起回：`scan_key()` 可能在 `hdr7/none` 命中，只回 key 的话
+        调用方会按 `hdr19` 复验，把合法密钥判成无效。
+        """
         with self._lock:
             if self._key is None or self._ident != ident:
                 return None
-            key = self._key
+            key, kind = self._key, self._kind
         own = auth is None
         a = auth or gcm_win.GcmAuth()
         try:
-            return key if verify_key(key, samples, auth=a) else None
+            if verify_key(key, samples, auth=a, aad_kind=kind):
+                return key, kind
+            return None
         finally:
             if own:
                 a.close()
 
-    def store(self, ident: Identity, key: bytes) -> None:
+    def lookup(self, ident: Identity, samples, *, auth: gcm_win.GcmAuth | None = None
+               ) -> bytes | None:
+        """缓存命中且能通过样本认证才返回 key。"""
+        hit = self.take(ident, samples, auth=auth)
+        return hit[0] if hit is not None else None
+
+    def store(self, ident: Identity, key: bytes, kind: str = "hdr19") -> None:
         with self._lock:
             self._ident, self._key = ident, bytes(key)
+            self._kind = kind if kind in RUNTIME_KINDS else "hdr19"
 
     def forget(self) -> None:
         with self._lock:
             self._ident = self._key = None
+            self._kind = "hdr19"
 
     def peek(self) -> bytes | None:
         with self._lock:

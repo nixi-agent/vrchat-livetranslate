@@ -640,6 +640,11 @@ class PlayerWarmup:
         with self._key_lock:
             if self._key is not None:
                 return self._key
+            if self._auth_failed:
+                # 授权/取钥已经明确失败过一次（UAC 被拒、子进程连不上、读盘被拒），
+                # 翻译腿每 10 s 调到这里时不该再自动重试：要么再弹一次 UAC，要么
+                # 把 34 GiB 再扫一遍。清标记只走「重新授权」（`authorize()`）。
+                return None
             host = self._host
             usable = list(samples or [])
             if len(usable) < 2:

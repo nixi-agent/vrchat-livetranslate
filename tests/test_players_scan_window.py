@@ -233,10 +233,21 @@ def test_forget_key() -> None:
         _key = b"dead" * 8
         _cache = _Cache()
 
-    cap = _Cap()
-    W._WinCapture.forget_key(cap)
+    # `forget_key()` 里那句 `_disk_key_forget()` 删的是**用户真实的**
+    # %APPDATA%\vrchat-livetranslate\key_cache.json —— 跑一次测试就把人家的
+    # 磁盘缓存清了（下次启动白扫 34 GiB）。这里换成计数器。
+    calls = {"disk": 0}
+    saved = W._disk_key_forget
+    W._disk_key_forget = lambda: calls.__setitem__("disk", calls["disk"] + 1)
+    try:
+        cap = _Cap()
+        W._WinCapture.forget_key(cap)
+    finally:
+        W._disk_key_forget = saved
+
     check("内存里的 key 被清掉", cap._key is None)
     check("会话缓存也被清掉", cap._cache.called)
+    check("磁盘缓存也要求清掉（但不许真删用户的文件）", calls["disk"] == 1)
 
     src = (ROOT / "vlt" / "players" / "warmup.py").read_text(encoding="utf-8")
     check("密钥失效分支调用了 forget_key", "forget_key" in src)
@@ -255,14 +266,18 @@ def test_shared_wait() -> None:
             pass
 
     class _Cache:
-        stored: list = []
+        def __init__(self) -> None:
+            # 每个实例各持一份：写成类属性会让 A) 的 (key, "hdr19") 漏到 D)
+            self.stored: list = []
 
-        def store(self, ident, key) -> None:
-            self.stored.append(key)
+        def store(self, ident, key, kind="hdr19") -> None:
+            self.stored.append((key, kind))
 
     class _Cap:
         _key = None
-        _cache = _Cache()
+
+        def __init__(self) -> None:
+            self._cache = _Cache()
 
         def _status(self, _level, _msg) -> None:
             pass
@@ -275,17 +290,19 @@ def test_shared_wait() -> None:
 
     try:
         W.gcm_win.GcmAuth = _Auth
-        W.key_win.verify_key = lambda k, g, auth=None: k == key
-        W.make_hit = lambda k, g, f, tag=None: ("hit", k)
+        W.key_win.verify_key = (lambda k, g, auth=None, aad_kind="hdr19":
+                                k == key and aad_kind == "hdr19")
+        W.make_hit = lambda k, g, f, tag=None, kind="hdr19": ("hit", k, kind)
         W.WAIT_SHARED_POLL_S = 0.01
 
         # A) 另一路在扫，它落盘的钥匙能过 GCM → 直接用，不再自己扫
         W.keyd.scan_busy = lambda: True
-        W._disk_key_read = lambda _i: key
+        W._disk_key_read = lambda _i: (key, "hdr19")
         cap = _Cap()
         got = call(cap)
-        check("命中另一路落盘的钥匙", got == ("hit", key), repr(got))
-        check("命中后写进会话缓存", cap._cache.stored == [key], repr(cap._cache.stored))
+        check("命中另一路落盘的钥匙", got == ("hit", key, "hdr19"), repr(got))
+        check("命中后写进会话缓存（带 AAD 形态）",
+              cap._cache.stored == [(key, "hdr19")], repr(cap._cache.stored))
 
         # B) 那一路收工了却没留下钥匙 → 让路结束，交回调用方自己扫
         W.keyd.scan_busy = lambda: False
@@ -295,9 +312,19 @@ def test_shared_wait() -> None:
 
         # C) 缓存里的钥匙打不开当前流量 → 不误命中
         W.keyd.scan_busy = lambda: True
-        W._disk_key_read = lambda _i: b"\x00" * 32
+        W._disk_key_read = lambda _i: (b"\x00" * 32, "hdr19")
         got = call(_Cap(), max_s=0.05)
         check("验不过的旧钥匙不当命中", got is None, repr(got))
+
+        # D) 落盘时记了 hdr7 → 复验与命中都必须带上这个形态
+        #    （写死 hdr19 会把 hdr7 命中按 19 字节 AAD 打不开，误报「换了世界」）
+        W.key_win.verify_key = lambda k, g, auth=None, aad_kind="hdr19": True
+        W._disk_key_read = lambda _i: (key, "hdr7")
+        cap = _Cap()
+        got = call(cap)
+        check("按落盘记的 AAD 形态命中", got == ("hit", key, "hdr7"), repr(got))
+        check("会话缓存也记这个形态",
+              cap._cache.stored == [(key, "hdr7")], repr(cap._cache.stored))
     finally:
         (W._disk_key_read, W.keyd.scan_busy, W.key_win.verify_key,
          W.gcm_win.GcmAuth, W.make_hit, W.WAIT_SHARED_POLL_S) = saved

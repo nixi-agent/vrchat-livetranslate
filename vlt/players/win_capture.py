@@ -42,6 +42,8 @@ _AAD_TO_LAYOUT = {
     "hdr7": gcm.LAYOUTS[1],
     "none": gcm.LAYOUTS[2],
 }
+# 反查：`gcm.KeyHit` 只带 layout，缓存与复验要的是 AAD 口径的名字。
+_LAYOUT_TO_AAD = {layout: kind for kind, layout in _AAD_TO_LAYOUT.items()}
 
 # ---------------------------------------------------------------- 密钥磁盘缓存
 # 为什么要落盘：冷启动一次扫描要读 34 GiB（本机 170 s）。密钥是**进程级**的
@@ -50,7 +52,13 @@ _AAD_TO_LAYOUT = {
 KEY_CACHE_FILE = _user_data_dir() / "key_cache.json"   # 与 api_key.txt 同一个用户目录
 
 
-def _disk_key_read(ident: "key_win.Identity") -> bytes | None:
+def _disk_key_read(ident: "key_win.Identity") -> tuple[bytes, str] | None:
+    """读回 `(key, aad_kind)`；老缓存文件没有 `aad` 字段时按 `hdr19` 处理。
+
+    返回 kind 的原因：`scan_key()` 会试 `hdr19/hdr7/none` 三种 AAD 形态命中，
+    只存 key 的话，后一次按 `hdr19` 复验就会把 `hdr7/none` 的合法密钥判成无效
+    （然后误报「抓包与读盘之间又换了世界」）。
+    """
     try:
         d = json.loads(KEY_CACHE_FILE.read_text(encoding="utf-8"))
         if int(d.get("pid") or 0) != ident.pid:
@@ -58,17 +66,24 @@ def _disk_key_read(ident: "key_win.Identity") -> bytes | None:
         if int(d.get("created") or 0) != ident.created:
             return None
         key = bytes.fromhex(str(d.get("key") or ""))
-        return key if len(key) == gcm.KEY_LEN else None
+        if len(key) != gcm.KEY_LEN:
+            return None
+        kind = str(d.get("aad") or AAD_KIND)
+        if kind not in _AAD_TO_LAYOUT:
+            kind = AAD_KIND
+        return key, kind
     except (OSError, ValueError, TypeError):
         return None
 
 
-def _disk_key_write(ident: "key_win.Identity", key: bytes) -> None:
+def _disk_key_write(ident: "key_win.Identity", key: bytes,
+                    kind: str = AAD_KIND) -> None:
+    kind = kind if kind in _AAD_TO_LAYOUT else AAD_KIND
     try:
         KEY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         KEY_CACHE_FILE.write_text(json.dumps({
             "pid": ident.pid, "created": ident.created,
-            "key": key.hex(), "ts": int(time.time()),
+            "key": key.hex(), "aad": kind, "ts": int(time.time()),
             # 明文说明用：只有 fingerprint 可读，key 本身在这儿（用户自己机器、他自己的会话）
             "note": "vrchat livetranslate session key cache; delete this file to force a rescan",
         }, ensure_ascii=False), encoding="utf-8")
@@ -235,17 +250,22 @@ def _cached_serial() -> int:
 def samples_to_groups(samples) -> tuple[dict, dict]:
     """把 `leg` 的 `[(gcm.Flow, payload)]` 转成 `key_win` 要的口径。
 
-    `key_win` 按 `(peerID, challenge)` 分组 —— 即密文头的前 5 个字节
-    （`payload[0:2]` 是 peerID、`payload[1:5]` 是 challenge，与 `scripts/pf_key2.py`
-    的 `load_samples` 同口径）。同时返回 `(peerID, challenge) → Flow` 的反查表，
-    因为最后构造 `gcm.KeyHit` 还要知道这把 key 属于哪条流。
+    `key_win` 按 `(peerID, challenge)` 分组。Photon 密文头是
+    `[peerID:2][0x01][challenge:4][nonce:12]`（见 `gcm.py` 顶部注释），所以
+    peerID 是 `payload[0:2]`、challenge 是 `payload[3:7]` —— 不是 `[1:5]`：
+    `payload[2]` 是固定的 `0x01` 标志位，把它算进 challenge 会让分组键漂移，
+    也让 challenge 锚点法在一堆包上误命中（`_scan_near_challenges` 拼的锚是
+    `peer + 0x01 + chal`，口径必须与这里一致）。
+    `tests/test_players_pagefile.py` 里造样本的 tag 也按这个口径。
+    同时返回 `(peerID, challenge) → Flow` 的反查表，因为最后构造
+    `gcm.KeyHit` 还要知道这把 key 属于哪条流。
     """
     groups: dict[tuple[bytes, bytes], list[bytes]] = {}
     flows: dict[tuple[bytes, bytes], gcm.Flow] = {}
     for flow, payload in samples:
         if len(payload) < gcm.MIN_PACKET or payload[2] != 0x01:
             continue
-        tag = (bytes(payload[0:2]), bytes(payload[1:5]))
+        tag = (bytes(payload[0:2]), bytes(payload[3:7]))
         groups.setdefault(tag, []).append(bytes(payload))
         flows.setdefault(tag, flow)
     # 只留够判定的流：一个包解不开就没法区分「key 不对」和「包不全」。
@@ -253,16 +273,22 @@ def samples_to_groups(samples) -> tuple[dict, dict]:
     return groups, flows
 
 
-def make_hit(key: bytes, groups: dict, flows: dict, tag=None) -> gcm.KeyHit:
-    """把裸 key 包成 `gcm.KeyHit`（`leg` 只认这个类型：要 `.key/.layout/.fingerprint`）。"""
+def make_hit(key: bytes, groups: dict, flows: dict, tag=None,
+             kind: str = AAD_KIND) -> gcm.KeyHit:
+    """把裸 key 包成 `gcm.KeyHit`（`leg` 只认这个类型：要 `.key/.layout/.fingerprint`）。
+
+    `kind` 必须传真实命中形态：`key_win.scan_key()` 会试 `hdr19/hdr7/none`，
+    写死 `hdr19` 会把 `hdr7/none` 的合法密钥包成解不开的 layout。
+    """
     tag = tag or next(iter(groups))
     pkts = groups[tag]
+    layout = _AAD_TO_LAYOUT.get(kind) or gcm.LAYOUTS[0]
     return gcm.KeyHit(
         key=bytes(key),
         flow=flows.get(tag) or next(iter(flows.values())),
         ok=len(pkts),
         total=len(pkts),
-        layout=_AAD_TO_LAYOUT[AAD_KIND],
+        layout=layout,
     )
 
 
@@ -478,29 +504,38 @@ class _WinCapture:
             pass
 
     def _from_cache(self, ident: key_win.Identity, groups: dict, flows: dict):
-        """会话缓存命中就零 UAC —— key 是进程级的，换房间不换。"""
-        if self._cache.peek() is None:
-            return None
+        """会话缓存 → 磁盘缓存，都命中不了才返回 None（零 UAC，key 是进程级的）。
+
+        以前这里有一句 `if self._cache.peek() is None: return None`：新进程的
+        会话缓存必然是空的，于是**永远读不到** `key_cache.json`，磁盘缓存等于没做
+        （冷启动照样弹 UAC、重扫 34 GiB）。现在会话缓存不中就直接往下读磁盘。
+        """
         auth = gcm_win.GcmAuth()
         try:
-            key = self._cache.lookup(ident, groups, auth=auth)
+            cached = self._cache.take(ident, groups, auth=auth)
         finally:
             auth.close()
-        if key is None:
-            key = _disk_key_read(ident)
-            if key is not None:
-                auth2 = gcm_win.GcmAuth()
-                try:
-                    ok = key_win.verify_key(key, groups, auth=auth2)
-                finally:
-                    auth2.close()
-                if not ok:
-                    key = None
-                    _disk_key_forget()          # 缓存里的钥匙打不开当前流量 → 立刻作废
-        if key is None:
-            return None
+        if cached is not None:
+            key, kind = cached
+        else:
+            disk = _disk_key_read(ident)
+            if disk is None:
+                return None
+            key, kind = disk
+            auth2 = gcm_win.GcmAuth()
+            try:
+                ok = key_win.verify_key(key, groups, auth=auth2, aad_kind=kind)
+            finally:
+                auth2.close()
+            if not ok:
+                # 缓存里的钥匙打不开当前流量 → 立刻作废（下次重扫）
+                _disk_key_forget()
+                return None
+        # 磁盘命中要顺手升级进会话缓存：否则每次 acquire_key() 都要重新 stat
+        # 一遍 key_cache.json（而且冷启动那条路本来就没有别的机会写会话缓存）。
+        self._cache.store(ident, key, kind)
         self._status("info", "命中密钥缓存（key 是进程级的），跳过提权与整盘扫描")
-        return make_hit(key, groups, flows)
+        return make_hit(key, groups, flows, kind=kind)
 
     def _scan(self, ident: key_win.Identity, groups: dict, flows: dict) -> gcm.KeyHit:
         """分派：已是管理员就在本进程内扫，否则拉起一次性提权子进程（`keyd`）。
@@ -525,7 +560,8 @@ class _WinCapture:
             else:
                 hit = self._scan_via_keyd(ident, groups, flows)
             self._key = hit
-            _disk_key_write(ident, hit.key)
+            _disk_key_write(ident, hit.key,
+                            _LAYOUT_TO_AAD.get(hit.layout) or AAD_KIND)
             return hit
 
     def _wait_shared_key(self, ident: key_win.Identity, groups: dict, flows: dict,
@@ -547,17 +583,19 @@ class _WinCapture:
         while time.monotonic() < deadline:
             if self._key is not None:
                 return self._key
-            key = _disk_key_read(ident)
-            if key is not None:
+            disk = _disk_key_read(ident)
+            if disk is not None:
+                key, kind = disk
                 auth = gcm_win.GcmAuth()
                 try:
-                    ok = key_win.verify_key(key, groups, auth=auth)
+                    ok = key_win.verify_key(key, groups, auth=auth,
+                                            aad_kind=kind)
                 finally:
                     auth.close()
                 if ok:
                     self._status("info", "另一路扫完了：密钥命中（复用它落盘的结果）")
-                    self._cache.store(ident, key)
-                    return make_hit(key, groups, flows)
+                    self._cache.store(ident, key, kind)
+                    return make_hit(key, groups, flows, kind=kind)
             if not keyd.scan_busy():
                 # 那一路已收工却没留下能用的钥匙（失败/超时）→ 让路到此为止。
                 self._status("info", "另一路扫描结束了但没拿到密钥 —— 自己再扫一次")
@@ -624,20 +662,26 @@ class _WinCapture:
         if len(key) != gcm_win.KEY_LEN:
             raise KeyUnavailable("提权子进程交回的密钥长度不对", fatal=True)
 
+        # 子进程告诉我们它是在哪种 AAD 形态下命中的（`hdr19/hdr7/none`）。
+        # 本地复验、定位流、缓存都必须用同一个口径 —— 写死 hdr19 会把 hdr7/none
+        # 的合法密钥判成无效，再误报「抓包与读盘之间又换了世界」。
+        kind = str(reply.get("aad_kind") or AAD_KIND)
+        if kind not in _AAD_TO_LAYOUT:
+            kind = AAD_KIND
         # 子进程扫的是它启动那一刻的 pagefile；本地再验一次，免得样本与
         # 扫到的内容对不上却把错 key 缓存下来（比如中间又换了世界）。
         auth = gcm_win.GcmAuth()
         try:
-            if not key_win.verify_key(key, groups, auth=auth, aad_kind=AAD_KIND):
+            if not key_win.verify_key(key, groups, auth=auth, aad_kind=kind):
                 raise KeyUnavailable(
                     f"子进程交回的密钥（指纹 {key_win.key_fingerprint(key)}）"
                     "在本地样本上不通过 GCM 认证：抓包与读盘之间多半又换了世界，重试一次"
                 )
-            tag = self._tag_for(key, groups, auth)
+            tag = self._tag_for(key, groups, auth, kind)
         finally:
             auth.close()
 
-        self._cache.store(ident, key)
+        self._cache.store(ident, key, kind)
         _clear_elevation_failure(ident)
         # 子进程顺带报告了它定位页文件用的记录号；存下来下次就不用再扫 324 万条 MFT。
         saved = _save_hint(int(reply.get("pagefile_mft") or 0),
@@ -649,16 +693,17 @@ class _WinCapture:
         self._status("info", f"密钥命中（指纹 {key_win.key_fingerprint(key)}，"
                              f"位置 0x{int(reply.get('offset') or 0):X}，"
                              f"由提权子进程扫得）")
-        return make_hit(key, groups, flows, tag)
+        return make_hit(key, groups, flows, tag, kind=kind)
 
     @staticmethod
-    def _tag_for(key: bytes, groups: dict, auth) -> tuple[bytes, bytes] | None:
+    def _tag_for(key: bytes, groups: dict, auth,
+                 aad_kind: str = AAD_KIND) -> tuple[bytes, bytes] | None:
         """找出这把 key 真正认证通过的那个流，作为 `KeyHit` 的标签。"""
         for (peer, chal), pkts in groups.items():
             n = min(len(pkts), 8)
             if n < key_win.MIN_FLOW_PACKETS:
                 continue
-            if auth.opens_all(key, pkts[:n], aad_kind=AAD_KIND) == n:
+            if auth.opens_all(key, pkts[:n], aad_kind=aad_kind) == n:
                 return (bytes(peer), bytes(chal))
         return None
 
@@ -675,6 +720,14 @@ class _WinCapture:
             ) from exc
         self._status("info", f"系统盘在 PhysicalDrive{layout.disk_no}"
                             f"（盘上起点 {layout.base_offset / 2**30:.1f} GiB）")
+        # 管理员这条路径以前完全不看内存压缩，失败了只报「都不通过 GCM 认证」。
+        # 现在两条路径口径一致：开着就警告（不拦，压缩页只占一部分），
+        # 扫不到时用户至少知道该去关什么。
+        if keyd._memory_compression_state():
+            self._status("info", "⚠️ 内存压缩开着（MemoryCompression=On）："
+                                 "pagefile 里多半不是原始堆页，扫描很可能落空；"
+                                 "若真扫不到，管理员执行 Disable-MMAgent "
+                                 "-MemoryCompression 后重启再试")
 
         with disk:
             try:
@@ -723,11 +776,15 @@ class _WinCapture:
             raise KeyUnavailable(
                 f"扫了 {result.scanned_bytes / 2**30:.1f} GiB（{result.chunks} 块）、"
                 f"候选 {len(result.candidates)} 个，都不通过 GCM 认证。"
-                "最可能的原因：内存压缩又开着了（Disable-MMAgent -MemoryCompression 后重启）"
+                "常见原因：内存压缩开着（管理员执行 Disable-MMAgent -MemoryCompression "
+                "后重启）、进世界后堆已换过一轮（重新授权一次）"
                 f"{unread}",
             )
+        # `scan_key()` 会依次试 hdr19/hdr7/none；命中形态必须原样带到缓存和
+        # `KeyHit.layout`，否则下一轮按 hdr19 复验会把 hdr7/none 判成无效。
+        kind = result.hit.kind if result.hit.kind in _AAD_TO_LAYOUT else AAD_KIND
         key = result.hit.key
-        self._cache.store(ident, key)
+        self._cache.store(ident, key, kind)
         saved = _save_hint(pf.mft_index, int(getattr(volume, "serial", 0) or 0))
         if saved is None:
             self._status("info", "⚠️ pagefile 记录号没能缓存下来（下次要多扫一遍 MFT）")
@@ -735,7 +792,7 @@ class _WinCapture:
             self._status("info", f"pagefile 记录号已缓存：{saved}")
         self._status("info", f"密钥命中（指纹 {key_win.key_fingerprint(key)}，"
                              f"位置 0x{result.hit.offset:X}）")
-        return make_hit(key, groups, flows, result.hit.flow)
+        return make_hit(key, groups, flows, result.hit.flow, kind=kind)
 
     # ---- 诊断 -----------------------------------------------------------
     def summary(self) -> dict:

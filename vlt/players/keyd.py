@@ -369,12 +369,16 @@ def _acquire_scan_mutex():
     """拿到 → 返回句柄；拿不到（已有扫描在跑）→ 返回 None。"""
     try:
         k32 = ctypes.windll.kernel32
+        # 句柄是 64 位：不设 restype 会被截成 int32，CloseHandle/ReleaseMutex 就作用在
+        # 一个错的值上（而且静默失败，看起来像「互斥体没生效」）。
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
         h = k32.CreateMutexW(None, False, MUTEX_NAME)
         if not h:
             return None
         ERROR_ALREADY_EXISTS = 183
         if k32.GetLastError() == ERROR_ALREADY_EXISTS:
-            k32.CloseHandle(h)
+            k32.CloseHandle(ctypes.c_void_p(h))
             return None
         return h
     except (AttributeError, OSError):
@@ -414,8 +418,13 @@ def _release_scan_mutex(h) -> None:
         return
     try:
         k32 = ctypes.windll.kernel32
-        k32.ReleaseMutex(h)
-        k32.CloseHandle(h)
+        # ReleaseMutex 只对「持锁的那个线程」有效；句柄不是自己拿的（例如上层把一个
+        # 别人创建的句柄传下来）就会失败 —— 这里不当作错误，句柄该关还是要关。
+        k32.ReleaseMutex(ctypes.c_void_p(h))
+    except (AttributeError, OSError):
+        pass
+    try:
+        ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(h))
     except (AttributeError, OSError):
         pass
 
@@ -430,11 +439,15 @@ def _dump_failure(pf, result, groups, *, log=None) -> str:
     没有这份东西，「候选 5 万个全不通过」只能靠猜（内存压缩？偏移不对？样本不对？）。
     有了它可以在**不重新提权**的情况下离线复验每一种 AAD 形态/候选偏移。
     只写 `%TEMP%`，只含密文与候选（没有明文、没有用户名）。
+
+    候选可能到 40 万个（≈27 MB），而取钥失败会每 10 s 重试一次 —— 不轮转的话
+    `%TEMP%` 会被同一份排查包反复堆满。这里只保留最近 `_DUMP_KEEP` 份。
     """
     try:
         import tempfile
         ts = time.strftime("%Y%m%d_%H%M%S")
-        path = Path(tempfile.gettempdir()) / f"vlt_keyd_dump_{ts}.json"
+        tmpdir = Path(tempfile.gettempdir())
+        path = tmpdir / f"vlt_keyd_dump_{ts}.json"
         items = groups.items() if isinstance(groups, dict) else groups
         samples = {}
         for tag, pkts in items:
@@ -473,6 +486,7 @@ def _dump_failure(pf, result, groups, *, log=None) -> str:
             "samples": samples,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        _prune_dumps(tmpdir, keep=_DUMP_KEEP)
         if log is not None:
             log(f"排查包已保存：{path}（{len(payload['candidates'])} 个候选）")
         return str(path)
@@ -482,12 +496,51 @@ def _dump_failure(pf, result, groups, *, log=None) -> str:
         return ""
 
 
+#: 排查包保留份数（文件名里的时间戳天然可排序）。
+_DUMP_KEEP = 3
+
+
+def _prune_dumps(tmpdir: "Path", *, keep: int) -> None:
+    """只留最近 `keep` 份排查包 —— 失败会每 10 s 重试，不清理会堆满 `%TEMP%`。"""
+    try:
+        dumps = sorted(tmpdir.glob("vlt_keyd_dump_*.json"))
+        for old in dumps[:-keep] if keep > 0 else dumps:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+_COMPRESSION_KEY = r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+STRICT_COMPRESSION_ENV = "VLT_KEY_SCAN_STRICT_COMPRESSION"
+
+
+def _strict_compression() -> bool:
+    """`VLT_KEY_SCAN_STRICT_COMPRESSION=1`：压缩开着就当作致命错误、不扫。
+
+    默认不拦（见 `_scan_job_inner`）：Win10/11 默认开着内存压缩，一刀切会把
+    大多数机器判成「取钥失败」；而压缩只是让扫描大概率落空，不是不可能成功
+    （小页/未压缩页仍可能命中），该由用户看到警告后自己决定。
+    """
+    raw = (os.environ.get(STRICT_COMPRESSION_ENV, "") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _memory_compression_state() -> bool | None:
     """Windows 内存压缩开关：True=开 / False=关 / None=问不出来。
 
-    只有管理员能查（`Get-MMAgent` 走 CIM）。子进程本来就是提权起来的，所以这里能问到；
-    查失败**不影响**扫描（None 当「不知道」处理，不拦）。
+    先读注册表（**非管理员也能读**），读不到再退回 CIM（只有管理员能问）。
+    这么排的原因是：压缩检查要能在弹 UAC **之前**做（子进程起来时用户已经点过
+    提权了，那时才告诉他「注定失败」等于白弹一次）。查失败**不影响**扫描。
     """
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _COMPRESSION_KEY) as k:
+            value, _kind = winreg.QueryValueEx(k, "MemoryCompression")
+        return bool(int(value))
+    except FileNotFoundError:
+        return None                     # 老系统没有这个值：不知道，别当成「关」
+    except (OSError, ValueError, TypeError):
+        pass
     try:
         import subprocess
         p = subprocess.run(
@@ -546,14 +599,18 @@ def _scan_job_inner(job: dict, *, pid: int, conn: socket.socket,
         f"（盘上起点 {layout.base_offset / 2**30:.1f} GiB{segs}）")
     compression = _memory_compression_state()
     if compression:
-        # 压缩开着时 pagefile 里存的是 XPRESS 压缩块，不是原始堆页 —— 扫描注定失败
-        # （上游实测 9,109 个候选全部认证失败）。这里必须在**扫之前**就说清楚，
-        # 否则用户只会看到「没找到能通过 GCM 认证的密钥」，完全没法归因。
-        msg = ("内存压缩开着（MemoryCompression=On）→ pagefile 里不是原始堆页，"
-               "扫描注定失败。修法（管理员，需重启）：Disable-MMAgent -MemoryCompression")
-        log("⚠️ " + msg)
-        return {"ok": False, "fatal": True, "error": msg,
-                "memory_compression": True}
+        # 压缩开着时 pagefile 里多半是 XPRESS 压缩块，不是原始堆页 —— 扫描大概率落空
+        # （上游实测 9,109 个候选全部认证失败）。但 Win10/11 默认就开着，一刀切
+        # 会让大多数机器直接「取钥失败」，所以默认只警告、继续扫；真要硬拦得
+        # 显式设 `VLT_KEY_SCAN_STRICT_COMPRESSION=1`。
+        msg = ("内存压缩开着（MemoryCompression=On）→ pagefile 里多半不是原始堆页，"
+               "扫描很可能落空。若确实扫不到，用管理员执行 "
+               "Disable-MMAgent -MemoryCompression 后重启再试")
+        if _strict_compression():
+            log("⚠️ " + msg + "（VLT_KEY_SCAN_STRICT_COMPRESSION=1，本轮不扫）")
+            return {"ok": False, "fatal": True, "error": msg,
+                    "memory_compression": True}
+        log("⚠️ " + msg + "（继续扫，先看结果）")
     if compression is False:
         log("内存压缩：关（扫描前提满足）")
 
@@ -622,8 +679,10 @@ def _scan_job_inner(job: dict, *, pid: int, conn: socket.socket,
             "ok": False,
             "error": (f"扫了 {result.scanned_bytes / 2**30:.1f} GiB"
                       f"（{result.chunks} 块）、候选 {len(result.candidates)} 个，"
-                      "都不通过 GCM 认证。最可能的原因：内存压缩又开着了"
-                      f"（Disable-MMAgent -MemoryCompression 后重启）{unread}"
+                      "都不通过 GCM 认证。常见原因：内存压缩开着"
+                      "（管理员执行 Disable-MMAgent -MemoryCompression 后重启）"
+                      "、进世界后堆已换过一轮（重新授权一次）"
+                      f"{unread}"
                       f"，pagefile 里的游戏堆路标：{getattr(result, 'markers', {})}"
                       + (f"；排查包：{dump}" if dump else "")),
         }

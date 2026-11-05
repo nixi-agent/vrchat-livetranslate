@@ -286,7 +286,10 @@ def t_worker_records_unread() -> None:
                            extents=(pagefile.Extent(0, 16),), real_bytes=65536,
                            volume=vol)
     pkt = bytes([1, 2, 0x01, 3, 4]) + bytes(range(12)) + bytes(22)
-    samples = {(b"\x01\x02", b"\x01\x02\x03\x04"): [pkt, pkt]}
+    # 真实头是 [peerID:2][0x01][challenge:4][nonce:12]：challenge 从 index 3 起。
+    # 以前这里写 b"\x01\x02\x03\x04"（按 payload[1:5] 的口径），会把「tag 取错字节」
+    # 这个 bug 盖住（见 #136 review 第 1 条）。
+    samples = {(bytes(pkt[0:2]), bytes(pkt[3:7])): [pkt, pkt]}
 
     old_disk, old_auth = pagefile.Disk, key_win.gcm_win.GcmAuth
     pagefile.Disk = _DeadDisk
@@ -304,6 +307,101 @@ def t_worker_records_unread() -> None:
     check("failed_disks=[3]", res.failed_disks == [3], f"{res.failed_disks}")
 
 
+def t_samples_group_by_header() -> None:
+    """分组键必须按 Photon 头取 `(peerID, challenge[3:7])`，不是 `payload[1:5]`。
+
+    #136 review 第 1 条：`payload[2]` 是固定 `0x01` 标志位，把它算进 challenge 会让
+    分组键漂移；`_scan_near_challenges()` 拼的锚是 `peer + 0x01 + chal`，取错字节后
+    几乎每个包都会被当成锚点，白烧 CPU。这里钉住口径，防止再改回去。
+    """
+    if sys.platform != "win32":
+        print("  --  [capture] 非 Windows，跳过分组口径验证")
+        return
+    print("[capture] 分组键 = (payload[0:2], payload[3:7])")
+
+    from vlt.players import gcm, win_capture as W  # noqa: PLC0415 - 平台相关，晚导入
+
+    flow = gcm.Flow.of(("10.0.0.1", 50000), ("10.0.0.2", 5056))
+
+    def pkt(chal: bytes, nonce: bytes, flag: bytes = b"\x01") -> bytes:
+        # [peerID:2][0x01][challenge:4][nonce:12][ciphertext+tag]
+        return b"\xaa\xbb" + flag + bytes(chal) + bytes(nonce) + b"\x00" * 16
+
+    a = pkt(b"\x11\x22\x33\x44", bytes(range(12)))
+    b = pkt(b"\x11\x22\x33\x44", bytes(range(12, 24)))
+    bad = pkt(b"\x11\x22\x33\x44", bytes(range(12)), flag=b"\x02")
+    groups, flows = W.samples_to_groups([(flow, a), (flow, b), (flow, bad)])
+
+    tag = (b"\xaa\xbb", b"\x11\x22\x33\x44")
+    check("同 peer/challenge 的两包归一组", list(groups) == [tag], f"{list(groups)}")
+    check("标志位不是 0x01 的包被丢掉", len(groups[tag]) == 2, f"{len(groups[tag])}")
+    check("反查表带回 Flow", flows.get(tag) == flow, f"{flows.get(tag)}")
+
+    hit = W.make_hit(b"\x01" * 32, groups, flows, kind="hdr7")
+    check("hdr7 命中按 7 字节 AAD 布局", hit.layout == "hdr", hit.layout)
+    hit19 = W.make_hit(b"\x01" * 32, groups, flows)
+    check("默认仍是 hdr+nonce", hit19.layout == gcm.LAYOUTS[0], hit19.layout)
+
+
+def t_from_cache_reads_disk() -> None:
+    """会话缓存空着也必须读磁盘缓存（#136 review 第 2 条）。
+
+    以前 `_from_cache()` 开头 `if self._cache.peek() is None: return None` 直接早退，
+    `_disk_key_read(ident)` 永远跑不到 —— 新进程永远用不上 `key_cache.json`，
+    磁盘缓存等于没做。这里钉住「缓存空 → 读盘 → 带 AAD 形态复验」。
+    """
+    if sys.platform != "win32":
+        print("  --  [capture] 非 Windows，跳过磁盘缓存回读验证")
+        return
+    print("[capture] 会话缓存空 → 读磁盘缓存（带 AAD 形态）")
+
+    from vlt.players import win_capture as W  # noqa: PLC0415 - 平台相关，晚导入
+
+    class _Leg:
+        def on_status(self, _level, _msg) -> None:
+            pass
+
+    class _Auth:
+        def close(self) -> None:
+            pass
+
+    key = bytes(range(32))
+    tag = (b"\xaa\xbb", b"\x11\x22\x33\x44")
+    groups = {tag: [b"p", b"p"]}
+    flows = {tag: "flow"}
+    saved = (W._disk_key_read, W._disk_key_forget, W.key_win.verify_key, W.gcm_win.GcmAuth)
+    calls = {"read": 0, "forget": 0}
+    try:
+        W.gcm_win.GcmAuth = _Auth
+        W._disk_key_read = lambda _ident: (calls.__setitem__("read", calls["read"] + 1)
+                                           or (key, "hdr7"))
+        W._disk_key_forget = lambda: calls.__setitem__("forget", calls["forget"] + 1)
+        W.key_win.verify_key = (lambda k, g, auth=None, aad_kind="hdr19":
+                                k == key and aad_kind == "hdr7")
+
+        cap = object.__new__(W._WinCapture)
+        cap._leg = _Leg()
+        cap._cache = W.key_win.SessionCache()
+        hit = W._WinCapture._from_cache(cap, object(), groups, flows)
+        check("盘上有钥匙就命中（不再被 peek() 早退挡住）", hit is not None)
+        check("确实读了一次磁盘", calls["read"] == 1, str(calls))
+        check("按落盘的 AAD 形态取布局", getattr(hit, "layout", None) == "hdr",
+              getattr(hit, "layout", None))
+        check("命中后写进会话缓存", cap._cache.peek() == key)
+
+        # 盘上的钥匙打不开当前流量 → 当没命中，并丢掉这条缓存
+        W.key_win.verify_key = lambda k, g, auth=None, aad_kind="hdr19": False
+        cap2 = object.__new__(W._WinCapture)
+        cap2._leg = _Leg()
+        cap2._cache = W.key_win.SessionCache()
+        check("验不过的磁盘缓存不当命中",
+              W._WinCapture._from_cache(cap2, object(), groups, flows) is None)
+        check("验不过就丢掉磁盘缓存", calls["forget"] == 1, str(calls))
+    finally:
+        (W._disk_key_read, W._disk_key_forget,
+         W.key_win.verify_key, W.gcm_win.GcmAuth) = saved
+
+
 def main() -> int:
     t_layout_keeps_disk_number()
     t_resolve_single_extent()
@@ -318,6 +416,8 @@ def main() -> int:
     t_legacy_layout_covers_spans()
     t_callsites_use_open_volume()
     t_worker_records_unread()
+    t_samples_group_by_header()
+    t_from_cache_reads_disk()
 
     if os.name != "nt":                      # 纯逻辑，Linux 上也应该能跑
         print("（非 Windows：只跑了映射逻辑，未触碰任何设备）")

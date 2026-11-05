@@ -30,6 +30,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .. import paths
+from ..paths import _user_data_dir
 from . import (dgram, gcm, gcm_win, key_win, keyd, names, opus, pagefile,
                procfs, procfs_win)
 
@@ -41,6 +42,45 @@ _AAD_TO_LAYOUT = {
     "hdr7": gcm.LAYOUTS[1],
     "none": gcm.LAYOUTS[2],
 }
+
+# ---------------------------------------------------------------- 密钥磁盘缓存
+# 为什么要落盘：冷启动一次扫描要读 34 GiB（本机 170 s）。密钥是**进程级**的
+# （换房间不换，只有游戏重启才换），所以「同一个 pid+created 的 VRChat」可以复用。
+# 用之前一定再用当前样本做一次 GCM 认证 —— 命中缓存绝不等于可信。
+KEY_CACHE_FILE = _user_data_dir() / "key_cache.json"   # 与 api_key.txt 同一个用户目录
+
+
+def _disk_key_read(ident: "key_win.Identity") -> bytes | None:
+    try:
+        d = json.loads(KEY_CACHE_FILE.read_text(encoding="utf-8"))
+        if int(d.get("pid") or 0) != ident.pid:
+            return None
+        if int(d.get("created") or 0) != ident.created:
+            return None
+        key = bytes.fromhex(str(d.get("key") or ""))
+        return key if len(key) == gcm.KEY_LEN else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _disk_key_write(ident: "key_win.Identity", key: bytes) -> None:
+    try:
+        KEY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        KEY_CACHE_FILE.write_text(json.dumps({
+            "pid": ident.pid, "created": ident.created,
+            "key": key.hex(), "ts": int(time.time()),
+            # 明文说明用：只有 fingerprint 可读，key 本身在这儿（用户自己机器、他自己的会话）
+            "note": "vrchat livetranslate session key cache; delete this file to force a rescan",
+        }, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _disk_key_forget() -> None:
+    try:
+        KEY_CACHE_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 # 回放窗口：取钥那十几秒里抓到的包要补一遍，否则名字表和开场语音会丢。
 REPLAY_S = 5.0
@@ -76,6 +116,11 @@ DIR_REFRESH_S = 2.0
 # 立刻重试只会再弹一次 UAC —— 用户看到的就是「一直弹窗但一直拿不到密钥」
 # （实测 27 秒里连弹了 6 次）。同一进程冷却期内直接报错，不再拉起子进程。
 ELEVATE_COOLDOWN_S = 25.0
+# 让路等待的上限：一次冷启动扫描本机实测 170 s（34 GiB @ 150 MB/s），给到 300 s
+# 才有余量。超了就自己上 —— 不能再等，否则一圈下来什么都没干。
+WAIT_SHARED_MAX_S = 300.0
+# 轮询间隔：落盘是整文件覆盖写，2 s 足够，也不至于把磁盘唤醒得太勤。
+WAIT_SHARED_POLL_S = 2.0
 
 
 class KeyUnavailable(RuntimeError):
@@ -224,6 +269,9 @@ def make_hit(key: bytes, groups: dict, flows: dict, tag=None) -> gcm.KeyHit:
 # key 是**进程级**的（换世界/换房间都不变，只有游戏重启才换），所以缓存必须跨
 # `_WinCapture` 实例共享：预热器（warmup）先取一次钥，`leg` 随后新建的 cap 才能在
 # 同一份缓存上命中 → 换世界不再弹 UAC、也不用重扫 20 秒的 pagefile。
+#: 扫描单飞：同一台机器同一时刻只允许一次提权扫描
+_SCAN_LOCK = threading.Lock()
+
 _SESSION = key_win.SessionCache()
 
 
@@ -245,6 +293,7 @@ class _WinCapture:
         self._stripper = dgram.Stripper()
         self._cache = _SESSION
         self._key: gcm.KeyHit | None = None
+        # 单飞锁是**模块级**的（见 _SCAN_LOCK）：多个采集实例共用一把
         self._table: names.NameTable | None = None
         self._status_provider = None
         self._replay: deque = deque(maxlen=MAX_REPLAY)
@@ -413,6 +462,21 @@ class _WinCapture:
         self._key = hit
         return hit
 
+    def forget_key(self) -> None:
+        """丢掉手里的密钥（含会话缓存）。
+
+        为什么必须有：`acquire_key()` 会把 key 缓存在**采集对象**上，`warmup` 判定
+        「连续 10 个包解不开」时只清了自己的 `_key` —— 下一次 `acquire_key()` 立刻把
+        同一把死钥匙还回来，于是「失败→10 秒后重试→又失败」无限循环，
+        界面上就是**永远「预热不可用」**（本机实测：找到钥匙 28 秒后进入这个死循环）。
+        """
+        self._key = None
+        _disk_key_forget()
+        try:
+            self._cache.forget()
+        except AttributeError:
+            pass
+
     def _from_cache(self, ident: key_win.Identity, groups: dict, flows: dict):
         """会话缓存命中就零 UAC —— key 是进程级的，换房间不换。"""
         if self._cache.peek() is None:
@@ -423,8 +487,19 @@ class _WinCapture:
         finally:
             auth.close()
         if key is None:
+            key = _disk_key_read(ident)
+            if key is not None:
+                auth2 = gcm_win.GcmAuth()
+                try:
+                    ok = key_win.verify_key(key, groups, auth=auth2)
+                finally:
+                    auth2.close()
+                if not ok:
+                    key = None
+                    _disk_key_forget()          # 缓存里的钥匙打不开当前流量 → 立刻作废
+        if key is None:
             return None
-        self._status("info", "命中会话缓存（key 是进程级的），跳过提权与整盘扫描")
+        self._status("info", "命中密钥缓存（key 是进程级的），跳过提权与整盘扫描")
         return make_hit(key, groups, flows)
 
     def _scan(self, ident: key_win.Identity, groups: dict, flows: dict) -> gcm.KeyHit:
@@ -434,13 +509,76 @@ class _WinCapture:
         区别只是权限来源：`\\.\PhysicalDriveN` 只给管理员 `GENERIC_READ`。
         提权只用于这**一次**读盘；密钥随即进 `SessionCache`，换房间不再弹 UAC。
         """
-        if keyd.is_admin():
-            return self._scan_local(ident, groups, flows)
-        return self._scan_via_keyd(ident, groups, flows)
+        # ⚠️ **单飞**：预热线程和翻译腿会同时来要钥匙，两边各自拉起提权子进程 =
+        # 两个子进程同时扫 34 GiB（本机实测：日志里两路进度交错、IO 翻倍，
+        # 而且先连上的那个把监听队列占满，另一个「没有交出结果就断开」）。
+        # 这里加锁后，后到的那一方等前一方扫完，直接拿 `self._key`。
+        with _SCAN_LOCK:
+            if self._key is not None:
+                return self._key
+            cached = self._from_cache(ident, groups, flows)
+            if cached is not None:
+                self._key = cached
+                return cached
+            if keyd.is_admin():
+                hit = self._scan_local(ident, groups, flows)
+            else:
+                hit = self._scan_via_keyd(ident, groups, flows)
+            self._key = hit
+            _disk_key_write(ident, hit.key)
+            return hit
+
+    def _wait_shared_key(self, ident: key_win.Identity, groups: dict, flows: dict,
+                         *, max_s: float = WAIT_SHARED_MAX_S):
+        """另一路正在扫：轮询它扫完落盘的密钥，**不重复读盘、不弹 UAC**。
+
+        为什么等磁盘而不是等内存：撞锁的「另一路」多半在**另一个进程**里
+        （翻译腿 / 右栏面板各有自己的采集实例），实例变量共享不了；而扫完的那一路
+        一定会 `_disk_key_write()`，于是磁盘就是它们之间的信箱。
+
+        命中后**仍要过 GCM 复验**：缓存里的钥匙打不开当前流量时必须继续等，
+        不能当成命中（也先别删 —— 可能是自己这批样本有问题，别毁掉别人的成果）。
+
+        返回 None 表示「让路到头了」，调用方应自己扫一次。
+        """
+        self._status("info", "另一个取钥扫描正在进行（本机只允许一路读盘）"
+                            "—— 等它的结果，不再弹 UAC")
+        deadline = time.monotonic() + max_s
+        while time.monotonic() < deadline:
+            if self._key is not None:
+                return self._key
+            key = _disk_key_read(ident)
+            if key is not None:
+                auth = gcm_win.GcmAuth()
+                try:
+                    ok = key_win.verify_key(key, groups, auth=auth)
+                finally:
+                    auth.close()
+                if ok:
+                    self._status("info", "另一路扫完了：密钥命中（复用它落盘的结果）")
+                    self._cache.store(ident, key)
+                    return make_hit(key, groups, flows)
+            if not keyd.scan_busy():
+                # 那一路已收工却没留下能用的钥匙（失败/超时）→ 让路到此为止。
+                self._status("info", "另一路扫描结束了但没拿到密钥 —— 自己再扫一次")
+                return None
+            time.sleep(WAIT_SHARED_POLL_S)
+        self._status("info", f"等了 {max_s:.0f} 秒另一路还没结果 —— 自己扫一次")
+        return None
 
     def _scan_via_keyd(self, ident: key_win.Identity, groups: dict,
                        flows: dict) -> gcm.KeyHit:
         """非管理员路径：把样本交给提权子进程，它只回一个 32 字节候选。"""
+        # 弹 UAC **之前**先探互斥体：另一路正在扫时等它的结果，别自己再扫一遍、
+        # 也别再弹一次窗。扫描要 3~4 分钟，而 warmup 每 10 秒重试一次 ——
+        # 把撞锁当失败就是「失败 → 10 s 后重试 → 又撞锁」的死循环，
+        # 本机实测 22 秒里连弹 5 次 UAC（用户看到的就是一直弹窗、一直没钥匙）。
+        if keyd.scan_busy():
+            hit = self._wait_shared_key(ident, groups, flows)
+            if hit is not None:
+                return hit
+            # 让路没等到结果（那一路失败/超时）：自己上，别把自己的机会也让掉。
+        # 让路之后再过一次冷却：上一次真失败了（25 秒内）就别再弹窗。
         _gate_elevation(ident)
         self._status("info", "取钥需要读 pagefile 的原始扇区 —— 现在弹一次 UAC"
                             "（只这一次，换房间不会再弹）")

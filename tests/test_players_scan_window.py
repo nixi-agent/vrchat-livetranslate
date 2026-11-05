@@ -282,6 +282,85 @@ def test_scan_busy() -> None:
     check("释放后 scan_busy 又变回 False", D.scan_busy() is False)
 
 
+def test_recv_sticky() -> None:
+    print("[keyd] 粘包：一次 recv 带回多条消息也要逐条读出（否则父进程误判断开）")
+    import json
+    import socket as S
+
+    from vlt.players import keyd as D
+
+    srv = S.socket()
+    srv.setsockopt(S.SOL_SOCKET, S.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    try:
+        c = S.create_connection(srv.getsockname(), timeout=2)
+        a, _ = srv.accept()
+        # 子进程定位完 pagefile 时就是这样：三条 log 几乎同时发出
+        blob = "".join(
+            json.dumps({"stage": "log", "message": f"m{i}"}, ensure_ascii=False) + "\n"
+            for i in range(3))
+        a.sendall(blob.encode("utf-8"))
+
+        buf = bytearray()
+        got = [D._recv(c, timeout=2.0, buf=buf) for _ in range(3)]
+        check("三条都读出来了", [g and g.get("message") for g in got] == ["m0", "m1", "m2"],
+              repr(got))
+        check("尾巴缓冲已清空", buf == b"", repr(bytes(buf)))
+
+        # 拆包（半条消息分两次到）也必须能拼起来
+        half = json.dumps({"stage": "done", "ok": True}) + "\n"
+        cut = len(half) // 2
+        a.sendall(half[:cut].encode())
+        a.sendall(half[cut:].encode())
+        msg = D._recv(c, timeout=2.0, buf=buf)
+        check("拆开的单条能拼回来", msg == {"stage": "done", "ok": True}, repr(msg))
+        c.close()
+        a.close()
+    finally:
+        srv.close()
+
+
+def test_persist_key() -> None:
+    print("[keyd] 子进程扫到钥匙先自己落盘（连接断了也不白扫）")
+    import json
+    import tempfile
+
+    from vlt.players import keyd as D
+    from vlt.players import win_capture as W
+
+    key = bytes(range(32))
+    with tempfile.TemporaryDirectory() as td:
+        orig = W.KEY_CACHE_FILE
+        W.KEY_CACHE_FILE = Path(td) / "key_cache.json"
+
+        class _Ident:
+            pid = 4242
+            created = 171717
+
+        try:
+            import vlt.paths as P
+            orig_dir = P._user_data_dir
+            P._user_data_dir = lambda: Path(td)          # 让 _persist_key 写进临时目录
+            try:
+                D._persist_key(4242, 171717, key)
+            finally:
+                P._user_data_dir = orig_dir
+
+            data = json.loads((Path(td) / "key_cache.json").read_text(encoding="utf-8"))
+            check("落盘内容含 pid/created/key",
+                  data.get("pid") == 4242 and data.get("created") == 171717
+                  and data.get("key") == key.hex(), repr(data))
+            check("主程序能原样读回", W._disk_key_read(_Ident()) == key,
+                  repr(W._disk_key_read(_Ident())))
+        finally:
+            W.KEY_CACHE_FILE = orig
+
+    src = (ROOT / "vlt" / "players" / "keyd.py").read_text(encoding="utf-8")
+    check("交出结果之前就落盘",
+          src.index("_persist_key(") < src.index('"key": result.hit.key.hex()'))
+
+
 def main() -> int:
     test_constants()
     test_worker_windows()
@@ -290,6 +369,8 @@ def main() -> int:
     test_failure_dump()
     test_scan_busy()
     test_shared_wait()
+    test_recv_sticky()
+    test_persist_key()
     if FAILS:
         print(f"\n{len(FAILS)} 项失败：{FAILS}")
         return 1

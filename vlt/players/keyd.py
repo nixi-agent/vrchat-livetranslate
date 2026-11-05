@@ -270,7 +270,8 @@ def _drive(conn: socket.socket, *, token: str, pid: int, created: int,
            hint_mft: int, hint_serial: int, samples, on_log,
            deadline: float) -> dict:
     """令牌握手 → 下发任务 → 收日志直到 done/error → bye。"""
-    hello = _recv(conn, timeout=CONNECT_TIMEOUT)
+    buf = bytearray()          # 粘包时多读的尾巴（见 `_recv`）
+    hello = _recv(conn, timeout=CONNECT_TIMEOUT, buf=buf)
     if not hello:
         raise KeyDenied("提权子进程连上了但没自报身份就退出了")
     if hello.get("token") != token:
@@ -288,7 +289,7 @@ def _drive(conn: socket.socket, *, token: str, pid: int, created: int,
 
     result: dict | None = None
     while time.monotonic() < deadline:
-        msg = _recv(conn, timeout=max(1.0, deadline - time.monotonic()))
+        msg = _recv(conn, timeout=max(1.0, deadline - time.monotonic()), buf=buf)
         if msg is None:
             break
         stage = msg.get("stage")
@@ -321,11 +322,28 @@ def _send(conn: socket.socket, payload: dict) -> None:
     conn.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
 
 
-def _recv(conn: socket.socket, *, timeout: float = 30.0) -> dict | None:
-    """读一行 JSON；对端关闭/超时/超长都返回 None（调用方按「没结果」处理）。"""
+def _recv(conn: socket.socket, *, timeout: float = 30.0,
+          buf: bytearray | None = None) -> dict | None:
+    """读一行 JSON。对端关闭/超时/超长都返回 None（调用方按「没结果」处理）。
+
+    ⚠️ **必须按行切，不能拿「整段以换行结尾」当读完了**：TCP 是流，子进程定位完
+    pagefile 会连发三条 log（内存压缩状态 / MFT / pagefile 摘要），实测必然被合并
+    进同一次 recv。老实现拿到 `"...a\\n...b\\n"` 就 `json.loads` 整段 → `Extra data:
+    line 2 column 1` → 返回 None → 父进程报「提权子进程没有交出结果就断开了」，
+    而子进程其实还在扫（本机实测又活了 120 秒，**并且真的找到了密钥**，结果没人收）。
+
+    多读进来的半截留在 `buf` 里，下一次调用接着用（同一条连接必须传同一个 buf）。
+    """
     conn.settimeout(timeout)
-    data = b""
-    while not data.endswith(b"\n"):
+    data = buf if buf is not None else bytearray()
+    while True:
+        nl = data.find(b"\n")
+        if nl >= 0:
+            line = bytes(data[:nl])
+            del data[:nl + 1]
+            break
+        if len(data) > MAX_LINE:              # 单行超过上限：协议已乱，放弃
+            return None
         try:
             chunk = conn.recv(65536)
         except socket.timeout:
@@ -334,11 +352,9 @@ def _recv(conn: socket.socket, *, timeout: float = 30.0) -> dict | None:
             return None
         if not chunk:
             return None
-        data += chunk
-        if len(data) > MAX_LINE:
-            return None
+        data.extend(chunk)
     try:
-        parsed = json.loads(data.decode("utf-8", "replace"))
+        parsed = json.loads(line.decode("utf-8", "replace"))
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
@@ -490,6 +506,33 @@ def _memory_compression_state() -> bool | None:
     return None
 
 
+def _persist_key(pid: int, created: int, key: bytes, *, log=None) -> None:
+    """子进程扫到密钥后自己落一份盘（与主程序 `win_capture.KEY_CACHE_FILE` 同文件）。
+
+    为什么要子进程写：扫一次 2~4 分钟，结果**只能靠那条 socket 交回**，而连接
+    可能先断（本机实测：粘包让主程序把「定位完 pagefile」误判成断开，子进程又
+    老老实实扫了 120 秒、真找到了钥匙，却没人收 —— 整轮白扫）。
+    落到同一个缓存文件后，主程序下一次 `acquire_key()` 直接命中，不用重扫。
+
+    写失败不影响返回：缓存是加速，不是正确性依赖。
+    """
+    if not pid or len(key) != 32:
+        return
+    try:
+        from ..paths import _user_data_dir
+        path = _user_data_dir() / "key_cache.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "pid": int(pid), "created": int(created),
+            "key": key.hex(), "ts": int(time.time()),
+            "note": "vrchat livetranslate session key cache; delete this file to force a rescan",
+        }, ensure_ascii=False), encoding="utf-8")
+        if log is not None:
+            log(f"密钥已落盘缓存：{path}")
+    except (OSError, ImportError, ValueError):
+        pass
+
+
 def _scan_job_inner(job: dict, *, pid: int, conn: socket.socket,
                     deadline: float, info: dict) -> dict:
     """真正的特权工作：定位 pagefile → 驱逐脏页 → 扫 key → 交回（不含明文日志）。
@@ -602,6 +645,12 @@ def _scan_job_inner(job: dict, *, pid: int, conn: socket.socket,
                       + (f"；排查包：{dump}" if dump else "")),
         }
     peer, chal = result.hit.flow
+    # 自己先落盘一份：子进程扫一次要 2~4 分钟，交回结果要靠**连接**——而连接
+    # 可能因为各种原因（粘包误判、主程序重启、UAC 被撤销）先断掉。断了还白扫
+    # 就没法接受；写进同一个缓存文件，主程序下次 `acquire_key()` 直接命中。
+    # 写失败不影响返回（缓存是加速，不是正确性依赖）。
+    _persist_key(int(job.get("pid") or pid), int(job.get("created") or 0),
+                 result.hit.key, log=log)
     return {
         "ok": True,
         "key": result.hit.key.hex(),
@@ -697,7 +746,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _send(conn, {"v": PROTO, "stage": "hello", "token": args.token,
                      "pid": args.pid, "created": args.created})
-        job = _recv(conn, timeout=CONNECT_TIMEOUT)
+        buf = bytearray()      # 粘包时多读的尾巴（见 `_recv`）
+        job = _recv(conn, timeout=CONNECT_TIMEOUT, buf=buf)
         if not job or job.get("cmd") != "job":
             _send(conn, {"stage": "error", "fatal": True,
                          "error": "没有收到任务下发"})
@@ -742,7 +792,8 @@ def main(argv: list[str] | None = None) -> int:
 
         # 等主程序收完说 bye；它异常退出（EOF）也立刻收摊，不空转到 lifetime。
         while time.monotonic() < deadline:
-            msg = _recv(conn, timeout=max(1.0, min(5.0, deadline - time.monotonic())))
+            msg = _recv(conn, timeout=max(1.0, min(5.0, deadline - time.monotonic())),
+                        buf=buf)
             if msg is None or msg.get("cmd") == "bye":
                 break
         return 0 if result.get("ok") else EXIT_NO_KEY

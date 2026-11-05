@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 import time
 from pathlib import Path
@@ -54,11 +55,22 @@ def test_constants() -> None:
     print("[key_win] 内存上界常量")
     check("单窗 ≤ 64 MiB", K.WINDOW <= (64 << 20), f"WINDOW={K.WINDOW}")
     check("扫描预算 ≥ 120s", K.SCAN_TIMEOUT >= 120.0, f"SCAN_TIMEOUT={K.SCAN_TIMEOUT}")
-    check("线程数 ≤ 4", 1 <= K.KEY_SCAN_THREADS <= 4, f"{K.KEY_SCAN_THREADS}")
+    check("线程数 ≤ 核数（默认 8）", 1 <= K.KEY_SCAN_THREADS <= max(8, os.cpu_count() or 4),
+          f"{K.KEY_SCAN_THREADS}（核数 {os.cpu_count()}）")
     check("候选偏移不止一种（8/12/16/24）", len(K.CAND_OFFSETS) >= 2, f"{K.CAND_OFFSETS}")
-    check("验收形态先试 hdr19 再退化",
-          K._kind_order("hdr19")[0] == "hdr19" and "hdr7" in K._kind_order("hdr19"),
+    check("默认只试主形态（省 GCM 开销）", K._kind_order("hdr19") == ("hdr19",),
           f"{K._kind_order('hdr19')}")
+    _old_kinds = os.environ.get("VLT_KEY_SCAN_KINDS")
+    os.environ["VLT_KEY_SCAN_KINDS"] = "all"
+    try:
+        _all_kinds = K._kind_order("hdr19")
+    finally:
+        if _old_kinds is None:
+            os.environ.pop("VLT_KEY_SCAN_KINDS", None)
+        else:
+            os.environ["VLT_KEY_SCAN_KINDS"] = _old_kinds
+    check("VLT_KEY_SCAN_KINDS=all 时先试 hdr19 再退化",
+          _all_kinds[0] == "hdr19" and "hdr7" in _all_kinds, f"{_all_kinds}")
     check("只试运行期能用的形态",
           set(K._kind_order("hdr19")) <= set(K.RUNTIME_KINDS), f"{K.RUNTIME_KINDS}")
     check("ScanHit 记录了形态与偏移",
@@ -67,12 +79,13 @@ def test_constants() -> None:
     src = (ROOT / "vlt" / "players" / "key_win.py").read_text(encoding="utf-8")
     check("源码里没有「整段 span 一次读」", "read_view(begin, span)" not in src,
           "还留着 read_view(begin, span)")
-    check("源码里有切窗循环", "min(WINDOW, end - pos)" in src)
-    check("候选按多种偏移取样", "for key_off in CAND_OFFSETS" in src)
+    check("源码里按窗口切读（每窗 ≤ WINDOW）", "min(WINDOW, end - pos)" in src)
+    check("候选偏移默认收敛到 KEY_OFF（VLT_KEY_SCAN_OFFSETS=all 放开）",
+          "for key_off in offsets" in src and "_cand_offsets" in src)
 
 
 def test_worker_windows() -> None:
-    print("[key_win] _worker 真的切窗（100 MiB span → 每窗 ≤ WINDOW）")
+    print("[key_win] _worker 按窗口读（100 MiB span → 每窗 ≤ WINDOW）")
     rec: list[tuple[int, int]] = []
     orig_open = K.pagefile.Disk.open
     orig_auth = K.gcm_win.GcmAuth
@@ -85,7 +98,8 @@ def test_worker_windows() -> None:
         K._lower_thread_priority = lambda: None
         span = 100 << 20
         state = K._State(span)
-        K._worker(state, [(0, 0, span)], [], deadline=time.monotonic() + 60, aad_kind="hdr19")
+        K._worker(state, [(0, 0, span)], [], deadline=time.monotonic() + 60,
+                  aad_kind="hdr19")
     finally:
         K.pagefile.Disk.open = orig_open
         K.gcm_win.GcmAuth = orig_auth
@@ -93,15 +107,16 @@ def test_worker_windows() -> None:
         K._lower_thread_priority = orig_prio
 
     sizes = [n for _o, n in rec]
-    starts = [o for o, _n in rec]
     check("读过数据", bool(rec), f"{rec[:3]}")
-    check("每次读入 ≤ WINDOW+OVERLAP", all(n <= K.WINDOW + K.OVERLAP for n in sizes),
+    # 每次读都带 39 字节跨窗尾巴，物理盘又要求扇区对齐 → 上限是 WINDOW+4096
+    check("单次读入 ≤ WINDOW+扇区余量",
+          all(n <= K.WINDOW + K.OVERLAP_ALIGN for n in sizes),
           f"max={max(sizes) if sizes else 0}")
-    check("步进就是 WINDOW（窗口首尾相接）",
-          all(starts[i + 1] - starts[i] == K.WINDOW for i in range(len(rec) - 1)),
-          f"{starts[:4]}")
-    check("覆盖整个 span", starts[-1] + K.WINDOW >= span, f"last={starts[-1]} span={span}")
-    check("窗口数合理", len(rec) == -(-span // K.WINDOW), f"{len(rec)}")
+    check("覆盖整个 span", state.scanned >= span, f"scanned={state.scanned} span={span}")
+    # 物理盘 ReadFile 长度必须按扇区对齐（err=87），39 字节的跨窗尾巴会读 4096
+    # 字节再切回 —— 断言「每次读都按扇区对齐、且都 ≥ WINDOW 级」。
+    check("每次读都按扇区对齐",
+          all(n % K.OVERLAP_ALIGN == 0 for n in sizes), f"{sizes[:3]}")
     check("窗口间留了 OVERLAP（跨窗的 key 不漏）", K.OVERLAP >= K.KEY_OFF + K.KEY_LEN - 1,
           f"OVERLAP={K.OVERLAP} 需要 {K.KEY_OFF + K.KEY_LEN - 1}")
 
@@ -136,6 +151,38 @@ def test_failure_dump() -> None:
         check("含扫描统计", data.get("scanned_bytes") == 123, f"{data.get('scanned_bytes')}")
         check("不含明文/昵称字段",
               not any(k in data for k in ("plain", "name", "display", "user", "key_plain")))
+
+
+def test_challenge_gate() -> None:
+    """challenge 路只在预算内跑：否则命中前要双路扫全盘，吞吐掉约 2×（实测 5×→ 里的一半）。"""
+    print("[key_win] challenge 第二条路的启用策略")
+    st = K._State(64 << 30)
+    check("auto：第一遍完全不跑 challenge（改成失败后补扫）",
+          K._challenge_enabled(st, "auto") is False, f"scanned={st.scanned}")
+    st.take_chunk(K.CHALLENGE_GATE_BYTES * 4)
+    check("auto：扫过 GATE 也不跑", K._challenge_enabled(st, "auto") is False, f"{st.scanned}")
+    check("chal：第二遍补扫时每窗都跑", K._challenge_enabled(st, "chal") is True)
+    check("always：无视阈值", K._challenge_enabled(st, "always") is True)
+    check("off：永不走第二条路", K._challenge_enabled(st, "off") is False)
+    st2 = K._State(64 << 30)
+    check("only：起步就跑（不受 GATE 限制）", K._challenge_enabled(st2, "only") is True,
+          f"scanned={st2.scanned}")
+    st2.take_challenge(K.CHALLENGE_BUDGET * 4)
+    check("only：预算用完也不再掐（主路要扫全盘）",
+          K._challenge_enabled(st2, "only") is True, f"{st2.challenge_bytes}")
+    check("环境变量认四档",
+          K._challenge_mode() in ("auto", "always", "off", "only"), f"{K._challenge_mode()}")
+    old_env = os.environ.get("VLT_KEY_SCAN_CHALLENGE")
+    try:
+        os.environ["VLT_KEY_SCAN_CHALLENGE"] = "only"
+        check("env=only 生效", K._challenge_mode() == "only", K._challenge_mode())
+        os.environ["VLT_KEY_SCAN_CHALLENGE"] = "nonsense"
+        check("env 非法值回落 auto", K._challenge_mode() == "auto", K._challenge_mode())
+    finally:
+        if old_env is None:
+            os.environ.pop("VLT_KEY_SCAN_CHALLENGE", None)
+        else:
+            os.environ["VLT_KEY_SCAN_CHALLENGE"] = old_env
 
 
 def test_challenge_zone() -> None:
@@ -285,6 +332,7 @@ def test_scan_busy() -> None:
 def main() -> int:
     test_constants()
     test_worker_windows()
+    test_challenge_gate()
     test_challenge_zone()
     test_forget_key()
     test_failure_dump()

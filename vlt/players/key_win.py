@@ -41,6 +41,11 @@ import ctypes
 import os
 import threading
 import time
+
+try:  # numpy 是既有依赖（engine/audio_dsp 都用），仅用于扫描加速
+    import numpy as _NP
+except Exception:  # pragma: no cover
+    _NP = None
 from ctypes import wintypes as wt
 from dataclasses import dataclass, field
 
@@ -79,16 +84,38 @@ WINDOW = 32 << 20                              # 32 MiB/窗
 #: 扫描总预算。36 GiB pagefile 单线程实测 ~1.2 GiB/s ≈ 30 s，这里留足余量；
 #: 原来 45 s 在机械盘/热 pagefile 上必然超时（超时 = 「没找到密钥」的假阴性）。
 SCAN_TIMEOUT = 180.0
-#: 并发线程数：read_view 复用缓冲后单线程 ~1 GiB/s（空载）；带游戏在跑时 4 线程实测更快
+
+#: 路标统计采样间隔（每 N 个窗口数一次；1 = 每窗都数）。实测每窗都数会吃掉约 25% 吞吐。
+MARKER_SAMPLE_EVERY = 8
+#: 并发线程数：read_view 复用缓冲后单线程 ~1 GiB/s（空载）。本机（16 核）实测 8 线程
+#: 比 4 线程快约 1.8×；上限再按 os.cpu_count() 夹，可用 VLT_KEY_SCAN_THREADS 覆盖。
+#: 别盲目拉满：每线程峰值内存 ≈ 读缓冲 + bytes 拷贝 ≈ 2×WINDOW，且会和游戏抢 CPU/IO。
 KEY_SCAN_THREADS = 4
 MIN_FLOW_PACKETS = 2                           # 一个 flow 至少 2 包才算数
 #: 候选 key 相对锚点的偏移。8 = IL2CPP 数组 header「max_length(u64) 之后紧跟数据」；
 #: 12/16/24 兼容别的对齐/包装 —— 本机 34 GiB 扫完、52k 候选全败，先怀疑偏移而不是密钥不存在。
 CAND_OFFSETS = (8, 12, 16, 24)
+#: 默认只用 KEY_OFF：每个「偏移 × AAD 形态」组合都是一次完整 GCM 认证（≈5 µs），
+#: 热路径锚点密度实测约 12.8 万/GiB（bench_real.py），4 偏移 × 3 形态 = 12 次/锚点会把吞吐从 ~1.8 压到
+#: ~0.25 GiB/s（单线程，见 bench_scan.py）。本机 063bd98 只用 KEY_OFF + hdr19 就能命中，
+#: 故默认收敛；换布局可疑时用 VLT_KEY_SCAN_OFFSETS=all 放开。
+def _cand_offsets() -> tuple[int, ...]:
+    mode = (os.environ.get("VLT_KEY_SCAN_OFFSETS", "") or "").strip().lower()
+    if mode in ("all", "1", "true", "yes", "on"):
+        return CAND_OFFSETS
+    return (KEY_OFF,)
+
+
 #: challenge 命中后向两侧各看多少字节（对象字段就在附近）
 CHALLENGE_ZONE = 2048
 #: 同一个 challenge 模式最多展开几处命中（防病态数据把扫描拖死）
 MAX_CHALLENGE_HITS = 256
+#: challenge 那条路**不是全盘都跑**：锚点法（needle）在正常机器上也能中，双路全程扫一遍
+#: 等于白烧一倍 CPU。这两个值把代价钉死：扫过 GATE 之后才开始跑 challenge，且全盘最多
+#: 跑 BUDGET 字节（命中即停）。VLT_KEY_SCAN_CHALLENGE=always 可恢复「全盘双路」旧行为，
+#: =only 则反过来：第一遍全盘只跑 challenge，没命中再用锚点法补扫一遍（见 scan_key 末尾）。
+CHALLENGE_GATE_BYTES = 4 << 30                 # 4 GiB：needle 先跑，别一上来就双路
+CHALLENGE_BUDGET = 8 << 30                     # 8 GiB：challenge 路的总预算（only 模式不受它限制）
 MAX_KEEP = 400_000                             # 候选上限，纯防爆内存
 # 4 种偏移 × 锚点数量：本机 52k 锚点 → 20.8 万候选，留一倍余量，别让 cap 把后半段吃掉
 
@@ -283,6 +310,14 @@ class ScanResult:
     pagefile_mft: int = 0
     unread_bytes: int = 0          # 应当扫、但读不到（盘打不开/读失败）的字节数
     failed_disks: list[int] = field(default_factory=list)
+    # ---- 两路各自的成本（用来定量判断 challenge 到底值不值，VLT_KEY_SCAN_STATS=1 时打印）
+    scan_mode: str = "auto"        # 本次实际生效的策略：auto | always | only | off
+    challenge_bytes: int = 0       # challenge 路扫过的字节（不占 scanned_bytes）
+    needle_seconds: float = 0.0    # 锚点法累计「线程秒」（多线程会大于墙钟时间）
+    challenge_seconds: float = 0.0 # challenge 路累计线程秒
+    needle_windows: int = 0
+    challenge_windows: int = 0
+    needle_fallback: bool = False  # only 模式第一遍没命中、补跑的那一遍锚点法
 
 
 class SessionCache:
@@ -352,13 +387,30 @@ RUNTIME_KINDS = ("hdr19", "hdr7", "none")
 
 
 def _kind_order(primary: str) -> tuple[str, ...]:
-    """先试调用方指定的形态，再试其余运行期支持的形态（错的 key 在第一个包就失败，很便宜）。"""
-    rest = tuple(k for k in RUNTIME_KINDS if k != primary)
-    return (primary,) + rest
+    """AAD 形态顺序：默认只试主形态（老版口径）。VLT_KEY_SCAN_KINDS=all 才依次全试。
+
+    错的 key 在第一个包就失败，但**每种形态仍要各做一次 GCM 认证**（key schedule ≈5 µs），
+    热路径上锚点密度一高就是主要成本，所以不做无条件全展开。
+    """
+    mode = (os.environ.get("VLT_KEY_SCAN_KINDS", "") or "").strip().lower()
+    if mode in ("all", "1", "true", "yes", "on"):
+        rest = tuple(k for k in RUNTIME_KINDS if k != primary)
+        return (primary,) + rest
+    return (primary,)
 
 
 def _plausible(key: bytes) -> bool:
-    return len(key) == KEY_LEN and len(set(key)) >= MIN_DISTINCT
+    """熵预筛：32 字节随机 key 至少 20 种不同字节值。
+
+    先用两次 `bytes.count`（C 实现，≈50 ns）做廉价否决：真 pagefile 的锚点密度实测
+    12.8 万/GiB（见 bench_real.py），每个锚点都构造一次 `set()` 会把 needle 路压到
+    ~0.7 GiB/s；随机 key 里出现 9 个以上 0x00/0xFF 的概率低于 1e-6，挡掉不亏。
+    """
+    if len(key) != KEY_LEN:
+        return False
+    if key.count(0) > 8 or key.count(255) > 8:
+        return False
+    return len(set(key)) >= MIN_DISTINCT
 
 
 #: pagefile 里「游戏堆」的路标（世界/用户 ID 前缀，一定出现在 VRChat 托管堆里）
@@ -384,6 +436,14 @@ class _State:
         # 否则上层会把 0% 覆盖率报成「扫了 X GiB 都不通过 GCM」。
         self.unread = 0
         self.failed_disks: set[int] = set()
+        #: challenge 第二条路已经跑过多少字节（用来钉住总预算，见 CHALLENGE_BUDGET）
+        self.challenge_bytes = 0
+        #: 两路各自的累计成本（线程秒 / 窗口数）：多线程下秒数之和会大于墙钟时间，
+        #: 这里要的就是「这条路烧掉了多少 CPU」，用来判断 challenge 到底值不值。
+        self.needle_seconds = 0.0
+        self.challenge_seconds = 0.0
+        self.needle_windows = 0
+        self.challenge_windows = 0
 
     def note_unread(self, nbytes: int, disk_no: int) -> None:
         with self.lock:
@@ -420,6 +480,23 @@ class _State:
         with self.lock:
             self.chunks_done += 1
             self.scanned += nbytes
+
+    def take_challenge(self, nbytes: int) -> None:
+        """登记 challenge 路扫过的字节（不占 scanned：scanned 只算物理读过的量）。"""
+        with self.lock:
+            self.challenge_bytes += int(nbytes)
+
+    def note_needle(self, seconds: float) -> None:
+        """记一次锚点法耗时（线程秒）。"""
+        with self.lock:
+            self.needle_seconds += float(seconds)
+            self.needle_windows += 1
+
+    def note_challenge(self, seconds: float) -> None:
+        """记一次 challenge 路耗时（线程秒）。"""
+        with self.lock:
+            self.challenge_seconds += float(seconds)
+            self.challenge_windows += 1
 
     def finish(self, hit: ScanHit) -> bool:
         """抢占命中。返回 True 表示是我抢到的。"""
@@ -527,10 +604,81 @@ def _scan_near_challenges(data: bytes, base_off: int, state: _State,
                                 return None
     return None
 
+def _scan_buffer_np(data: bytes, base_off: int, state: _State, auth: gcm_win.GcmAuth,
+                    groups: list[tuple[tuple[bytes, bytes], list[bytes]]],
+                    deadline: float, aad_kind: str,
+                    offsets: tuple[int, ...], kinds: tuple[str, ...]) -> ScanHit | None:
+    """numpy 批量版：一次把整块的候选与熵预筛算完，只对幸存候选走 GCM。
+
+    实测 pagefile 的锚点密度约 12.8 万/GiB，逐锚点做 Python 循环（切片 + count +
+    `set()`）会吃掉 0.7~0.9 GiB/s 的 CPU；这里用一次数组运算替代，成本降到 ~1 ms/窗。
+    语义与 `_scan_buffer_py` 一致：按锚点升序、每个锚点内按 `offsets` 顺序尝试。
+    """
+    positions: list[int] = []
+    find = data.find
+    pos = find(ANCHOR)
+    while pos >= 0:
+        positions.append(pos)
+        pos = find(ANCHOR, pos + 1)
+    if not positions:
+        return None
+    state.note_hits(len(positions))
+
+    n = len(data)
+    idx = _NP.asarray(positions, dtype=_NP.int64)
+    offs = _NP.asarray(offsets, dtype=_NP.int64)
+    starts = idx[:, None] + offs[None, :]
+    inside = starts + KEY_LEN <= n
+    # 越界的候选用 0 位置占位，最后靠 inside 掩掉
+    win = _NP.lib.stride_tricks.sliding_window_view(_NP.frombuffer(data, _NP.uint8), KEY_LEN)
+    cand = win[_NP.where(inside, starts, 0)]
+    keep = inside & ((cand == 0).sum(-1) <= 8) & ((cand == 255).sum(-1) <= 8)
+    rows, cols = _NP.nonzero(keep)
+    if not rows.size:
+        return None
+
+    for r, c in zip(rows.tolist(), cols.tolist()):
+        if time.monotonic() >= deadline:
+            return None
+        start = int(starts[r, c])
+        cand_bytes = data[start:start + KEY_LEN]
+        if not _plausible(cand_bytes):
+            continue
+        if not state.offer(cand_bytes):
+            continue
+        for flow, pkts in groups:
+            n_pkt = min(len(pkts), 8)
+            if n_pkt < MIN_FLOW_PACKETS:
+                continue
+            for kind in kinds:
+                if auth.opens_all(cand_bytes, pkts[:n_pkt], kind) == n_pkt:
+                    hit = ScanHit(key=cand_bytes, flow=flow, ok=n_pkt,
+                                  total=len(pkts), offset=base_off + start,
+                                  kind=kind, key_off=int(offs[c]))
+                    if state.finish(hit):
+                        return hit
+                    return None
+    return None
+
+
 def _scan_buffer(data: bytes, base_off: int, state: _State, auth: gcm_win.GcmAuth,
                  groups: list[tuple[tuple[bytes, bytes], list[bytes]]],
                  deadline: float, aad_kind: str) -> ScanHit | None:
     """扫一块数据：找锚点 → 熵预筛 → 逐候选认证。"""
+    offsets = _cand_offsets()
+    kinds = _kind_order(aad_kind)
+    if _NP is not None and len(data) >= (1 << 16):
+        return _scan_buffer_np(data, base_off, state, auth, groups, deadline,
+                               aad_kind, offsets, kinds)
+    return _scan_buffer_py(data, base_off, state, auth, groups, deadline,
+                           aad_kind, offsets, kinds)
+
+
+def _scan_buffer_py(data: bytes, base_off: int, state: _State, auth: gcm_win.GcmAuth,
+                    groups: list[tuple[tuple[bytes, bytes], list[bytes]]],
+                    deadline: float, aad_kind: str,
+                    offsets: tuple[int, ...], kinds: tuple[str, ...]) -> ScanHit | None:
+    """扫一块数据：找锚点 → 熵预筛 → 逐候选认证（纯 Python 兜底路径）。"""
     hits = 0
     start = 0
     while True:
@@ -541,7 +689,7 @@ def _scan_buffer(data: bytes, base_off: int, state: _State, auth: gcm_win.GcmAut
         hits += 1
         if hits & 1023 == 0 and time.monotonic() >= deadline:
             return None
-        for key_off in CAND_OFFSETS:
+        for key_off in offsets:
             if pos + key_off + KEY_LEN > len(data):
                 continue
             cand = data[pos + key_off: pos + key_off + KEY_LEN]
@@ -553,7 +701,7 @@ def _scan_buffer(data: bytes, base_off: int, state: _State, auth: gcm_win.GcmAut
                 n = min(len(pkts), 8)
                 if n < MIN_FLOW_PACKETS:
                     continue
-                for kind in _kind_order(aad_kind):
+                for kind in kinds:
                     if auth.opens_all(cand, pkts[:n], kind) == n:
                         hit = ScanHit(key=cand, flow=flow, ok=n, total=len(pkts),
                                       offset=base_off + pos + key_off,
@@ -567,25 +715,71 @@ def _scan_buffer(data: bytes, base_off: int, state: _State, auth: gcm_win.GcmAut
 
 
 def _lower_thread_priority() -> None:
-    """把扫描线程降到 **THREAD_PRIORITY_LOWEST**。
+    """按 `VLT_KEY_SCAN_PRIORITY` 调整扫描线程优先级。
 
-    取钥是后台任务，绝不该和前台抢 CPU/IO：本机实测高并发原始读会把整台机器拖到
-    无响应（Kernel-Power 41 硬重启）。降优先级后系统调度先满足前台，扫描慢一点没关系。
+    取钥是后台任务，本该让前台优先，但降级会直接吃掉吞吐：本机实测同一份 pagefile，
+    BELOW_NORMAL（-1）+ 进程 BELOW_NORMAL 只有 ~0.27 GiB/s，而老版本（不降级）1.0 GiB/s。
+    所以默认 ``normal`` 不降；``below`` 用 -1，``lowest`` 用 -2，需要时自行权衡。
+    32 MiB 切窗才是防止 Kernel-Power 41 的关键，不依赖降优先级。
     """
+    mode = (os.environ.get("VLT_KEY_SCAN_PRIORITY", "") or "normal").strip().lower()
+    level = {"below": -1, "lowest": -2}.get(mode)
+    if level is None:
+        return
     try:
         k32 = ctypes.windll.kernel32
-        # -1 = THREAD_PRIORITY_BELOW_NORMAL。原来用 LOWEST(-2)，实测只有 ~130 MB/s，
-        # 34 GiB 要 4 分半；改成 -1 仍然让前台优先，但不再被系统当后台 IO 限速。
-        k32.SetThreadPriority(k32.GetCurrentThread(), -1)
+        k32.SetThreadPriority(k32.GetCurrentThread(), level)
     except (AttributeError, OSError):
         pass
 
 
+def _challenge_mode() -> str:
+    """challenge 第二条路的启用策略：auto（默认）/ always / off / only。
+
+    ``auto``：第一遍只跑锚点法；整盘扫完没命中才补一遍 challenge（零成功成本）；
+    ``always``：每个窗口双路都跑（PR136 的原始行为，慢约 2×，只在排查时用）；
+    ``off``：只跑锚点法；
+    ``only``：第一遍全盘只跑 challenge（不受 GATE/BUDGET 限制），没命中再用锚点法
+    补扫一遍 —— 成功路径省掉 needle 的候选展开，失败路径才付第二遍读盘。
+    """
+    mode = (os.environ.get("VLT_KEY_SCAN_CHALLENGE", "") or "auto").strip().lower()
+    return mode if mode in ("auto", "always", "off", "only") else "auto"
+
+
+def _challenge_enabled(state: _State, mode: str) -> bool:
+    """这一窗口要不要跑 challenge 路。
+
+    ``auto`` 在第一遍**完全不跑** challenge：这条路要按 8 字节步长在命中点附近展开
+    候选，实测每窗 30+ ms（本机全盘 34 线程秒 ≈ 20% 墙钟），而锚点法 22 GiB 就命中了。
+    改为「扫完没命中再补一遍」（见 `scan_key` 尾部的第二遍），成功路径零成本，
+    needle 彻底失效的机器仍会走到 challenge。
+    """
+    if mode == "off":
+        return False
+    if mode in ("always", "only", "chal"):
+        # only/chal 是「challenge 主路」，不能被预算掐掉，否则等于没扫。
+        return True
+    return False
+
+
+def _stats_on() -> bool:
+    """`VLT_KEY_SCAN_STATS=1` 时把两路成本打一行（默认关，避免刷日志）。"""
+    return (os.environ.get("VLT_KEY_SCAN_STATS", "").strip().lower()
+            in ("1", "true", "yes", "on"))
+
+
 def _worker(state: _State, tasks: list[tuple[int, int, int]], groups, *,
-            deadline: float, aad_kind: str) -> None:
-    """扫自己那份任务。任务是 ``(盘号, 盘上偏移, 字节数)``，按盘惰性开句柄。"""
+            deadline: float, aad_kind: str, mode: str | None = None) -> None:
+    """扫自己那份任务。任务是 ``(盘号, 盘上偏移, 字节数)``，按盘惰性开句柄。
+
+    ``mode`` 为空时回落到环境变量策略（见 `_challenge_mode`）；``scan_key`` 会显式
+    传入，好让 only/chal 模式的第一遍真的只跑 challenge。
+    """
     _lower_thread_priority()
+    mode = mode or _challenge_mode()
+    needle_on = mode not in ("only", "chal")
     disks: dict[int, pagefile.Disk] = {}
+    marker_windows = 0
     try:
         with gcm_win.GcmAuth() as auth:
             for disk_no, off, size in tasks:
@@ -596,44 +790,51 @@ def _worker(state: _State, tasks: list[tuple[int, int, int]], groups, *,
                     try:
                         disk = pagefile.Disk.open(disk_no, 0)
                     except OSError:
-                        # 这块盘打不开：**记下来**（上层要据此报「没扫全」），
-                        # 但不拖垮其它盘
-                        state.note_unread(size, disk_no)
+                        state.note_unread(int(size), disk_no)
                         continue
                     disks[disk_no] = disk
-                begin = max(((off - OVERLAP) // OVERLAP_ALIGN) * OVERLAP_ALIGN, 0)
-                end = off + size
-                # ⚠️ **必须切窗读**：read_view 会一次性分配 size 字节的缓冲。老代码把整段
-                # span（本机 pagefile 36 GiB / 33 个 extent）一次读进内存 —— 16 GB 机器直接
-                # 把系统拖死（实测两次 Kernel-Power 41 硬重启，连 minidump 都写不出来）。
-                pos = begin
+                # 从 off 往前退到 OVERLAP 对齐的位置，好让跨任务边界那 39 字节也能读到
+                begin = max(((int(off) - OVERLAP) // OVERLAP_ALIGN) * OVERLAP_ALIGN, 0)
+                pos, end = begin, int(off) + int(size)
                 while pos < end:
-                    if state.stop.is_set() or time.monotonic() >= deadline:
-                        return
                     step = min(WINDOW, end - pos)
-                    # 多读 OVERLAP 字节：key 紧跟在锚点后面，跨窗边界的那一个不能漏
-                    # （老代码整段一次读，天然没有边界；切窗后必须补回这 39 字节）
-                    n = min(step + OVERLAP, end - pos)
+                    n = min(step + OVERLAP, end - pos)     # 多读 39 字节防跨窗漏 key
+                    # 物理盘 ReadFile 的长度必须按扇区对齐（不对齐是 err=87）：跨窗那
+                    # 39 字节不满一个扇区，先把读取长度向上取整，再切回 n 字节。
+                    align = OVERLAP_ALIGN
+                    read_n = n if n % align == 0 else n + (align - n % align)
                     try:
-                        view = disk.read_view(pos, n)
+                        view = disk.read_view(pos, read_n)
                     except OSError:
                         state.note_unread(step, disk_no)
-                        pos += step
-                        continue
-                    data = bytes(view)
+                        break
+                    take = min(len(view), n)
+                    data = bytes(view[:take])
                     view.release()
-                    del view
-                    state.note_markers(data)
-                    if not data or len(data) < n:
-                        state.note_unread(step - min(len(data), step), disk_no)
+                    if take < step:
+                        state.note_unread(step - take, disk_no)
                     if data:
+                        # 路标只用来判断「游戏堆有没有落进 pagefile」，不需要每窗都数：
+                        # bytes.count 三次实测吃掉约 25% 吞吐（0.736→0.488 GiB/s）。
+                        marker_windows += 1
+                        if marker_windows % MARKER_SAMPLE_EVERY == 0:
+                            state.note_markers(data)
                         state.take_chunk(min(len(data), step))
-                        if _scan_buffer(data, pos, state, auth, groups,
-                                        deadline, aad_kind) is not None:
-                            return
-                        if _scan_near_challenges(data, pos, state, auth, groups,
-                                                 deadline, aad_kind) is not None:
-                            return
+                        if needle_on:
+                            t_needle = time.perf_counter()
+                            hit = _scan_buffer(data, pos, state, auth, groups,
+                                               deadline, aad_kind)
+                            state.note_needle(time.perf_counter() - t_needle)
+                            if hit is not None:
+                                return
+                        if _challenge_enabled(state, mode):
+                            state.take_challenge(min(len(data), step))
+                            t_chal = time.perf_counter()
+                            hit = _scan_near_challenges(data, pos, state, auth, groups,
+                                                        deadline, aad_kind)
+                            state.note_challenge(time.perf_counter() - t_chal)
+                            if hit is not None:
+                                return
                     pos += step
     finally:
         for disk in disks.values():
@@ -641,7 +842,6 @@ def _worker(state: _State, tasks: list[tuple[int, int, int]], groups, *,
                 disk.close()
             except OSError:
                 pass
-
 
 def _layout_from_one_extent(spans, disk_no: int, base_offset: int) -> pagefile.Layout:
     """老口径（单盘单段）合成一个 Layout，长度要**覆盖到 pagefile 的最远偏移**。
@@ -660,6 +860,7 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
              layout: pagefile.Layout | None = None,
              threads: int = 0, chunk: int = CHUNK,
              deadline_s: float = SCAN_TIMEOUT, aad_kind: str = "hdr19",
+             mode: str = "", _needle_fallback: bool = False,
              on_progress=None) -> ScanResult:
     """在 pagefile 里找能把 `samples` 全部解开的 32 字节 key。
 
@@ -670,7 +871,13 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
     把「卷内偏移」翻成 `(盘号, 盘上偏移)`；不给时退回 `disk_no` / `base_offset`
     （单盘单段的老口径，`base_offset=None` 时自己查，非提权就能查）。
     返回的 `ScanResult.hit` 为 None 表示没找到 —— 先确认内存压缩是不是又开了。
+
+    `mode` 为 auto/always/off/only，空串走环境变量（`_challenge_mode`）。only 模式
+    先全盘只跑 challenge，没命中再**自动补一遍**锚点法（`needle_fallback=True`）。
     """
+    mode = (mode or _challenge_mode()).strip().lower()
+    if mode not in ("auto", "always", "off", "only"):
+        mode = "auto"
     groups: list[tuple[tuple[bytes, bytes], list[bytes]]] = []
     for flow, pkts in sorted(samples.items(), key=lambda kv: -len(kv[1])):
         good = [p for p in pkts if len(p) >= gcm_win.MIN_PACKET and p[2] == 0x01]
@@ -695,7 +902,7 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
             threads = int(os.environ.get("VLT_KEY_SCAN_THREADS", "") or KEY_SCAN_THREADS)
         except ValueError:
             threads = KEY_SCAN_THREADS
-    nthreads = max(1, min(int(threads or KEY_SCAN_THREADS), 4))
+    nthreads = max(1, min(int(threads or KEY_SCAN_THREADS), max(1, os.cpu_count() or 4)))
 
     state = _State(total)
     try:
@@ -705,7 +912,7 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
     deadline = time.monotonic() + max(1.0, deadline_s)
     t0 = time.monotonic()
 
-    # 任务按块轮转分配：大块在前、交错，避免某个线程捡到全是零的后段
+    # 任务轮转分配：交错到各线程，避免某个线程捡到全是零的后段
     buckets: list[list[tuple[int, int, int]]] = [[] for _ in range(nthreads)]
     for i, task in enumerate(tasks):
         buckets[i % nthreads].append(task)
@@ -714,7 +921,7 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
         threading.Thread(
             target=_worker, name=f"vlt-keywin-{i}", daemon=True,
             args=(state, buckets[i], groups),
-            kwargs=dict(deadline=deadline, aad_kind=aad_kind))
+            kwargs=dict(deadline=deadline, aad_kind=aad_kind, mode=mode))
         for i in range(nthreads)
     ]
     for w in workers:
@@ -738,6 +945,49 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
         state.stop.set()
         for w in workers:
             w.join(timeout=1.0)
+
+    # ── 第二遍：第一遍锚点法整盘没命中，再单独跑一遍 challenge ──────────────
+    # 本机实测：challenge 路每窗 30+ ms，全盘 34 线程秒、约占 20% 墙钟，而锚点法
+    # 22 GiB 就命中了 —— 双路并跑等于给每次冷启动白付这笔钱。改成「失败才补扫」
+    # 后，成功路径一分钱不花；needle 结构对不上（其他版本/其他布局）的机器仍然
+    # 会走到 challenge，只是多付一次读盘。
+    if state.hit is None and mode == "auto":
+        state2 = _State(total)
+        deadline2 = time.monotonic() + max(30.0, deadline_s)
+        workers2 = [
+            threading.Thread(
+                target=_worker, name=f"vlt-keychal-{i}", daemon=True,
+                args=(state2, buckets[i], groups),
+                kwargs=dict(deadline=deadline2, aad_kind=aad_kind, mode="chal"))
+            for i in range(nthreads)
+        ]
+        for w in workers2:
+            w.start()
+        try:
+            while any(w.is_alive() for w in workers2):
+                for w in workers2:
+                    w.join(timeout=0.2)
+                if on_progress is not None:
+                    now = time.monotonic()
+                    if now - state.last_report >= 0.5:
+                        state.last_report = now
+                        try:
+                            on_progress(state.scanned + state2.scanned, now - t0)
+                        except Exception:               # noqa: BLE001 - 回调不影响扫描
+                            pass
+                if state2.stop.is_set():
+                    break
+        finally:
+            state2.stop.set()
+            for w in workers2:
+                w.join(timeout=1.0)
+        state.challenge_bytes += state2.challenge_bytes
+        state.challenge_seconds += state2.challenge_seconds
+        state.challenge_windows += state2.challenge_windows
+        state.unread += state2.unread
+        state.failed_disks |= state2.failed_disks
+        if state2.hit is not None:
+            state.hit = state2.hit
 
     elapsed_ms = (time.monotonic() - t0) * 1000.0
     if state.hit:
@@ -766,7 +1016,38 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
         pagefile_mft=pf.mft_index,
         unread_bytes=state.unread,
         failed_disks=sorted(state.failed_disks),
+        scan_mode=mode,
+        challenge_bytes=state.challenge_bytes,
+        needle_seconds=state.needle_seconds,
+        challenge_seconds=state.challenge_seconds,
+        needle_windows=state.needle_windows,
+        challenge_windows=state.challenge_windows,
+        needle_fallback=_needle_fallback,
     )
+    if _stats_on():
+        print(
+            f"[key_win] scan mode={mode} fallback={_needle_fallback} "
+            f"hit={'yes' if result.hit else 'no'} stopped={result.stopped} | "
+            f"read={result.scanned_bytes / 2**30:.1f} GiB "
+            f"wall={result.elapsed_ms / 1000.0:.1f}s | "
+            f"needle={result.needle_seconds:.1f}s/{result.needle_windows}win "
+            f"({result.needle_hits} anchors, {len(result.candidates)} cand) | "
+            f"challenge={result.challenge_seconds:.1f}s/{result.challenge_windows}win "
+            f"({result.challenge_bytes / 2**30:.1f} GiB)",
+            flush=True,
+        )
+
+    # only 模式：第一遍全盘只有 challenge 路。没命中就补一遍锚点法 —— 失败路径才付
+    # 第二遍读盘（本机 34 GiB ≈ 34 s），成功路径省掉 needle 的候选展开。
+    if (mode == "only" and result.hit is None and result.stopped != "deadline"
+            and time.monotonic() < deadline):
+        if _stats_on():
+            print("[key_win] only 模式未命中，改用锚点法补扫一遍", flush=True)
+        return scan_key(pf, samples, disk_no=disk_no, base_offset=base_offset,
+                        layout=layout, threads=nthreads, chunk=chunk,
+                        deadline_s=max(1.0, deadline - time.monotonic()),
+                        aad_kind=aad_kind, mode="off", _needle_fallback=True,
+                        on_progress=on_progress)
     return result
 
 

@@ -583,7 +583,11 @@ def _scan_job_inner(job: dict, *, pid: int, conn: socket.socket,
         result = key_win.scan_key(pf, groups, layout=layout, aad_kind="hdr19",
                                  deadline_s=max(5.0, deadline - time.monotonic() - 10.0),
                                  on_progress=progress)
-        log(f"scan_key 用时 {time.monotonic() - _t:.1f}s（stopped={result.stopped}）")
+        log(f"scan_key 用时 {time.monotonic() - _t:.1f}s（stopped={result.stopped}；"
+            f"needle {result.needle_seconds:.1f}s/{result.needle_windows}窗、"
+            f"challenge {result.challenge_seconds:.1f}s/{result.challenge_windows}窗；"
+            f"锚点 {result.needle_hits}、候选 {len(result.candidates)}、"
+            f"偏移 {len(key_win._cand_offsets())}、形态 {len(key_win._kind_order(result.aad_kind))}）")
 
     if result.hit is None:
         dump = _dump_failure(pf, result, groups, log=log)
@@ -678,12 +682,19 @@ def main(argv: list[str] | None = None) -> int:
     if not is_admin():
         print("[keyd] 必须以管理员运行（由主程序提权拉起）", file=sys.stderr, flush=True)
         return EXIT_NOT_ADMIN
-    # 后台任务：整机不能被扫盘拖垮。降到 BELOW_NORMAL（线程内再降到 LOWEST）。
-    try:
-        ctypes.windll.kernel32.SetPriorityClass(
-            ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)   # BELOW_NORMAL_PRIORITY_CLASS
-    except (AttributeError, OSError):
-        pass
+    # 后台任务：整机不能被扫盘拖垮，但降级会直接吃掉扫描吞吐（本机实测 BELOW_NORMAL
+    # 只有 ~0.27 GiB/s，NORMAL 时 1.0 GiB/s）。所以交给 VLT_KEY_SCAN_PRIORITY 决定：
+    #   normal（默认）：进程保持正常优先级，扫得快；32 MiB 切窗已能防止把机器拖死
+    #   below：BELOW_NORMAL_PRIORITY_CLASS，前台优先
+    #   lowest：IDLE_PRIORITY_CLASS，最保守（更慢）
+    _prio = (os.environ.get("VLT_KEY_SCAN_PRIORITY", "") or "normal").strip().lower()
+    _class = {"normal": 0x20, "below": 0x4000, "lowest": 0x40}.get(_prio)
+    if _class is not None:
+        try:
+            ctypes.windll.kernel32.SetPriorityClass(
+                ctypes.windll.kernel32.GetCurrentProcess(), _class)
+        except (AttributeError, OSError):
+            pass
 
     deadline = time.monotonic() + max(30.0, args.lifetime)
     try:

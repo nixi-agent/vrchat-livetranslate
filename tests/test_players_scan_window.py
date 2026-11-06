@@ -172,6 +172,26 @@ def test_challenge_zone() -> None:
                                   time.monotonic() + 10, "hdr19") is None)
 
 
+def test_samples_grouping() -> None:
+    print("[capture] 分组口径：challenge 必须是 payload[3:7]（[1:5] 是错的）")
+    from vlt.players import gcm, win_capture as W
+
+    peer = b"\xaa\xbb"
+    chal = b"\x11\x22\x33\x44"
+    nonce = bytes(12)
+    cipher = bytes(range(32))
+    pkt = peer + b"\x01" + chal + nonce + cipher      # Photon 头 19 字节 + 密文
+    check("造出来的包够长", len(pkt) >= gcm.MIN_PACKET,
+          f"len={len(pkt)} MIN={gcm.MIN_PACKET}")
+
+    groups, flows = W.samples_to_groups([("f", pkt), ("f", pkt)])
+    check("按 (peerID, challenge) 分组", (peer, chal) in groups, str(list(groups)))
+    wrong = (peer, pkt[1:5])                          # 老口径（错）
+    check("没有被错口径 [1:5] 分出来",
+          wrong == (peer, chal) or wrong not in groups, str(wrong))
+    check("反查表也按同一口径", flows.get((peer, chal)) == "f", str(flows))
+
+
 def test_forget_key() -> None:
     print("[capture] 密钥失效时必须连采集对象的缓存一起丢（否则永远「预热不可用」）")
     from vlt.players import win_capture as W
@@ -530,6 +550,7 @@ def main() -> int:
     test_constants()
     test_worker_windows()
     test_challenge_zone()
+    test_samples_grouping()
     test_forget_key()
     test_failure_dump()
     test_scan_busy()

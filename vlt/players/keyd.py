@@ -75,11 +75,9 @@ PROTO = 1
 MAX_LINE = 8 << 20
 # 冻结产物用这个开关把自己重新拉起来当助手（`run_gui.py` 在导入 GUI 之前拦）。
 KEYD_SWITCH = "--vlt-keyd"
-# 扫一遍 31 GiB 实测 21 s，加 trim + 定位，240 s 是「绝不会误杀」的量级。
-# ⚠️ 现在不够了：challenge 展开上限从 256 抬到 2048 之后，候选从 24 万涨到 ~200 万，
-# 读盘 220 s + 验证 ~60 s 会顶到 240 s 被自身 deadline 掐断（实测 stopped=deadline，
-# 扫了 33.4/34 GiB 却什么都没找到）。给到 420 s。
-DEFAULT_LIFETIME = 420.0
+# 扫一遍 31 GiB 实测 21 s（#137 的吞吐口径），加 trim + 定位，240 s 是「绝不会误杀」的量级。
+# 之前为了给「challenge 展开 2048 处」留时间抬到过 420 s —— 锚点取对之后不需要了。
+DEFAULT_LIFETIME = 240.0
 # 主程序等 UAC + 子进程启动的时间窗。用户可能慢慢点确认。
 ACCEPT_TIMEOUT = 90.0
 # 子进程连回主程序的超时：提权进程从 ShellExecute 到解释器就绪一般 < 3 s。
@@ -479,6 +477,15 @@ def _dump_failure(pf, result, groups, *, log=None) -> str:
             "samples": samples,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        # 取钥失败会每 10 s 重试一次，而一份排查包 15~27 MB —— 不清理会把 %TEMP%
+        # 堆成几百 MB（本机实测 57 份 / 259 MB）。只留最近 3 份，够复盘就行。
+        try:
+            olds = sorted(path.parent.glob("vlt_keyd_dump_*.json"),
+                          key=lambda p: p.stat().st_mtime, reverse=True)
+            for old in olds[3:]:
+                old.unlink(missing_ok=True)
+        except OSError:
+            pass
         if log is not None:
             log(f"排查包已保存：{path}（{len(payload['candidates'])} 个候选）")
         return str(path)
@@ -730,12 +737,19 @@ def main(argv: list[str] | None = None) -> int:
     if not is_admin():
         print("[keyd] 必须以管理员运行（由主程序提权拉起）", file=sys.stderr, flush=True)
         return EXIT_NOT_ADMIN
-    # 后台任务：整机不能被扫盘拖垮。降到 BELOW_NORMAL（线程内再降到 LOWEST）。
-    try:
-        ctypes.windll.kernel32.SetPriorityClass(
-            ctypes.windll.kernel32.GetCurrentProcess(), 0x4000)   # BELOW_NORMAL_PRIORITY_CLASS
-    except (AttributeError, OSError):
-        pass
+    # 进程优先级：默认 **normal**。降优先级会把吞吐直接压死（#137 实测
+    # BELOW_NORMAL 只剩 0.27 GiB/s），而「别拖垮整机」靠的是 32 MiB 切窗。
+    # 想让它绝对让路：`VLT_KEY_SCAN_PRIORITY=below|lowest`。
+    _prio = (os.environ.get("VLT_KEY_SCAN_PRIORITY", "normal") or "normal").strip().lower()
+    _cls = {"below": 0x4000, "lowest": 0x40}.get(_prio)   # BELOW_NORMAL / IDLE
+    if _cls is not None:
+        try:
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            k32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            k32.SetPriorityClass(k32.GetCurrentProcess(), _cls)
+        except (AttributeError, OSError):
+            pass
 
     deadline = time.monotonic() + max(30.0, args.lifetime)
     try:

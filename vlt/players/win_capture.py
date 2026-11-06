@@ -116,10 +116,9 @@ DIR_REFRESH_S = 2.0
 # 立刻重试只会再弹一次 UAC —— 用户看到的就是「一直弹窗但一直拿不到密钥」
 # （实测 27 秒里连弹了 6 次）。同一进程冷却期内直接报错，不再拉起子进程。
 ELEVATE_COOLDOWN_S = 25.0
-# 让路等待的上限：一路扫描现在给了 420 s 生命周期（challenge 展开上限抬高后
-# 读盘 220 s + 验证 60 s），让路的一方必须比它长，否则「等到一半自己放弃、
-# 又去抢盘」。600 s 覆盖最坏情况。
-WAIT_SHARED_MAX_S = 600.0
+# 让路等待的上限：一路扫描的生命周期是 240 s（keyd.DEFAULT_LIFETIME），让路的一方
+# 必须比它长，否则「等到一半自己放弃、又去抢盘」。300 s 覆盖 240 + 定位 + 余量。
+WAIT_SHARED_MAX_S = 300.0
 # 轮询间隔：落盘是整文件覆盖写，2 s 足够，也不至于把磁盘唤醒得太勤。
 WAIT_SHARED_POLL_S = 2.0
 
@@ -236,17 +235,22 @@ def _cached_serial() -> int:
 def samples_to_groups(samples) -> tuple[dict, dict]:
     """把 `leg` 的 `[(gcm.Flow, payload)]` 转成 `key_win` 要的口径。
 
-    `key_win` 按 `(peerID, challenge)` 分组 —— 即密文头的前 5 个字节
-    （`payload[0:2]` 是 peerID、`payload[1:5]` 是 challenge，与 `scripts/pf_key2.py`
-    的 `load_samples` 同口径）。同时返回 `(peerID, challenge) → Flow` 的反查表，
-    因为最后构造 `gcm.KeyHit` 还要知道这把 key 属于哪条流。
+    Photon 密文头是 `[peerID:2][0x01][challenge:4][nonce:12]`（见 `gcm.py` 顶部
+    注释），所以 peerID 是 `payload[0:2]`、challenge 是 **`payload[3:7]`** ——
+    不是 `[1:5]`：`payload[2]` 是固定的 `0x01` 标志位，把它算进 challenge 会让
+    分组键漂移，也让 `_scan_near_challenges()` 拼的锚 `peer + 0x01 + chal`
+    变成一串几乎每个包都对不上的字节 —— 白吃满 `MAX_CHALLENGE_HITS × 偏移`
+    的预算却永远定位不到真正的密钥对象（实测：34 GiB 全扫、24 万候选全败）。
+
+    同时返回 `(peerID, challenge) → Flow` 的反查表，因为最后构造 `gcm.KeyHit`
+    还要知道这把 key 属于哪条流。
     """
     groups: dict[tuple[bytes, bytes], list[bytes]] = {}
     flows: dict[tuple[bytes, bytes], gcm.Flow] = {}
     for flow, payload in samples:
         if len(payload) < gcm.MIN_PACKET or payload[2] != 0x01:
             continue
-        tag = (bytes(payload[0:2]), bytes(payload[1:5]))
+        tag = (bytes(payload[0:2]), bytes(payload[3:7]))
         groups.setdefault(tag, []).append(bytes(payload))
         flows.setdefault(tag, flow)
     # 只留够判定的流：一个包解不开就没法区分「key 不对」和「包不全」。

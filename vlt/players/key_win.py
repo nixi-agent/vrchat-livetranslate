@@ -88,13 +88,15 @@ CAND_OFFSETS = (8, 12, 16, 24)
 #: challenge 命中后向两侧各看多少字节（对象字段就在附近）
 CHALLENGE_ZONE = 2048
 #: 同一个 challenge 模式最多展开几处命中（防病态数据把扫描拖死）。
-#: 原来是 256 —— 本机实测锚点命中 359 万次、只展开 512 处（覆盖率 0.014%），
-#: 34 GiB 扫完 24 万候选全败。真钥所在的那处大概率压根没进前 256。抬高到 2048
-#: 覆盖 ×8；验证是「首包不过就返回」，每个错候选只花 4 种 AAD × 2 flow 的
-#: 首包尝试，代价约 +30~60 秒，而读盘本来就要 220 秒。
-MAX_CHALLENGE_HITS = 2048
-#: 候选上限，纯防爆内存。64 位进程里 200 万 × 32 字节 ≈ 150 MB，能承受。
-MAX_KEEP = 2_000_000
+#: 注：锚点（`peer + 0x01 + challenge`）取对之后，真正的密钥对象只会命中一两处，
+#: 256 足够。曾经为了「覆盖更多」抬到 2048，那是在锚取错字节（`payload[1:5]`）的
+#: 前提下打的补丁 —— 锚一修就不需要了，抬上去只会把扫描拖慢几倍。
+MAX_CHALLENGE_HITS = 256
+#: 候选上限，纯防爆内存。
+MAX_KEEP = 400_000
+#: 路标统计（`wrld_`/`usr_`/`avtr_`）每几窗真数一次。每窗三次 `bytes.count`
+#: 实测吃掉约 1/3 吞吐，而这三个数只用于日志展示。
+MARKER_SAMPLE_EVERY = 8
 # 4 种偏移 × 锚点数量：本机 52k 锚点 → 20.8 万候选，留一倍余量，别让 cap 把后半段吃掉
 
 # ---- Pager ------------------------------------------------------------
@@ -363,7 +365,17 @@ def _kind_order(primary: str) -> tuple[str, ...]:
 
 
 def _plausible(key: bytes) -> bool:
-    return len(key) == KEY_LEN and len(set(key)) >= MIN_DISTINCT
+    """这个 32 字节窗口值不值得做 GCM 认证（扫描热路径，每个候选都要问一次）。
+
+    先做两个 `bytes.count`（C 实现）的快拒：真密钥是均匀随机的，32 字节里出现
+    ≥9 个 `0x00` 或 `0xFF` 的概率 < 1e-6，而 pagefile 里绝大多数窗口是零页/填充。
+    这一步比下面 `set()` 建表快一个数量级 —— #137 实测它在整个吞吐里占大头。
+    """
+    if len(key) != KEY_LEN:
+        return False
+    if key.count(0) >= 9 or key.count(255) >= 9:
+        return False
+    return len(set(key)) >= MIN_DISTINCT
 
 
 #: pagefile 里「游戏堆」的路标（世界/用户 ID 前缀，一定出现在 VRChat 托管堆里）
@@ -384,6 +396,7 @@ class _State:
         self.candidates: list[bytes] = []
         self.seen: set[bytes] = set()
         self.markers: dict[str, int] = {}          # pagefile 里的堆路标计数（见 note_markers）
+        self._marker_windows = 0                   # 路标统计抽样用（见 note_markers）
         self.last_report = 0.0
         # 「该扫但没读到」的字节与盘号：不许把「盘打不开」静默算成「扫过了没命中」，
         # 否则上层会把 0% 覆盖率报成「扫了 X GiB 都不通过 GCM」。
@@ -411,13 +424,20 @@ class _State:
             return True
 
     def note_markers(self, data: bytes) -> None:
-        """数一数页文件里出现了多少游戏堆的「路标」字符串。
+        """数一数页文件里出现了多少游戏堆的「路标」字符串（**抽样**）。
 
         目的只有一个：判断 **VRChat 的堆到底有没有落进 pagefile**。
-        世界 ID（`wrld_`）、用户 ID（`usr_`）是它堆里必然存在的字符串；
-        扫完 34 GiB 一个都没有 → 再怎么调锚点也找不到密钥（前提就不成立）。
+        世界 ID（`wrld_`）、用户 ID（`usr_`）是它堆里必然存在的字符串；扫完 34 GiB
+        一个都没有 → 再怎么调锚点也找不到密钥（前提就不成立）。
+
+        ⚠️ 每窗三次 `bytes.count` 实测吃掉约 1/3 吞吐（#137 实测），而这三个数只用于
+        日志展示 —— 所以每 `MARKER_SAMPLE_EVERY` 窗才真数一次。统计值因此是抽样口
+        径（只能判「有没有」，不能当精确计数）。
         """
         with self.lock:
+            self._marker_windows += 1
+            if self._marker_windows % MARKER_SAMPLE_EVERY:
+                return
             for marker, key in _MARKERS:
                 self.markers[key] = self.markers.get(key, 0) + data.count(marker)
 
@@ -571,17 +591,25 @@ def _scan_buffer(data: bytes, base_off: int, state: _State, auth: gcm_win.GcmAut
     return None
 
 
-def _lower_thread_priority() -> None:
-    """把扫描线程降到 **THREAD_PRIORITY_LOWEST**。
+def _thread_priority_step() -> int | None:
+    """`VLT_KEY_SCAN_PRIORITY` → `SetThreadPriority` 的增量；None = 不动（normal）。
 
-    取钥是后台任务，绝不该和前台抢 CPU/IO：本机实测高并发原始读会把整台机器拖到
-    无响应（Kernel-Power 41 硬重启）。降优先级后系统调度先满足前台，扫描慢一点没关系。
+    默认 **normal**：降优先级是把吞吐直接压死（#137 实测 `BELOW_NORMAL` 只剩
+    0.27 GiB/s，本机 LOWEST 约 130 MB/s），而「别把整机拖垮」靠的是 32 MiB 切窗
+    —— 一次只读这么多，内存上界由它保证，跟优先级无关。
     """
+    raw = (os.environ.get("VLT_KEY_SCAN_PRIORITY", "normal") or "normal").strip().lower()
+    return {"below": -1, "lowest": -2}.get(raw)
+
+
+def _lower_thread_priority() -> None:
+    """按 `VLT_KEY_SCAN_PRIORITY` 降扫描线程优先级（默认 normal = 不降）。"""
+    step = _thread_priority_step()
+    if step is None:
+        return
     try:
         k32 = ctypes.windll.kernel32
-        # -1 = THREAD_PRIORITY_BELOW_NORMAL。原来用 LOWEST(-2)，实测只有 ~130 MB/s，
-        # 34 GiB 要 4 分半；改成 -1 仍然让前台优先，但不再被系统当后台 IO 限速。
-        k32.SetThreadPriority(k32.GetCurrentThread(), -1)
+        k32.SetThreadPriority(k32.GetCurrentThread(), step)
     except (AttributeError, OSError):
         pass
 

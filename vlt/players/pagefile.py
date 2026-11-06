@@ -425,17 +425,23 @@ class Disk:
             view = self._read_aligned(offset, size)
             if view is not None:
                 return view
-        if size > self._buf_size:
-            self._buf = (ctypes.c_ubyte * size)()
-            self._buf_size = size
+        # ⚠️ 带缓存这条路**也必须按扇区读**：`\\.\PhysicalDriveN` 的 ReadFile 要求
+        # 偏移与长度都对齐，而扫描读的 `step + OVERLAP(39)` 天生不对齐 —— 实测会
+        # `err=87 (ERROR_INVALID_PARAMETER)`，而失败是按整窗处理的，表现成
+        # 「扫了 0.0 GiB」/「一个候选都没有」。所以向上取整读，返回时截回所需长度。
+        want = int(size)
+        read_size = (want + READ_ALIGN - 1) // READ_ALIGN * READ_ALIGN
+        if read_size > self._buf_size:
+            self._buf = (ctypes.c_ubyte * read_size)()
+            self._buf_size = read_size
         pos = self._position(offset)
         cur = ctypes.c_longlong(0)
         if not _k32.SetFilePointerEx(self._h, pos, ctypes.byref(cur), 0):
             raise PagefileError(f"SetFilePointerEx({pos}) err={ctypes.get_last_error()}")
         got = wt.DWORD(0)
-        if not _k32.ReadFile(self._h, self._buf, size, ctypes.byref(got), None):
-            raise PagefileError(f"ReadFile({pos},{size}) err={ctypes.get_last_error()}")
-        return memoryview(self._buf)[:got.value]
+        if not _k32.ReadFile(self._h, self._buf, read_size, ctypes.byref(got), None):
+            raise PagefileError(f"ReadFile({pos},{read_size}) err={ctypes.get_last_error()}")
+        return memoryview(self._buf)[:min(int(got.value), want)]
 
 
 # ---------------------------------------------------------------- NTFS 结构

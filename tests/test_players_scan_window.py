@@ -266,10 +266,17 @@ def test_scan_busy() -> None:
     print("[keyd] 父进程侧互斥体探测（真句柄，不弹 UAC）")
     from vlt.players import keyd as D
 
-    check("空闲时 scan_busy 为 False", D.scan_busy() is False, str(D.scan_busy()))
+    busy = D.scan_busy()
     if sys.platform != "win32":
+        check("非 Windows 一律 False", busy is False, str(busy))
         print("  --  非 Windows，跳过真实互斥体验证")
         return
+    if busy:
+        # 用户正在跑 GUI 且它正在扫盘：互斥体被别人占着，这是**对的**行为，
+        # 只是本机此刻没法验证「空闲 → False」。别因此把测试判红。
+        print("  --  此刻已有另一个扫描在进行（GUI 占着互斥体），跳过句柄验证")
+        return
+    check("空闲时 scan_busy 为 False", busy is False, str(busy))
     import ctypes
 
     k32 = ctypes.windll.kernel32
@@ -361,6 +368,137 @@ def test_persist_key() -> None:
           src.index("_persist_key(") < src.index('"key": result.hit.key.hex()'))
 
 
+def test_cache_disk_fallback() -> None:
+    print("[capture] 会话缓存是空的也要能用磁盘缓存（否则开关一次翻译就重扫 34 GiB）")
+    from vlt.players import win_capture as W
+
+    key = bytes(range(32))
+    saved = (W._disk_key_read, W.key_win.verify_key, W.gcm_win.GcmAuth, W.make_hit)
+
+    class _Auth:
+        def close(self) -> None:
+            pass
+
+    class _EmptyCache:
+        def peek(self):
+            return None                       # 新采集实例：会话缓存空
+
+        def lookup(self, *_a, **_k):          # pragma: no cover - 不该被调用
+            raise AssertionError("会话缓存空时不该调 lookup")
+
+    class _Cap:
+        _key = None
+        _cache = _EmptyCache()
+
+        def _status(self, _l, _m) -> None:
+            pass
+
+    try:
+        W.gcm_win.GcmAuth = _Auth
+        W.key_win.verify_key = lambda k, g, auth=None: k == key
+        W.make_hit = lambda k, g, f, tag=None: ("hit", k)
+        W._disk_key_read = lambda _i: key
+
+        got = W._WinCapture._from_cache(_Cap(), object(), {}, {})
+        check("磁盘缓存被读到了", got == ("hit", key), repr(got))
+
+        W._disk_key_read = lambda _i: None
+        got = W._WinCapture._from_cache(_Cap(), object(), {}, {})
+        check("真没有缓存时才返回 None", got is None, repr(got))
+    finally:
+        (W._disk_key_read, W.key_win.verify_key, W.gcm_win.GcmAuth, W.make_hit) = saved
+
+
+def test_fresh_reverify() -> None:
+    print("[capture] 扫完要用**最新**流量复验：换过世界就当场改口，别装着钥匙干等")
+    from vlt.players import win_capture as W
+
+    key = bytes(range(32))
+    saved = (W.keyd.scan_busy, W.keyd.run_scan, W._gate_elevation,
+             W.samples_to_groups, W.key_win.verify_key, W.gcm_win.GcmAuth,
+             W.make_hit, W.key_win.key_fingerprint)
+
+    class _Auth:
+        def close(self) -> None:
+            pass
+
+    class _Cache:
+        def store(self, *_a) -> None:
+            pass
+
+    class _Cap:
+        _key = None
+        _cache = _Cache()
+
+        def _status(self, _l, _m) -> None:
+            pass
+
+        def _fresh_samples(self):
+            return [("fresh", b"x")]
+
+        def _tag_for(self, *_a, **_k):
+            return None
+
+    calls: list = []
+    ident = type("_I", (), {"pid": 4242, "created": 171717})()
+
+    def fake_verify(_k, groups, auth=None, aad_kind=None):
+        calls.append(groups)
+        return len(calls) == 1        # 旧样本过、最新流量不过
+
+    try:
+        W.gcm_win.GcmAuth = _Auth
+        W.keyd.scan_busy = lambda: False
+        W._gate_elevation = lambda _i: None
+        W.keyd.run_scan = lambda **_kw: {"ok": True, "key": key.hex(), "pagefile_mft": 1}
+        W.samples_to_groups = lambda _s: ({"g": [b"p"]}, {})
+        W.key_win.verify_key = fake_verify
+        W.key_win.key_fingerprint = lambda k: "fp"
+        W.make_hit = lambda k, g, f, tag=None: ("hit", k)
+
+        try:
+            W._WinCapture._scan_via_keyd(_Cap(), ident, {}, {})
+        except W.KeyUnavailable as exc:
+            check("过期钥匙被当场拦下", "最新的" in str(exc), str(exc))
+        else:
+            check("过期钥匙被当场拦下", False, "没有抛 KeyUnavailable")
+        check("确实验了两次（旧样本 + 最新流量）", len(calls) == 2, str(len(calls)))
+
+        if hasattr(W, "_scan_local"):
+            src = (ROOT / "vlt" / "players" / "win_capture.py").read_text(encoding="utf-8")
+            check("解包路径也用了最新流量复验", "_fresh_samples()" in src)
+    finally:
+        (W.keyd.scan_busy, W.keyd.run_scan, W._gate_elevation,
+         W.samples_to_groups, W.key_win.verify_key, W.gcm_win.GcmAuth,
+         W.make_hit, W.key_win.key_fingerprint) = saved
+
+
+def test_world_gate() -> None:
+    print("[warmup] 没进世界就别扫（菜单会话的钥匙一进世界就作废）")
+    import threading as T
+
+    from vlt.players import warmup as WM
+
+    class _R:
+        def __init__(self, synced: bool, world: str) -> None:
+            self.synced, self.world = synced, world
+
+    class _Self:
+        def __init__(self, synced: bool, world: str) -> None:
+            self._roster = _R(synced, world)
+            self._roster_lock = T.Lock()
+
+    gate = WM.PlayerWarmup._world_ready
+    check("读不到 output_log → 不拦（宁可白扫也别卡死）",
+          gate(_Self(False, "")) is True)
+    check("读过日志但还没进过世界 → 拦", gate(_Self(True, "")) is False)
+    check("已经在世界里 → 放行", gate(_Self(True, "功能测试世界")) is True)
+
+    src = (ROOT / "vlt" / "players" / "warmup.py").read_text(encoding="utf-8")
+    check("闸门在开扫之前",
+          src.index("self._world_ready()") < src.index('PHASE_ACQUIRING, "正在获取密钥'))
+
+
 def main() -> int:
     test_constants()
     test_worker_windows()
@@ -371,6 +509,9 @@ def main() -> int:
     test_shared_wait()
     test_recv_sticky()
     test_persist_key()
+    test_cache_disk_fallback()
+    test_fresh_reverify()
+    test_world_gate()
     if FAILS:
         print(f"\n{len(FAILS)} 项失败：{FAILS}")
         return 1

@@ -478,14 +478,20 @@ class _WinCapture:
             pass
 
     def _from_cache(self, ident: key_win.Identity, groups: dict, flows: dict):
-        """会话缓存命中就零 UAC —— key 是进程级的，换房间不换。"""
-        if self._cache.peek() is None:
-            return None
-        auth = gcm_win.GcmAuth()
-        try:
-            key = self._cache.lookup(ident, groups, auth=auth)
-        finally:
-            auth.close()
+        """会话缓存/磁盘缓存命中就零 UAC —— key 是进程级的，换房间不换。
+
+        ⚠️ 别在 `self._cache.peek() is None` 时提前 return：那是**会话缓存**
+        （挂在采集对象上），而「关一次翻译再开」就会新建采集实例，它的会话缓存
+        是空的 —— 提前返回等于把磁盘缓存彻底废掉，于是每次都重扫 34 GiB
+        （本机实测：开关一次翻译 = 3 分钟）。会话缓存只当快路径，磁盘才是兜底。
+        """
+        key = None
+        if self._cache.peek() is not None:
+            auth = gcm_win.GcmAuth()
+            try:
+                key = self._cache.lookup(ident, groups, auth=auth)
+            finally:
+                auth.close()
         if key is None:
             key = _disk_key_read(ident)
             if key is not None:
@@ -566,6 +572,15 @@ class _WinCapture:
         self._status("info", f"等了 {max_s:.0f} 秒另一路还没结果 —— 自己扫一次")
         return None
 
+    def _fresh_samples(self) -> list[tuple]:
+        """最新几秒的密文，转成与 `acquire_key()` 同口径的样本 `[(Flow, payload)]`。"""
+        try:
+            dgs = self.recent_cipher()
+        except Exception:                                 # noqa: BLE001 - 诊断不该抛
+            return []
+        return [(gcm.Flow.of(dg.src, dg.dst), dg.payload)
+                for dg in dgs if getattr(dg, "is_encrypted", False)]
+
     def _scan_via_keyd(self, ident: key_win.Identity, groups: dict,
                        flows: dict) -> gcm.KeyHit:
         """非管理员路径：把样本交给提权子进程，它只回一个 32 字节候选。"""
@@ -632,6 +647,19 @@ class _WinCapture:
                 raise KeyUnavailable(
                     f"子进程交回的密钥（指纹 {key_win.key_fingerprint(key)}）"
                     "在本地样本上不通过 GCM 认证：抓包与读盘之间多半又换了世界，重试一次"
+                )
+            # ★ 再用**最新**流量验一遍。上面那批样本是扫描**开始**时抓的，扫描要
+            # 3~4 分钟，这期间换过世界的话它们照样能解开，但实时流一个都解不开 ——
+            # 本机实测（gui_20261106_234031.log）：23:43:47 密钥命中、开始解码，
+            # 到 23:52 全是「音频消息 0、帧 0」，然后判「连续 10 个包解不开」再扫
+            # 一整轮。用新世界的包当场复验，就能立刻改口说「钥匙过期了」而不是
+            # 装着钥匙干等。
+            fresh, _fresh_flows = samples_to_groups(self._fresh_samples())
+            if fresh and not key_win.verify_key(key, fresh, auth=auth, aad_kind=AAD_KIND):
+                raise KeyUnavailable(
+                    f"子进程交回的密钥（指纹 {key_win.key_fingerprint(key)}）解不开**最新的**"
+                    "流量：扫描这几分钟里换过世界，钥匙已经过期。重新取一次"
+                    "（这次会用新世界的样本扫）"
                 )
             tag = self._tag_for(key, groups, auth)
         finally:

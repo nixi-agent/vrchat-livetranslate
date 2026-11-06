@@ -597,6 +597,22 @@ class PlayerWarmup:
 
     # ------------------------------------------------------------ 密钥
 
+    def _world_ready(self) -> bool:
+        """有没有「已经进过世界」的证据（名单从 output_log 的 `Entering Room` 读）。
+
+        为什么要在扫之前确认：进世界会换 Photon 会话，**密钥跟着换**。在菜单 /
+        加载界面抓到的样本扫出来的 key，一进世界就作废 —— 本机实测：23:40 启动
+        就预热、扫了 3 分钟，23:43 进世界后密钥「命中」了却一个包都解不开，
+        10 秒后判失效又扫一整轮。
+
+        读不到 output_log（`synced` 为假）时返回 True：宁可白扫一次，也别让
+        取钥永远等在一个读不到日志的环境里。
+        """
+        with self._roster_lock:
+            if not self._roster.synced:
+                return True
+            return bool(self._roster.world)
+
     def ensure_key(self, samples=None, *, deadline_s: float = 40.0):
         """有缓存就用缓存；否则**起短命助手扫一次**。失败返回 None。"""
         with self._key_lock:
@@ -608,6 +624,10 @@ class PlayerWarmup:
                 # 翻译腿刚接管时可能只有 1 个样本：用预热自己攒的
                 usable = list(self._samples)
             if host is None or len(usable) < 2:
+                return None
+            # 没进世界就别扫（见 `_world_ready`）：扫出来的是菜单会话的钥匙。
+            if not self._world_ready():
+                self._set_phase(PHASE_WAITING, "先进入一个世界，再取密钥")
                 return None
             self._set_phase(PHASE_ACQUIRING, "正在获取密钥（扫描游戏内存，约 1~20 秒）…")
             last_error = ""

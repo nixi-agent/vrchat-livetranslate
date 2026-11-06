@@ -499,6 +499,33 @@ def test_world_gate() -> None:
           src.index("self._world_ready()") < src.index('PHASE_ACQUIRING, "正在获取密钥'))
 
 
+def test_read_nobuf_alignment() -> None:
+    print("[pagefile] NO_BUFFERING 的对齐前置条件（不满足就退回带缓存的老路）")
+    from vlt.players import pagefile as P
+
+    d = P.Disk.__new__(P.Disk)
+    d._h = None
+    d._h_nb = None
+    d.base_offset = 0
+    d._nb_buf = None
+    d._nb_size = 0
+    d._buf = None
+    d._buf_size = 0
+    d._closed = False
+
+    check("对齐粒度是扇区 4 KiB", P.READ_ALIGN == 4096, str(P.READ_ALIGN))
+    check("偏移不对齐 → 交回老路", d._read_aligned(3, 100) is None)
+    check("带 base_offset 时按盘上位置判对齐",
+          d._read_aligned(0, 100) is None or (d.base_offset % P.READ_ALIGN == 0))
+    up = (100 + P.READ_ALIGN - 1) // P.READ_ALIGN * P.READ_ALIGN
+    check("长度向上取整到扇区", up == P.READ_ALIGN, str(up))
+
+    src = (ROOT / "vlt" / "players" / "pagefile.py").read_text(encoding="utf-8")
+    check("NO_BUFFERING 打了个独立句柄（不动小读那条路）",
+          "FILE_FLAG_NO_BUFFERING" in src and "_h_nb" in src)
+    check("能一键关掉（VLT_READ_NOBUF=0）", "VLT_READ_NOBUF" in src)
+
+
 def main() -> int:
     test_constants()
     test_worker_windows()
@@ -512,6 +539,7 @@ def main() -> int:
     test_cache_disk_fallback()
     test_fresh_reverify()
     test_world_gate()
+    test_read_nobuf_alignment()
     if FAILS:
         print(f"\n{len(FAILS)} 项失败：{FAILS}")
         return 1

@@ -26,6 +26,7 @@ pagefile 扫描路径则用 :class:`Layout` 把卷内区间翻成**盘上绝对�
 from __future__ import annotations
 
 import ctypes
+import os
 import struct
 from collections.abc import Callable, Iterator
 from ctypes import wintypes as wt
@@ -57,7 +58,34 @@ FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
 OPEN_EXISTING = 3
 FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000
+#: 绕过系统缓存读（DMA 直达用户缓冲）。扫 34 GiB 这种一次性数据全靠它：
+#: 走缓存会把 standby list 冲干净、还要和游戏自己换页抢内存。
+FILE_FLAG_NO_BUFFERING = 0x20000000
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+MEM_COMMIT = 0x1000
+MEM_RESERVE = 0x2000
+MEM_RELEASE = 0x8000
+PAGE_READWRITE = 0x04
+#: NO_BUFFERING 的硬要求：偏移、长度、缓冲地址全部按**扇区**对齐。
+#: 4 KiB 是本机 NTFS 卷扇区（物理扇区 512 的盘也满足这个更严的值）。
+READ_ALIGN = 4096
+
+
+def _alloc_aligned(size: int):
+    """按 `READ_ALIGN` 对齐分配一块可复用缓冲（VirtualAlloc 返回 64 KiB 对齐）。"""
+    k32 = _k32
+    k32.VirtualAlloc.restype = ctypes.c_void_p
+    k32.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wt.DWORD, wt.DWORD]
+    return k32.VirtualAlloc(None, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) or None
+
+
+def _free_aligned(ptr) -> None:
+    if not ptr:
+        return
+    k32 = _k32
+    k32.VirtualFree.restype = wt.BOOL
+    k32.VirtualFree.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wt.DWORD]
+    k32.VirtualFree(ctypes.c_void_p(ptr), 0, MEM_RELEASE)
 
 # IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS：拿分区在物理盘上的起点与长度
 IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000
@@ -268,12 +296,16 @@ class Disk:
       `Layout.resolve()` 给出，直接 `read_view(abs_off, len)`。
     """
 
-    def __init__(self, handle, base_offset: int, *, disk_no: int) -> None:
-        self._h = handle
+    def __init__(self, h, base_offset: int, disk_no: int = 0, *, h_nb=None) -> None:
+        self._h = h
         self.base_offset = int(base_offset)
         self.disk_no = disk_no
+        #: NO_BUFFERING 句柄（可选）。大顺序扫走它，小读仍走 `_h`。
+        self._h_nb = h_nb
         self._buf = None
         self._buf_size = 0
+        self._nb_buf = None
+        self._nb_size = 0
         self._closed = False
 
     @classmethod
@@ -289,11 +321,30 @@ class Disk:
         if h == INVALID_HANDLE_VALUE or not h:
             raise PagefileError(
                 f"打开物理盘 {path} 失败 err={ctypes.get_last_error()}（需要管理员）")
-        return cls(h, base_offset, disk_no=disk_no)
+        # 再开一个**绕系统缓存**的句柄给大顺序扫用。为什么要它：一次扫 34 GiB，
+        # 走缓存的话这批一次性数据会把 standby list 冲干净、还和游戏自己换页抢内存
+        # —— 本机实测同一块盘同一份 pagefile，速率在 88~691 MB/s 之间飘。失败就
+        # 算了（退回带缓存的老路），不影响取钥。
+        # 关掉：`VLT_READ_NOBUF=0`。
+        h_nb = None
+        if os.environ.get("VLT_READ_NOBUF", "1").strip() != "0":
+            h_nb = k32.CreateFileW(
+                path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, None,
+                OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, None)
+            if h_nb == INVALID_HANDLE_VALUE or not h_nb:
+                h_nb = None
+        return cls(h, base_offset, disk_no=disk_no, h_nb=h_nb)
 
     def close(self) -> None:
         if not self._closed:
             _k32.CloseHandle(self._h)
+            if self._h_nb:
+                _k32.CloseHandle(self._h_nb)
+                self._h_nb = None
+            if self._nb_buf:
+                _free_aligned(self._nb_buf)
+                self._nb_buf = None
+                self._nb_size = 0
             self._closed = True
 
     def __enter__(self) -> Disk:
@@ -320,12 +371,60 @@ class Disk:
             raise PagefileError(f"ReadFile({pos},{size}) err={ctypes.get_last_error()}")
         return bytes(buf[:got.value])
 
+    def _read_aligned(self, offset: int, size: int) -> memoryview | None:
+        """走 `NO_BUFFERING` 句柄读一块；任何前置条件不满足就返回 None（调用方退老路）。
+
+        NO_BUFFERING 要求偏移、长度、**缓冲地址**全按扇区对齐。页文件 extent 的末尾
+        不一定对齐到 4 KiB，所以最后一块常常读不了 —— 那种情况直接交给带缓存的老路径，
+        不为了几 KiB 让整轮扫描失败。
+        """
+        pos = self._position(offset)
+        if pos % READ_ALIGN:
+            return None
+        # ⚠️ 句柄是 64 位 HANDLE：不写 argtypes 会被当 32 位 int 传（截断 → 读错
+        # 位置或静默失败）。`read()` 里也是这么设的。
+        _k32.SetFilePointerEx.restype = wt.BOOL
+        _k32.SetFilePointerEx.argtypes = [wt.HANDLE, ctypes.c_longlong,
+                                          ctypes.POINTER(ctypes.c_longlong), wt.DWORD]
+        _k32.ReadFile.restype = wt.BOOL
+        _k32.ReadFile.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.DWORD,
+                                  ctypes.POINTER(wt.DWORD), ctypes.c_void_p]
+        want = int(size)
+        size = (want + READ_ALIGN - 1) // READ_ALIGN * READ_ALIGN
+        if size > self._nb_size:
+            if self._nb_buf:
+                _free_aligned(self._nb_buf)
+                self._nb_buf = None
+                self._nb_size = 0
+            self._nb_buf = _alloc_aligned(size)
+            if not self._nb_buf:
+                self._h_nb = None            # 分不出对齐缓冲：以后都走老路
+                return None
+            self._nb_size = size
+        cur = ctypes.c_longlong(0)
+        if not _k32.SetFilePointerEx(self._h_nb, pos, ctypes.byref(cur), 0):
+            return None
+        got = wt.DWORD(0)
+        if not _k32.ReadFile(self._h_nb, ctypes.c_void_p(self._nb_buf), size,
+                             ctypes.byref(got), None):
+            # 跨 extent 末尾 / 盘尾：老路径按字节读，不受对齐约束
+            return None
+        n = min(int(got.value), want)
+        return memoryview((ctypes.c_ubyte * n).from_address(self._nb_buf))
+
     def read_view(self, offset: int, size: int) -> memoryview:
         """读进复用缓冲，返回 memoryview（**下次读会被覆盖**，用完立刻 release）。
 
         单次 read 只有 ~65 MB/s（ctypes 数组分配 + 整块拷贝），复用缓冲后
         实测 1.2 GiB/s。
+
+        有 `NO_BUFFERING` 句柄时优先走它（绕系统缓存，大顺序扫更快也更稳）；
+        对齐不满足或系统拒绝就自动退回下面这条带缓存的老路。
         """
+        if self._h_nb is not None:
+            view = self._read_aligned(offset, size)
+            if view is not None:
+                return view
         if size > self._buf_size:
             self._buf = (ctypes.c_ubyte * size)()
             self._buf_size = size

@@ -27,9 +27,17 @@ build_dbg/
 config.yaml
 # 配置写坏时的自动备份（见 vlt/config.py 的恢复逻辑）
 config.yaml.broken
+config.yaml.bak.*
 config.local.yaml
 
 # 编辑器
 .vscode/
 .idea/
 *.swp
+
+# 运行时缓存：源码运行时 `paths.app_dir()` 就是仓库根，这些文件会长在这儿
+# （`pagefile-hint.json` 由 win_capture 写、`key_cache.json` 是冻结版的候选落点）。
+# 它们只对**本机**有意义（MFT 记录号 / 一把进程级密钥），绝不能进版本库。
+pagefile-hint.json
+key_cache.json
+vlt_keyd_dump_*.json

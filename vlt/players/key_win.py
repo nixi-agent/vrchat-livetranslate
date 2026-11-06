@@ -38,6 +38,7 @@ key 是 **VRChat 进程级**的：换房间、换世界、重连 Photon 都不�
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
 import time
 from ctypes import wintypes as wt
@@ -71,9 +72,32 @@ MIN_DISTINCT = 20                              # 熵预筛：至少 20 个不同
 OVERLAP = KEY_OFF + KEY_LEN - 1                # 39：跨块命中不漏
 OVERLAP_ALIGN = 4096                           # 物理盘读必须扇区对齐
 CHUNK = 8 << 20                                # 8 MiB/块
-SCAN_TIMEOUT = 45.0
+#: 每次**真正读进内存**的窗口。峰值内存 ≈ 窗口 × 线程数，所以绝不能用 extent 整段
+#: 长度去读：本机 pagefile 36 GiB / 33 个 extent，老代码一次 alloc 36 GiB，
+#: 16 GB 机器直接被拖死（实测两次 Kernel-Power 41 硬重启，minidump 都写不出来）。
+WINDOW = 32 << 20                              # 32 MiB/窗
+#: 扫描总预算。36 GiB pagefile 单线程实测 ~1.2 GiB/s ≈ 30 s，这里留足余量；
+#: 原来 45 s 在机械盘/热 pagefile 上必然超时（超时 = 「没找到密钥」的假阴性）。
+SCAN_TIMEOUT = 180.0
+#: 并发线程数：read_view 复用缓冲后单线程 ~1 GiB/s（空载）；带游戏在跑时 4 线程实测更快
+KEY_SCAN_THREADS = 4
 MIN_FLOW_PACKETS = 2                           # 一个 flow 至少 2 包才算数
-MAX_KEEP = 200_000                             # 候选上限，纯防爆内存
+#: 候选 key 相对锚点的偏移。8 = IL2CPP 数组 header「max_length(u64) 之后紧跟数据」；
+#: 12/16/24 兼容别的对齐/包装 —— 本机 34 GiB 扫完、52k 候选全败，先怀疑偏移而不是密钥不存在。
+CAND_OFFSETS = (8, 12, 16, 24)
+#: challenge 命中后向两侧各看多少字节（对象字段就在附近）
+CHALLENGE_ZONE = 2048
+#: 同一个 challenge 模式最多展开几处命中（防病态数据把扫描拖死）。
+#: 注：锚点（`peer + 0x01 + challenge`）取对之后，真正的密钥对象只会命中一两处，
+#: 256 足够。曾经为了「覆盖更多」抬到 2048，那是在锚取错字节（`payload[1:5]`）的
+#: 前提下打的补丁 —— 锚一修就不需要了，抬上去只会把扫描拖慢几倍。
+MAX_CHALLENGE_HITS = 256
+#: 候选上限，纯防爆内存。
+MAX_KEEP = 400_000
+#: 路标统计（`wrld_`/`usr_`/`avtr_`）每几窗真数一次。每窗三次 `bytes.count`
+#: 实测吃掉约 1/3 吞吐，而这三个数只用于日志展示。
+MARKER_SAMPLE_EVERY = 8
+# 4 种偏移 × 锚点数量：本机 52k 锚点 → 20.8 万候选，留一倍余量，别让 cap 把后半段吃掉
 
 # ---- Pager ------------------------------------------------------------
 SYSTEM_MEMORY_LIST_INFORMATION = 80
@@ -237,6 +261,8 @@ class ScanHit:
     ok: int
     total: int
     offset: int = 0                # 盘上**绝对**偏移（任务在 _phys_tasks 之后）
+    kind: str = "hdr19"            # 这条 key 是在哪种 AAD 形态下认证通过的
+    key_off: int = KEY_OFF         # 相对锚点的偏移（见 CAND_OFFSETS）
 
     @property
     def fingerprint(self) -> str:
@@ -257,6 +283,8 @@ class ScanResult:
     region_bytes: int = 0
     fingerprints: list[str] = field(default_factory=list)
     hit: ScanHit | None = None
+    aad_kind: str = "hdr19"        # 命中时是哪种 AAD 形态（没命中就是调用方给的默认）
+    markers: dict[str, int] = field(default_factory=dict)   # pagefile 里的堆路标计数
     chunks: int = 0
     threads: int = 0
     pagefile_mft: int = 0
@@ -325,8 +353,33 @@ def verify_key(key: bytes, samples, *, auth: gcm_win.GcmAuth | None = None,
             a.close()
 
 
+#: 只试**运行期解包能对应上**的形态（gcm.py 的 LAYOUTS = hdr+nonce / hdr / none）。
+#: challenge/peeronce 在这里就算命中了也用不了 —— 解包器没有对应布局，会白扫。
+RUNTIME_KINDS = ("hdr19", "hdr7", "none")
+
+
+def _kind_order(primary: str) -> tuple[str, ...]:
+    """先试调用方指定的形态，再试其余运行期支持的形态（错的 key 在第一个包就失败，很便宜）。"""
+    rest = tuple(k for k in RUNTIME_KINDS if k != primary)
+    return (primary,) + rest
+
+
 def _plausible(key: bytes) -> bool:
-    return len(key) == KEY_LEN and len(set(key)) >= MIN_DISTINCT
+    """这个 32 字节窗口值不值得做 GCM 认证（扫描热路径，每个候选都要问一次）。
+
+    先做两个 `bytes.count`（C 实现）的快拒：真密钥是均匀随机的，32 字节里出现
+    ≥9 个 `0x00` 或 `0xFF` 的概率 < 1e-6，而 pagefile 里绝大多数窗口是零页/填充。
+    这一步比下面 `set()` 建表快一个数量级 —— #137 实测它在整个吞吐里占大头。
+    """
+    if len(key) != KEY_LEN:
+        return False
+    if key.count(0) >= 9 or key.count(255) >= 9:
+        return False
+    return len(set(key)) >= MIN_DISTINCT
+
+
+#: pagefile 里「游戏堆」的路标（世界/用户 ID 前缀，一定出现在 VRChat 托管堆里）
+_MARKERS = ((b"wrld_", "wrld"), (b"usr_", "usr"), (b"avtr_", "avtr"))
 
 
 class _State:
@@ -342,6 +395,8 @@ class _State:
         self.needle_hits = 0
         self.candidates: list[bytes] = []
         self.seen: set[bytes] = set()
+        self.markers: dict[str, int] = {}          # pagefile 里的堆路标计数（见 note_markers）
+        self._marker_windows = 0                   # 路标统计抽样用（见 note_markers）
         self.last_report = 0.0
         # 「该扫但没读到」的字节与盘号：不许把「盘打不开」静默算成「扫过了没命中」，
         # 否则上层会把 0% 覆盖率报成「扫了 X GiB 都不通过 GCM」。
@@ -367,6 +422,24 @@ class _State:
             self.seen.add(cand)
             self.candidates.append(cand)
             return True
+
+    def note_markers(self, data: bytes) -> None:
+        """数一数页文件里出现了多少游戏堆的「路标」字符串（**抽样**）。
+
+        目的只有一个：判断 **VRChat 的堆到底有没有落进 pagefile**。
+        世界 ID（`wrld_`）、用户 ID（`usr_`）是它堆里必然存在的字符串；扫完 34 GiB
+        一个都没有 → 再怎么调锚点也找不到密钥（前提就不成立）。
+
+        ⚠️ 每窗三次 `bytes.count` 实测吃掉约 1/3 吞吐（#137 实测），而这三个数只用于
+        日志展示 —— 所以每 `MARKER_SAMPLE_EVERY` 窗才真数一次。统计值因此是抽样口
+        径（只能判「有没有」，不能当精确计数）。
+        """
+        with self.lock:
+            self._marker_windows += 1
+            if self._marker_windows % MARKER_SAMPLE_EVERY:
+                return
+            for marker, key in _MARKERS:
+                self.markers[key] = self.markers.get(key, 0) + data.count(marker)
 
     def take_chunk(self, nbytes: int) -> None:
         with self.lock:
@@ -421,6 +494,64 @@ def _phys_tasks(tasks: list[tuple[int, int]],
     return out
 
 
+def _scan_near_challenges(data: bytes, base_off: int, state: _State,
+                          auth: gcm_win.GcmAuth,
+                          groups: list[tuple[tuple[bytes, bytes], list[bytes]]],
+                          deadline: float, aad_kind: str) -> ScanHit | None:
+    """在「challenge 附近」找 key。
+
+    为什么需要这条：锚点法假设密钥存在 `byte[32]` 托管数组里（长度字段 32 紧挨数据）。
+    本机 34 GiB 全扫、25 万候选全败 —— 说明这个假设在这个 VRChat 版本上不成立（或那一页
+    压根没落盘）。但 Photon 的连接状态对象里**同时**存着 challenge 与 EncryptionKey，
+    两者相距通常在一个对象/几十字节内，所以：
+
+        用报文中真实的 challenge（4 字节随机数）当锚 → 在命中点 ±2 KiB 内按 8 字节对齐
+        取 32 字节窗口当候选 → GCM 认证
+
+    challenge 是 4 字节随机数，在 34 GiB 里几乎不会误命中，比「等于 32 的 u64」精确得多。
+    """
+    zone = CHALLENGE_ZONE
+    for flow, pkts in groups:
+        peer, chal = flow
+        pats = [bytes(chal)]
+        if len(peer) and len(chal):
+            pats.insert(0, bytes(peer) + b"" + bytes(chal))
+        for pat in pats:
+            if len(pat) < 4:
+                continue
+            start = 0
+            seen = 0
+            while seen < MAX_CHALLENGE_HITS:
+                pos = data.find(pat, start)
+                if pos < 0:
+                    break
+                start = pos + 1
+                seen += 1
+                lo = max(pos - zone, 0)
+                hi = min(pos + len(pat) + zone, len(data) - KEY_LEN)
+                for off in range(lo - (lo % 8), hi, 8):
+                    if time.monotonic() >= deadline:
+                        return None
+                    cand = data[off:off + KEY_LEN]
+                    if len(cand) != KEY_LEN or not _plausible(cand):
+                        continue
+                    if not state.offer(cand):
+                        continue
+                    for kind in _kind_order(aad_kind):
+                        for flow2, pkts2 in groups:
+                            n = min(len(pkts2), 8)
+                            if n < MIN_FLOW_PACKETS:
+                                continue
+                            if auth.opens_all(cand, pkts2[:n], kind) == n:
+                                hit = ScanHit(key=cand, flow=flow2, ok=n,
+                                              total=len(pkts2),
+                                              offset=base_off + off,
+                                              kind=kind, key_off=-1)
+                                if state.finish(hit):
+                                    return hit
+                                return None
+    return None
+
 def _scan_buffer(data: bytes, base_off: int, state: _State, auth: gcm_win.GcmAuth,
                  groups: list[tuple[tuple[bytes, bytes], list[bytes]]],
                  deadline: float, aad_kind: str) -> ScanHit | None:
@@ -435,29 +566,58 @@ def _scan_buffer(data: bytes, base_off: int, state: _State, auth: gcm_win.GcmAut
         hits += 1
         if hits & 1023 == 0 and time.monotonic() >= deadline:
             return None
-        cand = data[pos + KEY_OFF: pos + KEY_OFF + KEY_LEN]
-        if not _plausible(cand):
-            continue
-        if not state.offer(cand):
-            continue
-        for flow, pkts in groups:
-            n = min(len(pkts), 8)
-            if n < MIN_FLOW_PACKETS:
+        for key_off in CAND_OFFSETS:
+            if pos + key_off + KEY_LEN > len(data):
                 continue
-            if auth.opens_all(cand, pkts[:n], aad_kind) == n:
-                hit = ScanHit(key=cand, flow=flow, ok=n, total=len(pkts),
-                              offset=base_off + pos + KEY_OFF)
-                if state.finish(hit):
-                    return hit
-                return None
+            cand = data[pos + key_off: pos + key_off + KEY_LEN]
+            if not _plausible(cand):
+                continue
+            if not state.offer(cand):
+                continue
+            for flow, pkts in groups:
+                n = min(len(pkts), 8)
+                if n < MIN_FLOW_PACKETS:
+                    continue
+                for kind in _kind_order(aad_kind):
+                    if auth.opens_all(cand, pkts[:n], kind) == n:
+                        hit = ScanHit(key=cand, flow=flow, ok=n, total=len(pkts),
+                                      offset=base_off + pos + key_off,
+                                      kind=kind, key_off=key_off)
+                        if state.finish(hit):
+                            return hit
+                        return None
     if hits:
         state.note_hits(hits)
     return None
 
 
+def _thread_priority_step() -> int | None:
+    """`VLT_KEY_SCAN_PRIORITY` → `SetThreadPriority` 的增量；None = 不动（normal）。
+
+    默认 **normal**：降优先级是把吞吐直接压死（#137 实测 `BELOW_NORMAL` 只剩
+    0.27 GiB/s，本机 LOWEST 约 130 MB/s），而「别把整机拖垮」靠的是 32 MiB 切窗
+    —— 一次只读这么多，内存上界由它保证，跟优先级无关。
+    """
+    raw = (os.environ.get("VLT_KEY_SCAN_PRIORITY", "normal") or "normal").strip().lower()
+    return {"below": -1, "lowest": -2}.get(raw)
+
+
+def _lower_thread_priority() -> None:
+    """按 `VLT_KEY_SCAN_PRIORITY` 降扫描线程优先级（默认 normal = 不降）。"""
+    step = _thread_priority_step()
+    if step is None:
+        return
+    try:
+        k32 = ctypes.windll.kernel32
+        k32.SetThreadPriority(k32.GetCurrentThread(), step)
+    except (AttributeError, OSError):
+        pass
+
+
 def _worker(state: _State, tasks: list[tuple[int, int, int]], groups, *,
             deadline: float, aad_kind: str) -> None:
     """扫自己那份任务。任务是 ``(盘号, 盘上偏移, 字节数)``，按盘惰性开句柄。"""
+    _lower_thread_priority()
     disks: dict[int, pagefile.Disk] = {}
     try:
         with gcm_win.GcmAuth() as auth:
@@ -475,24 +635,39 @@ def _worker(state: _State, tasks: list[tuple[int, int, int]], groups, *,
                         continue
                     disks[disk_no] = disk
                 begin = max(((off - OVERLAP) // OVERLAP_ALIGN) * OVERLAP_ALIGN, 0)
-                span = off + size - begin
-                # 必须走 read_view：Disk.read 每块新建一个 8 MiB 的 ctypes 数组，
-                # 实测 8 线程也只有 64 MB/s（45 s 才扫到 2.8 GiB）；复用缓冲后
-                # 单线程就能跑到 1 GiB/s 以上。
-                try:
-                    view = disk.read_view(begin, span)
-                except OSError:
-                    state.note_unread(size, disk_no)
-                    continue
-                data = bytes(view)
-                view.release()
-                del view
-                if not data:
-                    continue
-                state.take_chunk(size)
-                if _scan_buffer(data, begin, state, auth, groups,
-                                deadline, aad_kind) is not None:
-                    return
+                end = off + size
+                # ⚠️ **必须切窗读**：read_view 会一次性分配 size 字节的缓冲。老代码把整段
+                # span（本机 pagefile 36 GiB / 33 个 extent）一次读进内存 —— 16 GB 机器直接
+                # 把系统拖死（实测两次 Kernel-Power 41 硬重启，连 minidump 都写不出来）。
+                pos = begin
+                while pos < end:
+                    if state.stop.is_set() or time.monotonic() >= deadline:
+                        return
+                    step = min(WINDOW, end - pos)
+                    # 多读 OVERLAP 字节：key 紧跟在锚点后面，跨窗边界的那一个不能漏
+                    # （老代码整段一次读，天然没有边界；切窗后必须补回这 39 字节）
+                    n = min(step + OVERLAP, end - pos)
+                    try:
+                        view = disk.read_view(pos, n)
+                    except OSError:
+                        state.note_unread(step, disk_no)
+                        pos += step
+                        continue
+                    data = bytes(view)
+                    view.release()
+                    del view
+                    state.note_markers(data)
+                    if not data or len(data) < n:
+                        state.note_unread(step - min(len(data), step), disk_no)
+                    if data:
+                        state.take_chunk(min(len(data), step))
+                        if _scan_buffer(data, pos, state, auth, groups,
+                                        deadline, aad_kind) is not None:
+                            return
+                        if _scan_near_challenges(data, pos, state, auth, groups,
+                                                 deadline, aad_kind) is not None:
+                            return
+                    pos += step
     finally:
         for disk in disks.values():
             try:
@@ -548,10 +723,18 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
         layout = _layout_from_one_extent(spans, disk_no, int(base_offset))
 
     tasks = _phys_tasks(_build_tasks(spans, chunk), layout)
-    nthreads = threads or min(8, max(2, (ctypes.cdll.kernel32.GetActiveProcessorCount(0) or 8)))
-    nthreads = max(1, min(nthreads, 16))
+    if not threads:
+        try:
+            threads = int(os.environ.get("VLT_KEY_SCAN_THREADS", "") or KEY_SCAN_THREADS)
+        except ValueError:
+            threads = KEY_SCAN_THREADS
+    nthreads = max(1, min(int(threads or KEY_SCAN_THREADS), 4))
 
     state = _State(total)
+    try:
+        deadline_s = float(os.environ.get("VLT_KEY_SCAN_TIMEOUT", "") or deadline_s)
+    except ValueError:
+        pass
     deadline = time.monotonic() + max(1.0, deadline_s)
     t0 = time.monotonic()
 
@@ -605,6 +788,8 @@ def scan_key(pf: pagefile.Pagefile, samples, *,
         needle_hits=state.needle_hits,
         regions=len(spans),
         stopped=stopped,
+        aad_kind=(state.hit.kind if state.hit else aad_kind),
+        markers=dict(state.markers),
         needle="q",
         region_bytes=total,
         fingerprints=[key_fingerprint(k) for k in state.candidates[:64]],

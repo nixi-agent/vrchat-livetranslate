@@ -76,7 +76,10 @@ MAX_LINE = 8 << 20
 # 冻结产物用这个开关把自己重新拉起来当助手（`run_gui.py` 在导入 GUI 之前拦）。
 KEYD_SWITCH = "--vlt-keyd"
 # 扫一遍 31 GiB 实测 21 s，加 trim + 定位，240 s 是「绝不会误杀」的量级。
-DEFAULT_LIFETIME = 240.0
+# ⚠️ 现在不够了：challenge 展开上限从 256 抬到 2048 之后，候选从 24 万涨到 ~200 万，
+# 读盘 220 s + 验证 ~60 s 会顶到 240 s 被自身 deadline 掐断（实测 stopped=deadline，
+# 扫了 33.4/34 GiB 却什么都没找到）。给到 420 s。
+DEFAULT_LIFETIME = 420.0
 # 主程序等 UAC + 子进程启动的时间窗。用户可能慢慢点确认。
 ACCEPT_TIMEOUT = 90.0
 # 子进程连回主程序的超时：提权进程从 ShellExecute 到解释器就绪一般 < 3 s。
